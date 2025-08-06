@@ -1,0 +1,9 @@
+vis4d==0.1.4
+wandb
+einops
+fvcore
+nltk
+transformers
+fairscale
+mmengine
+bitsandbytes
