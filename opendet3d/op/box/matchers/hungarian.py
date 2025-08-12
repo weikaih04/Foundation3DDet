@@ -5,12 +5,10 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 from scipy.optimize import linear_sum_assignment
 from torch import Tensor
-
-from vis4d.op.box.matchers.base import MatchResult
 from vis4d.op.box.box2d import bbox_iou
+from vis4d.op.box.matchers.base import MatchResult
 
 
 class HungarianMatcher:

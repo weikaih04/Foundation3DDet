@@ -5,10 +5,8 @@ from __future__ import annotations
 import json
 import os.path as osp
 
-from tqdm import tqdm
-
 import numpy as np
-
+from tqdm import tqdm
 from vis4d.common.logging import rank_zero_info
 from vis4d.common.typing import ArgsType, DictStrAny
 from vis4d.data.const import CommonKeys as K

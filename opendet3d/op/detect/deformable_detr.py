@@ -5,16 +5,15 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 from torch.amp import autocast
-
-from vis4d.op.layer.ms_deform_attn import MultiScaleDeformableAttention
 from vis4d.op.layer.attention import MultiheadAttention
+from vis4d.op.layer.ms_deform_attn import MultiScaleDeformableAttention
 from vis4d.op.layer.transformer import FFN, inverse_sigmoid
 
 from .detr import (
-    DetrTransformerEncoder,
-    DetrTransformerEncoderLayer,
     DetrTransformerDecoder,
     DetrTransformerDecoderLayer,
+    DetrTransformerEncoder,
+    DetrTransformerEncoderLayer,
 )
 
 

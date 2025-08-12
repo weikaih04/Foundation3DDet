@@ -1,12 +1,13 @@
 """Language grounding utilities."""
 
 import re
-import torch
-import nltk
 
+import nltk
+import torch
+from torch import Tensor
 from transformers import BatchEncoding
 
-from torch import Tensor
+from vis4d.common.logging import rank_zero_info, rank_zero_warn
 
 
 def find_noun_phrases(caption: str) -> list:
@@ -90,7 +91,7 @@ def run_ner(caption: str) -> tuple[list[list[int]], list[str]]:
     noun_phrases = find_noun_phrases(caption)
     noun_phrases = [remove_punctuation(phrase) for phrase in noun_phrases]
     noun_phrases = [phrase for phrase in noun_phrases if phrase != ""]
-    print("noun_phrases:", noun_phrases)
+    rank_zero_info("noun_phrases:", noun_phrases)
     relevant_phrases = noun_phrases
     labels = noun_phrases
 
@@ -102,9 +103,9 @@ def run_ner(caption: str) -> tuple[list[list[int]], list[str]]:
             for m in re.finditer(entity, caption.lower()):
                 tokens_positive.append([[m.start(), m.end()]])
         except Exception:
-            print("noun entities:", noun_phrases)
-            print("entity:", entity)
-            print("caption:", caption.lower())
+            rank_zero_warn("noun entities:", noun_phrases)
+            rank_zero_warn("entity:", entity)
+            rank_zero_warn("caption:", caption.lower())
     return tokens_positive, noun_phrases
 
 

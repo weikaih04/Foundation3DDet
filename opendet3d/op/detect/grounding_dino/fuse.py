@@ -7,10 +7,8 @@
 
 import torch
 import torch.nn.functional as F
-
-from torch import Tensor, nn
-
 from timm.layers import DropPath
+from torch import Tensor, nn
 
 
 class BiMultiHeadAttention(nn.Module):

@@ -8,31 +8,29 @@ from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
-
 from torch import Tensor, nn
 from transformers import BatchEncoding
-
 from vis4d.common.ckpt import load_model_checkpoint
 from vis4d.common.logging import rank_zero_warn
 from vis4d.op.base import BaseModel
 from vis4d.op.layer.positional_encoding import SinePositionalEncoding
 
 from opendet3d.model.language.mm_bert import BertModel
+from opendet3d.op.detect.deformable_detr import get_valid_ratio
 from opendet3d.op.detect.dino import CdnQueryGenerator
 from opendet3d.op.detect.grounding_dino import (
+    GroundingDINOHead,
     GroundingDinoTransformerDecoder,
     GroundingDinoTransformerEncoder,
-    GroundingDINOHead,
     RoI2Det,
 )
-from opendet3d.op.detect.deformable_detr import get_valid_ratio
 from opendet3d.op.fpp.channel_mapper import ChannelMapper
 from opendet3d.op.language.grounding import (
-    clean_label_name,
     chunks,
-    run_ner,
+    clean_label_name,
     create_positive_map,
     create_positive_map_label_to_token,
+    run_ner,
 )
 
 REV_KEYS = [

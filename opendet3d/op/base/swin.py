@@ -7,22 +7,19 @@ Code adapted from:
 from __future__ import annotations
 
 from collections import OrderedDict
-
 from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
 from timm.layers import DropPath, to_2tuple, trunc_normal_
-from torch import nn, Tensor
+from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
-
 from vis4d.common.ckpt import CheckpointLoader
 from vis4d.common.logging import rank_zero_warn
 from vis4d.op.base import BaseModel
-
 from vis4d.op.layer.transformer import FFN
-from vis4d.op.layer.weight_init import constant_init
 from vis4d.op.layer.util import build_norm_layer
+from vis4d.op.layer.weight_init import constant_init
 
 from opendet3d.op.layer.patch_embed import PatchEmbed, PatchMerging
 

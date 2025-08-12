@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch.nn.functional as F
 from torch import Tensor
 from torchvision.ops import sigmoid_focal_loss
-
 from vis4d.op.loss.base import Loss
 from vis4d.op.loss.reducer import LossReducer, mean_loss
 

@@ -1,12 +1,10 @@
 """Matcher cost op."""
 
 import torch
-
 from torch import Tensor
-
 from vis4d.op.box.box2d import bbox_iou
 
-from opendet3d.op.box.box2d import bbox_xyxy_to_cxcywh, bbox_overlaps
+from opendet3d.op.box.box2d import bbox_overlaps, bbox_xyxy_to_cxcywh
 
 
 class MatchCost:

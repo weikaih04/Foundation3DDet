@@ -3,16 +3,10 @@
 from __future__ import annotations
 
 from ml_collections import ConfigDict, FieldReference
-
 from vis4d.config import class_config
 
 from opendet3d.model.detect.grounding_dino import GroundingDINO
-from opendet3d.model.language.mm_bert import BertModel
-from opendet3d.op.detect.grounding_dino import (
-    GroundingDINOHead,
-    ContrastiveEmbed,
-    RoI2Det,
-)
+from opendet3d.op.detect.grounding_dino import RoI2Det
 
 GDINO_MODEL_WEIGHTS = {
     "mm_gdino_swin_tiny_obj365_goldg_grit9m_v3det": "https://download.openmmlab.com/mmdetection/v3.0/mm_grounding_dino/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth",
@@ -26,7 +20,6 @@ GDINO_MODEL_WEIGHTS = {
 def get_gdino_cfg(
     basemodel: ConfigDict,
     neck: ConfigDict,
-    mm_gdino: bool,
     num_feature_levels: int = 4,
     nms: bool | FieldReference = False,
     max_per_img: int | FieldReference = 300,
@@ -51,45 +44,14 @@ def get_gdino_cfg(
     else:
         weights = None
 
-    if mm_gdino:
-        model = class_config(
-            GroundingDINO,
-            basemodel=basemodel,
-            neck=neck,
-            num_feature_levels=num_feature_levels,
-            roi2det=roi2det,
-            use_checkpoint=use_checkpoint,
-            weights=weights,
-        )
-    else:
-        model = class_config(
-            GroundingDINO,
-            basemodel=basemodel,
-            neck=neck,
-            num_feature_levels=num_feature_levels,
-            bbox_head=class_config(
-                GroundingDINOHead,
-                num_classes=256,
-                num_decoder_layer=6,
-                fc_cls=class_config(
-                    ContrastiveEmbed,
-                    max_text_len=256,
-                    log_scale="auto",
-                    bias=False,
-                ),
-            ),
-            language_model=class_config(
-                BertModel,
-                name="bert-base-uncased",
-                max_tokens=256,
-                pad_to_max=False,
-                use_sub_sentence_represent=True,
-                special_tokens_list=["[CLS]", "[SEP]", ".", "?"],
-                add_pooling_layer=True,
-            ),
-            roi2det=roi2det,
-            use_checkpoint=use_checkpoint,
-            weights=weights,
-        )
+    model = class_config(
+        GroundingDINO,
+        basemodel=basemodel,
+        neck=neck,
+        num_feature_levels=num_feature_levels,
+        roi2det=roi2det,
+        use_checkpoint=use_checkpoint,
+        weights=weights,
+    )
 
     return model

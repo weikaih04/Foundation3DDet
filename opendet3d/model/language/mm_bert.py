@@ -1,15 +1,12 @@
 """BERT model from mmdetection."""
 
-import os
 import logging
-
+import os
 from collections import OrderedDict
 from collections.abc import Sequence
 
 import torch
-
 from torch import nn
-
 from transformers import AutoTokenizer, BertConfig
 from transformers import BertModel as HFBertModel
 

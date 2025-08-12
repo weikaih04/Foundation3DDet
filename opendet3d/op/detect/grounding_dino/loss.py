@@ -1,22 +1,21 @@
 """G-DINO Loss."""
 
 import torch
-from torch import nn, Tensor
-
+from torch import Tensor, nn
 from vis4d.common.distributed import reduce_mean
 from vis4d.op.loss.common import l1_loss
 from vis4d.op.loss.reducer import SumWeightedLoss
 
+from opendet3d.op.box.box2d import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh
 from opendet3d.op.box.matchers.hungarian import HungarianMatcher
-from opendet3d.op.util import multi_apply
-from opendet3d.op.box.box2d import bbox_xyxy_to_cxcywh, bbox_cxcywh_to_xyxy
 from opendet3d.op.loss.focal_loss import FocalLoss
+from opendet3d.op.loss.iou_loss import GIoULoss
 from opendet3d.op.match_cost import (
-    BinaryFocalLossCost,
     BBoxL1Cost,
+    BinaryFocalLossCost,
     IoUCost,
 )
-from opendet3d.op.loss.iou_loss import GIoULoss
+from opendet3d.op.util import multi_apply
 
 
 class GroundingDINOLoss(nn.Module):

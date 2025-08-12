@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import math
-import torch
 
+import torch
+from fairscale.nn.checkpoint import checkpoint_wrapper
 from torch import Tensor, nn
 from torch.amp import autocast
-from fairscale.nn.checkpoint import checkpoint_wrapper
-
 from vis4d.op.layer.attention import MultiheadAttention
 from vis4d.op.layer.ms_deform_attn import MultiScaleDeformableAttention
-from vis4d.op.layer.transformer import FFN, inverse_sigmoid, get_clones
+from vis4d.op.layer.transformer import FFN, get_clones, inverse_sigmoid
 
 from opendet3d.op.detect.deformable_detr import (
     DeformableDetrTransformerDecoderLayer,

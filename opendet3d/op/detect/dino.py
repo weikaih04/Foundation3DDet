@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import torch
-
 from torch import Tensor, nn
-
 from vis4d.op.layer.transformer import inverse_sigmoid
 
 from opendet3d.op.box.box2d import bbox_xyxy_to_cxcywh

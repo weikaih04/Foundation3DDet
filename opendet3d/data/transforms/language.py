@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import re
 import random
+import re
 
 import numpy as np
-
 from transformers import AutoTokenizer
-
 from vis4d.common.logging import rank_zero_warn
 from vis4d.common.typing import NDArrayF32, NDArrayI64
 from vis4d.data.const import CommonKeys as K

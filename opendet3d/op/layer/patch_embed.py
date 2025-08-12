@@ -11,8 +11,7 @@ from collections.abc import Sequence
 
 import torch.nn.functional as F
 from timm.layers import to_2tuple
-from torch import nn, Tensor
-
+from torch import Tensor, nn
 from vis4d.op.layer.conv2d import Conv2d
 from vis4d.op.layer.util import build_norm_layer
 

@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import math
-import torch
 
+import torch
 from torch import Tensor, nn
 from torchvision.ops import batched_nms, nms
-
-from vis4d.op.layer.transformer import get_clones
+from vis4d.op.layer.transformer import get_clones, inverse_sigmoid
 from vis4d.op.layer.weight_init import constant_init
-from vis4d.op.layer.transformer import inverse_sigmoid
 
 from opendet3d.op.box.box2d import bbox_cxcywh_to_xyxy
 

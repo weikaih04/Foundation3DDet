@@ -3,9 +3,8 @@
 from collections.abc import Sequence
 
 from torch import Tensor, nn
-
 from vis4d.op.layer.conv2d import Conv2d
-from vis4d.op.layer.util import build_norm_layer, build_activation_layer
+from vis4d.op.layer.util import build_activation_layer, build_norm_layer
 from vis4d.op.layer.weight_init import xavier_init
 
 

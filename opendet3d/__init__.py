@@ -1,1 +1,1 @@
-"""Vis4D Template."""
+"""3D-MOOD."""

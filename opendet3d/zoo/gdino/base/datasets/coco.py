@@ -1,42 +1,54 @@
-"""Grounding DINO data config."""
+"""Grounding DINO COCO config."""
 
 from __future__ import annotations
 
-from ml_collections import ConfigDict
+from collections.abc import Sequence
 
+from ml_collections import ConfigDict
 from vis4d.config import class_config
+from vis4d.data.const import CommonKeys as K
 from vis4d.data.data_pipe import DataPipe
+from vis4d.data.datasets.coco import COCO
 from vis4d.data.transforms.base import RandomApply, compose
 from vis4d.data.transforms.crop import (
-    GenCropParameters,
     CropBoxes2D,
     CropImages,
+    GenCropParameters,
 )
 from vis4d.data.transforms.flip import FlipBoxes2D, FlipImages
 from vis4d.data.transforms.normalize import NormalizeImages
-from vis4d.data.transforms.pad import PadImages
 from vis4d.data.transforms.resize import (
     GenResizeParameters,
     ResizeBoxes2D,
     ResizeImages,
 )
-from vis4d.data.transforms.to_tensor import ToTensor
-from vis4d.zoo.base import (
-    get_inference_dataloaders_cfg,
-    get_train_dataloader_cfg,
-)
-
-from opendet3d.data.transforms.language import RandomSamplingNegPos
 
 
-def get_train_dataloader(
-    train_dataset_cfg: ConfigDict,
-    samples_per_gpu: int,
-    workers_per_gpu: int,
-    pad_stride: int = 1,
-    random_sample_neg_pos: bool = False,
+def get_coco_detection_train_cfg(
+    data_root: str = "data/coco",
+    train_split: str = "train2017",
+    train_keys_to_load: Sequence[str] = (
+        K.images,
+        K.original_images,
+        K.boxes2d,
+        K.boxes2d_classes,
+    ),
+    data_backend: None | ConfigDict = None,
+    cache_as_binary: bool = True,
+    train_cached_file_path: str | None = "data/coco/train.pkl",
 ) -> ConfigDict:
-    """Get train dataloader config."""
+    """Get the DataPipe config for COCO detection train set."""
+    dataset_cfg = class_config(
+        COCO,
+        keys_to_load=train_keys_to_load,
+        data_root=data_root,
+        split=train_split,
+        remove_empty=True,
+        data_backend=data_backend,
+        cache_as_binary=cache_as_binary,
+        cached_file_path=train_cached_file_path,
+    )
+
     preprocess_transforms = [
         class_config(
             RandomApply,
@@ -93,47 +105,44 @@ def get_train_dataloader(
     preprocess_transforms.append(
         class_config(
             RandomApply,
-            transforms=[
-                class_config(FlipImages),
-                class_config(FlipBoxes2D),
-            ],
+            transforms=[class_config(FlipImages), class_config(FlipBoxes2D)],
             probability=0.5,
         )
     )
 
-    if random_sample_neg_pos:
-        preprocess_transforms.append(class_config(RandomSamplingNegPos))
-
     preprocess_transforms.append(class_config(NormalizeImages))
 
-    train_preprocess_cfg = class_config(
-        compose, transforms=preprocess_transforms
-    )
+    preprocess_fn_cfg = class_config(compose, transforms=preprocess_transforms)
 
-    train_batchprocess_cfg = class_config(
-        compose,
-        transforms=[
-            class_config(PadImages, stride=pad_stride),
-            class_config(ToTensor),
-        ],
-    )
-
-    return get_train_dataloader_cfg(
-        preprocess_cfg=train_preprocess_cfg,
-        dataset_cfg=train_dataset_cfg,
-        batchprocess_cfg=train_batchprocess_cfg,
-        samples_per_gpu=samples_per_gpu,
-        workers_per_gpu=workers_per_gpu,
+    return class_config(
+        DataPipe, datasets=dataset_cfg, preprocess_fn=preprocess_fn_cfg
     )
 
 
-def get_test_dataloader(
-    test_dataset: ConfigDict,
-    pad_stride: int = 1,
-    samples_per_gpu: int = 1,
-    workers_per_gpu: int = 2,
+def get_coco_detection_test_cfg(
+    data_root: str = "data/coco",
+    test_split: str = "val2017",
+    test_keys_to_load: Sequence[str] = (
+        K.images,
+        K.original_images,
+        K.boxes2d,
+        K.boxes2d_classes,
+    ),
+    test_cached_file_path: str | None = "data/coco/val.pkl",
+    cache_as_binary: bool = True,
+    data_backend: None | ConfigDict = None,
 ) -> ConfigDict:
-    """Get test dataloader config."""
+    """Get the DataPipe config for COCO detection test set."""
+    dataset_cfg = class_config(
+        COCO,
+        keys_to_load=test_keys_to_load,
+        data_root=data_root,
+        split=test_split,
+        data_backend=data_backend,
+        cache_as_binary=cache_as_binary,
+        cached_file_path=test_cached_file_path,
+    )
+
     preprocess_transforms = [
         class_config(
             GenResizeParameters,
@@ -147,25 +156,8 @@ def get_test_dataloader(
 
     preprocess_transforms.append(class_config(NormalizeImages))
 
-    test_preprocess_cfg = class_config(
-        compose, transforms=preprocess_transforms
-    )
+    preprocess_fn_cfg = class_config(compose, transforms=preprocess_transforms)
 
-    test_batchprocess_cfg = class_config(
-        compose,
-        transforms=[
-            class_config(PadImages, stride=pad_stride),
-            class_config(ToTensor),
-        ],
-    )
-
-    test_dataset_cfg = class_config(
-        DataPipe, datasets=test_dataset, preprocess_fn=test_preprocess_cfg
-    )
-
-    return get_inference_dataloaders_cfg(
-        datasets_cfg=test_dataset_cfg,
-        samples_per_gpu=samples_per_gpu,
-        workers_per_gpu=workers_per_gpu,
-        batchprocess_cfg=test_batchprocess_cfg,
+    return class_config(
+        DataPipe, datasets=dataset_cfg, preprocess_fn=preprocess_fn_cfg
     )

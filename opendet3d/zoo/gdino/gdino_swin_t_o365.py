@@ -1,11 +1,11 @@
-"""Grounding DINO Swin-T pre-train on Objects365."""
+"""Grounding DINO Swin-T pre-train on Objects365v1."""
 
 from __future__ import annotations
 
-import lightning.pytorch as pl
+import os
+
 from torch.optim.adamw import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
-
 from vis4d.config import class_config
 from vis4d.config.typing import ExperimentConfig, ExperimentParameters
 from vis4d.data.io.hdf5 import HDF5Backend
@@ -28,15 +28,19 @@ from vis4d.zoo.base import (
 from vis4d.zoo.base.datasets.coco import CONN_COCO_BBOX_EVAL
 
 from opendet3d.op.base.swin import SwinTransformer
-from opendet3d.op.fpp.channel_mapper import ChannelMapper
 from opendet3d.op.detect.grounding_dino.loss import GroundingDINOLoss
+from opendet3d.op.fpp.channel_mapper import ChannelMapper
 from opendet3d.zoo.gdino.base.connector import (
-    CONN_GDINO_LOSS,
-    CONN_BBOX_2D_TRAIN,
     CONN_BBOX_2D_TEST,
+    CONN_BBOX_2D_TRAIN_WITH_TOKENS,
     CONN_BBOX_2D_VIS,
+    CONN_GDINO_LOSS,
 )
-from opendet3d.zoo.gdino.base.data import get_coco_detection_cfg
+from opendet3d.zoo.gdino.base.data import get_data_cfg
+from opendet3d.zoo.gdino.base.datasets import (
+    get_coco_detection_test_cfg,
+    get_objects365v1_detection_train_cfg,
+)
 from opendet3d.zoo.gdino.base.model import get_gdino_cfg
 
 
@@ -45,15 +49,15 @@ def get_config() -> ExperimentConfig:
     ######################################################
     ##                    General Config                ##
     ######################################################
-    config = get_default_cfg(exp_name="gdino_swin-t_o365")
+    config = get_default_cfg(exp_name="gdino_swin-t_o365v1")
 
-    config.use_checkpoint = False
+    config.use_checkpoint = True
 
     # High level hyper parameters
     params = ExperimentParameters()
     params.samples_per_gpu = 4
     params.workers_per_gpu = 4
-    params.lr = 0.0002  # bs=64, lr=0.0002
+    params.lr = 0.0004  # bs=128, lr=0.0004
     params.num_epochs = 12
     params.accumulate_grad_batches = 1
     config.params = params
@@ -61,17 +65,31 @@ def get_config() -> ExperimentConfig:
     ######################################################
     ##          Datasets with augmentations             ##
     ######################################################
-    data_root = "data/coco"
-    train_split = "train2017"
-    test_split = "val2017"
-
+    data_root = "data"
     data_backend = class_config(HDF5Backend)
 
-    config.data = get_coco_detection_cfg(
-        data_root=data_root,
-        train_split=train_split,
-        test_split=test_split,
+    # Train Datasets
+    o365v1_data_root = os.path.join(data_root, "objects365v1")
+    o365v1 = get_objects365v1_detection_train_cfg(
+        data_root=o365v1_data_root,
+        ann_file="o365v1_train_odvg.json",
+        label_map_file="o365v1_label_map.json",
+        dataset_prefix="train",
         data_backend=data_backend,
+    )
+
+    # Test Datasets
+    coco_data_root = os.path.join(data_root, "coco")
+    coco_test_split = "val2017"
+    coco_test_cfg = get_coco_detection_test_cfg(
+        data_root=coco_data_root,
+        test_split=coco_test_split,
+        data_backend=data_backend,
+    )
+
+    config.data = get_data_cfg(
+        train_datasets=[o365v1],
+        test_datasets=coco_test_cfg,
         samples_per_gpu=params.samples_per_gpu,
         workers_per_gpu=params.workers_per_gpu,
     )
@@ -107,10 +125,7 @@ def get_config() -> ExperimentConfig:
     config.model = get_gdino_cfg(
         basemodel=basemodel,
         neck=neck,
-        mm_gdino=True,
         pretrained="mm_gdino_swin_tiny_obj365_goldg_grit9m_v3det",
-        # mm_gdino=False,
-        # pretrained="gdino_swin_tiny_obj365_goldg_cap4m",
         use_checkpoint=config.use_checkpoint,
     )
 
@@ -149,7 +164,7 @@ def get_config() -> ExperimentConfig:
     ##                  DATA CONNECTOR                  ##
     ######################################################
     config.train_data_connector = class_config(
-        DataConnector, key_mapping=CONN_BBOX_2D_TRAIN
+        DataConnector, key_mapping=CONN_BBOX_2D_TRAIN_WITH_TOKENS
     )
 
     config.test_data_connector = class_config(
@@ -180,7 +195,9 @@ def get_config() -> ExperimentConfig:
         class_config(
             EvaluatorCallback,
             evaluator=class_config(
-                COCODetectEvaluator, data_root=data_root, split=test_split
+                COCODetectEvaluator,
+                data_root=coco_data_root,
+                split=coco_test_split,
             ),
             metrics_to_eval=["Det"],
             test_connector=class_config(
@@ -201,9 +218,5 @@ def get_config() -> ExperimentConfig:
     pl_trainer.accumulate_grad_batches = params.accumulate_grad_batches
     pl_trainer.gradient_clip_val = 0.1
     config.pl_trainer = pl_trainer
-
-    # PL Callbacks
-    pl_callbacks: list[pl.Callback] = []
-    config.pl_callbacks = pl_callbacks
 
     return config.value_mode()

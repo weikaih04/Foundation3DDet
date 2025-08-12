@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
-
 from vis4d.op.layer.attention import MultiheadAttention
 from vis4d.op.layer.transformer import FFN, get_clones
 
