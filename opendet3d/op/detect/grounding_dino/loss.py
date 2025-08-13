@@ -151,7 +151,7 @@ class GroundingDINOLoss(nn.Module):
         gt_classes: Tensor,
         positive_map: Tensor,
         text_token_mask: Tensor,
-    ):
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Compute regression and classification targets for one image."""
         img_h, img_w = input_hw
         num_bboxes = bbox_pred.size(0)

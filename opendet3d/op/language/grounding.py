@@ -6,7 +6,6 @@ import nltk
 import torch
 from torch import Tensor
 from transformers import BatchEncoding
-
 from vis4d.common.logging import rank_zero_info, rank_zero_warn
 
 
