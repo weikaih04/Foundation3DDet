@@ -38,7 +38,7 @@ from opendet3d.data.transforms.resize import GenResizeParameters
 
 
 def get_train_transforms_cfg(
-    shape: tuple[int, int] = (800, 1333), with_depth: bool = False
+    shape: tuple[int, int] = (800, 1333)
 ) -> ConfigDict:
     """Get train data transforms."""
     preprocess_transforms = [
@@ -46,10 +46,8 @@ def get_train_transforms_cfg(
         class_config(ResizeImages),
         class_config(ResizeBoxes2D),
         class_config(ResizeIntrinsics),
+        class_config(ResizeDepthMaps),
     ]
-
-    if with_depth:
-        preprocess_transforms.append(class_config(ResizeDepthMaps))
 
     # Center Crop
     preprocess_transforms += [
@@ -58,20 +56,16 @@ def get_train_transforms_cfg(
         class_config(CropBoxes2D),
         class_config(CropBoxes3D),
         class_config(CropIntrinsics),
+        class_config(CropDepthMaps),
     ]
-
-    if with_depth:
-        preprocess_transforms.append(class_config(CropDepthMaps))
 
     flip_transforms = [
         class_config(FlipImages),
         class_config(FlipIntrinsics),
         class_config(FlipBoxes2D),
         class_config(FlipBoxes3D),
+        class_config(FlipDepthMaps),
     ]
-
-    if with_depth:
-        flip_transforms.append(class_config(FlipDepthMaps))
 
     preprocess_transforms.append(
         class_config(RandomApply, transforms=flip_transforms, probability=0.5)
@@ -89,10 +83,8 @@ def get_train_transforms_cfg(
         ),
         class_config(CenterPadBoxes2D),
         class_config(CenterPadIntrinsics),
+        class_config(CenterPadDepthMaps),
     ]
-
-    if with_depth:
-        preprocess_transforms.append(class_config(CenterPadDepthMaps))
 
     train_preprocess_cfg = class_config(
         compose, transforms=preprocess_transforms

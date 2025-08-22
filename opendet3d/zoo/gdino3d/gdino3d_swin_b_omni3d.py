@@ -1,4 +1,4 @@
-"""3D-MOOD with Swin-T."""
+"""3D-MOOD with Swin-B."""
 
 from __future__ import annotations
 
@@ -24,18 +24,18 @@ from opendet3d.zoo.gdino3d.base.dataset.open import (
 from opendet3d.zoo.gdino3d.base.loss import get_loss_cfg
 from opendet3d.zoo.gdino3d.base.model import (
     get_gdino3d_hyperparams_cfg,
-    get_gdino3d_swin_tiny_cfg,
+    get_gdino3d_swin_base_cfg,
 )
 from opendet3d.zoo.gdino3d.base.optim import get_optim_cfg
 from opendet3d.zoo.gdino3d.base.pl import get_pl_cfg
 
 
 def get_config() -> ExperimentConfig:
-    """Returns the 3D-MOOD with Swin-T."""
+    """Returns the 3D-MOOD with Swin-B."""
     ######################################################
     ##                    General Config                ##
     ######################################################
-    config = get_default_cfg(exp_name="gdino3d_swin-t_omni3d")
+    config = get_default_cfg(exp_name="gdino3d_swin-b_omni3d")
 
     config.use_checkpoint = False
 
@@ -90,9 +90,9 @@ def get_config() -> ExperimentConfig:
     ######################################################
     ##                  MODEL & LOSS                    ##
     ######################################################
-    config.model, box_coder = get_gdino3d_swin_tiny_cfg(
+    config.model, box_coder = get_gdino3d_swin_base_cfg(
         params=params,
-        pretrained="mm_gdino_swin_tiny_obj365_goldg_grit9m_v3det",
+        pretrained="mm_gdino_swin_base_all",
         use_checkpoint=config.use_checkpoint,
     )
 

@@ -19,8 +19,12 @@ typeCheckingMode = "off"
 
 [project]
 name = "opendet3d"
-description = "PyTorch implementation of 3D-MOOD."
+description = "3D-MOOD: Lifting 2D to 3D for Monocular Open-Set Object Detection"
 version = "0.0.0"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]
 include = ["opendet3d*"]

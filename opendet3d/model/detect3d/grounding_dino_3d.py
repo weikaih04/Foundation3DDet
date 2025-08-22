@@ -98,13 +98,8 @@ class GroundingDINO3D(GroundingDINO):
         self.roi2det3d = roi2det3d or RoI2Det3D()
 
         # Depth Head
-        self.with_depth = True
-
         self.fpn = fpn
-
-        if self.with_depth:
-            assert depth_head is not None, "Depth head should be provided."
-            self.depth_head = depth_head
+        self.depth_head = depth_head
 
         if freeze_detector:
             self._freeze_detector()
@@ -429,13 +424,9 @@ class GroundingDINO3D(GroundingDINO):
         )
 
         # Depth Head
-        if self.with_depth:
-            depth_preds, depth_latents = self.depth_head(
-                depth_feats, intrinsics, batch_input_shape
-            )
-        else:
-            depth_preds = None
-            depth_latents = None
+        depth_preds, depth_latents = self.depth_head(
+            depth_feats, intrinsics, batch_input_shape
+        )
 
         (
             memory_text,
@@ -572,39 +563,31 @@ class GroundingDINO3D(GroundingDINO):
                 )
 
                 # Depth Head
-                if self.with_depth:
-                    depth_preds, depth_latents = self.depth_head(
-                        depth_feats, intrinsics, batch_input_shape
-                    )
+                depth_preds, depth_latents = self.depth_head(
+                    depth_feats, intrinsics, batch_input_shape
+                )
 
-                    depth_maps = []
-                    for i, depth_pred in enumerate(depth_preds):
-                        if padding is not None:
-                            pad_left, pad_right, pad_top, pad_bottom = padding[
-                                i
-                            ]
+                depth_maps = []
+                for i, depth_pred in enumerate(depth_preds):
+                    if padding is not None:
+                        pad_left, pad_right, pad_top, pad_bottom = padding[i]
 
-                            depth_pred = depth_pred[
-                                pad_top : batch_input_img_h - pad_bottom,
-                                pad_left : batch_input_img_w - pad_right,
-                            ]
+                        depth_pred = depth_pred[
+                            pad_top : batch_input_img_h - pad_bottom,
+                            pad_left : batch_input_img_w - pad_right,
+                        ]
 
-                        depth_maps.append(
-                            F.interpolate(
-                                depth_pred.unsqueeze(0).unsqueeze(0),
-                                size=original_hw[i],
-                                mode="bilinear",
-                                align_corners=False,
-                                antialias=True,
-                            )
-                            .squeeze(0)
-                            .squeeze(0)
+                    depth_maps.append(
+                        F.interpolate(
+                            depth_pred.unsqueeze(0).unsqueeze(0),
+                            size=original_hw[i],
+                            mode="bilinear",
+                            align_corners=False,
+                            antialias=True,
                         )
-
-                    depth_maps = torch.stack(depth_maps)
-                else:
-                    depth_maps = None
-                    depth_latents = None
+                        .squeeze(0)
+                        .squeeze(0)
+                    )
 
                 (
                     memory_text,
@@ -692,35 +675,31 @@ class GroundingDINO3D(GroundingDINO):
             )
 
             # Depth Head
-            if self.with_depth:
-                depth_preds, depth_latents = self.depth_head(
-                    depth_feats, intrinsics, batch_input_shape
-                )
+            depth_preds, depth_latents = self.depth_head(
+                depth_feats, intrinsics, batch_input_shape
+            )
 
-                depth_maps = []
-                for i, depth_pred in enumerate(depth_preds):
-                    if padding is not None:
-                        pad_left, pad_right, pad_top, pad_bottom = padding[i]
+            depth_maps = []
+            for i, depth_pred in enumerate(depth_preds):
+                if padding is not None:
+                    pad_left, pad_right, pad_top, pad_bottom = padding[i]
 
-                        depth_pred = depth_pred[
-                            pad_top : batch_input_img_h - pad_bottom,
-                            pad_left : batch_input_img_w - pad_right,
-                        ]
+                    depth_pred = depth_pred[
+                        pad_top : batch_input_img_h - pad_bottom,
+                        pad_left : batch_input_img_w - pad_right,
+                    ]
 
-                    depth_maps.append(
-                        F.interpolate(
-                            depth_pred.unsqueeze(0).unsqueeze(0),
-                            size=original_hw[i],
-                            mode="bilinear",
-                            align_corners=False,
-                            antialias=True,
-                        )
-                        .squeeze(0)
-                        .squeeze(0)
+                depth_maps.append(
+                    F.interpolate(
+                        depth_pred.unsqueeze(0).unsqueeze(0),
+                        size=original_hw[i],
+                        mode="bilinear",
+                        align_corners=False,
+                        antialias=True,
                     )
-            else:
-                depth_maps = None
-                depth_latents = None
+                    .squeeze(0)
+                    .squeeze(0)
+                )
 
             (
                 memory_text,

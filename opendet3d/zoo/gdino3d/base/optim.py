@@ -10,22 +10,6 @@ from vis4d.config.typing import ExperimentParameters
 from vis4d.zoo.base import get_lr_scheduler_cfg, get_optimizer_cfg
 
 
-def get_1x_schedule(
-    params: ExperimentParameters, epoch_based: bool = True
-) -> None:
-    """Returns the 1 times training schedule."""
-    if epoch_based:
-        params.num_epochs = 12
-        params.step_1 = 8
-        params.step_2 = 11
-        params.check_val_every_n_epoch = 1
-    else:
-        params.num_iters = 30000
-        params.step_1 = 20000
-        params.step_2 = 27500
-        params.val_freq = 3000
-
-
 def get_optim_cfg(
     params: ExperimentParameters,
     epoch_based: bool = True,

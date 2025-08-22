@@ -1,6 +1,8 @@
 """Box operations for 2D bounding boxes."""
 
 import torch
+import numpy as np
+
 from torch import Tensor
 
 
@@ -233,3 +235,39 @@ def bbox_overlaps(bboxes1, bboxes2, mode="iou", is_aligned=False, eps=1e-6):
     enclose_area = torch.max(enclose_area, eps)
     gious = ious - (enclose_area - union) / enclose_area
     return gious
+
+
+def compute_visibility_mask(target_box, occluder_boxes, resolution=1):
+    """
+    target_box: [x_min, y_min, x_max, y_max]
+    occluder_boxes: list of [x_min, y_min, x_max, y_max] that are in front of the target_box.
+    resolution: size of one pixel in the coordinate system (default 1)
+
+    Returns:
+        visible fraction (a value between 0 and 1)
+    """
+    x_min, y_min, x_max, y_max = target_box
+    width = int((x_max - x_min) / resolution)
+    height = int((y_max - y_min) / resolution)
+
+    # Create a mask for the target box (1 means visible)
+    mask = np.ones((height, width), dtype=bool)
+
+    for occ in occluder_boxes:
+        occ_xmin, occ_ymin, occ_xmax, occ_ymax = occ
+        # Compute intersection between occluder and target box in pixel coordinates
+        ix_min = int(max(x_min, occ_xmin) - x_min)
+        iy_min = int(max(y_min, occ_ymin) - y_min)
+        ix_max = int(min(x_max, occ_xmax) - x_min)
+        iy_max = int(min(y_max, occ_ymax) - y_min)
+
+        if ix_max > ix_min and iy_max > iy_min:
+            mask[iy_min:iy_max, ix_min:ix_max] = False  # mark as occluded
+
+    visible_pixels = np.sum(mask)
+    total_pixels = mask.size
+
+    if total_pixels == 0:
+        return 0.0
+
+    return visible_pixels / total_pixels

@@ -26,6 +26,30 @@
 - [ ] Release code and models.
 - [x] `25.06.2025`: 3D-MOOD is accepted at ICCV 2025!
 
+## Getting Started
+
+### Installation
+
+We support Python 3.11+ and PyTorch 2.4.0+. Please install the correct PyTorch version according to your own hardware settings.
+
+```bash
+conda create -n opendet3d python=3.11 -y
+
+conda activate opendet3d
+
+# Install Vis4D
+# It should also install the PyTorch with CUDA support. But please check.
+pip install vis4d
+
+# Install CUDA ops
+pip install git+https://github.com/SysCV/vis4d_cuda_ops.git
+
+# Install 3D-MOOD
+pip install -v -e .
+```
+
+### Data Preparation
+
 ## Citation
 
 If you find our work useful in your research please consider citing our publications:

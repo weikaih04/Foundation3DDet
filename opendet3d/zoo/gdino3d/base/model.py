@@ -31,9 +31,9 @@ def get_gdino3d_hyperparams_cfg() -> ExperimentParameters:
     params.weight_decay = 0.0001
 
     # Learning rate schedule
-    params.num_epochs = 12
-    params.step_1 = 8
-    params.step_2 = 11
+    params.num_epochs = 120
+    params.step_1 = 80
+    params.step_2 = 110
     params.check_val_every_n_epoch = 1
 
     # Grounding DINO 3D Coder
@@ -144,8 +144,8 @@ def get_gdino3d_swin_tiny_cfg(
     cat_mapping: dict[str, int] | None = None,
     pretrained: str | None = None,
     use_checkpoint: bool | FieldReference = False,
-):
-    """Get the Grounding DINO 3D with Swin-Tiny model config."""
+) -> ConfigDict:
+    """Get the config of Swin-Tiny."""
     basemodel = class_config(
         SwinTransformer,
         convert_weights=True,
@@ -197,8 +197,8 @@ def get_gdino3d_swin_base_cfg(
     cat_mapping: dict[str, int] | None = None,
     pretrained: str | None = None,
     use_checkpoint: bool | FieldReference = False,
-):
-    """Get the Grounding DINO 3D with Swin-Base model config."""
+) -> ConfigDict:
+    """Get the config of Swin-Base."""
     basemodel = class_config(
         SwinTransformer,
         convert_weights=True,

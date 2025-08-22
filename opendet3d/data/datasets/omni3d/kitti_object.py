@@ -67,54 +67,6 @@ def get_kitti_det_map(split: str) -> dict[str, int]:
     return kitti_train_det_map
 
 
-def get_kitti_mapping(
-    object_data_root: str = "data/KITTI_object",
-) -> tuple[list[str], list[str]]:
-    """Get the KITTI object and raw data mapping."""
-    with open(os.path.join(object_data_root, "train_rand.txt"), "r") as f:
-        kitti_train_rand = f.readlines()[0].split(",")
-
-    with open(os.path.join(object_data_root, "train_mapping.txt"), "r") as f:
-        kitti_train_mapping = f.readlines()
-
-    return kitti_train_rand, kitti_train_mapping
-
-
-def get_kitti_depth_data(
-    img_name: str,
-    kitti_train_rand: list[str],
-    kitti_train_mapping: list[str],
-    depth_data_root: str = "data/kitti_depth",
-) -> tuple[str, str]:
-    """Get the raw KITTI data from Object dataset."""
-    raw = kitti_train_mapping[
-        int(kitti_train_rand[int(img_name)]) - 1
-    ].replace("\n", "")
-    date, seq_name, raw_img_name = raw.split()
-
-    depth_file_path = os.path.join(
-        depth_data_root,
-        "input",
-        date,
-        seq_name,
-        "image_00",
-        "data",
-        f"{raw_img_name}.png",
-    )
-
-    depth_gt_file_path = os.path.join(
-        depth_data_root,
-        "gt_depth",
-        seq_name,
-        "proj_depth",
-        "groundtruth",
-        "image_02",
-        f"{raw_img_name}.png",
-    )
-
-    return depth_file_path, depth_gt_file_path
-
-
 class KITTIObject(COCO3DDataset):
     """KITTI Object Dataset."""
 
@@ -123,10 +75,11 @@ class KITTIObject(COCO3DDataset):
         class_map: dict[str, int] = omni3d_class_map,
         max_depth: float = 80.0,
         depth_scale: float = 256.0,
+        depth_data_root: str = "data/KITTI_object_depth",
         **kwargs: ArgsType,
     ) -> None:
         """Creates an instance of the class."""
-        self.kitti_train_rand, self.kitti_train_mapping = get_kitti_mapping()
+        self.depth_data_root = depth_data_root
 
         super().__init__(
             class_map=class_map,
@@ -140,9 +93,13 @@ class KITTIObject(COCO3DDataset):
 
         Since not every data has depth.
         """
-        _, depth_filename = get_kitti_depth_data(
-            img["file_path"].split("/")[-1].split(".")[0],
-            self.kitti_train_rand,
-            self.kitti_train_mapping,
+        _, _, split, image_id, img_filename = img["file_path"].split("/")
+
+        depth_filename = os.path.join(
+            self.depth_data_root,
+            split,
+            image_id,
+            img_filename.replace(".jpg", ".png"),
         )
+
         return depth_filename

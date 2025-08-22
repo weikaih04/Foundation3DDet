@@ -1,4 +1,4 @@
-vis4d==0.1.4
+vis4d==1.0.0
 wandb
 einops
 fvcore
@@ -6,4 +6,3 @@ nltk
 transformers
 fairscale
 mmengine
-bitsandbytes

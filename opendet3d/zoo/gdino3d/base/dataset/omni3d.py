@@ -90,7 +90,6 @@ def get_omni3d_train_cfg(
     ),
     data_backend: None | ConfigDict = None,
     omni3d50: bool = True,
-    with_depth: bool = False,
     shape: tuple[int, int] = (800, 1333),
     cache_as_binary: bool = True,
 ) -> ConfigDict:
@@ -101,13 +100,11 @@ def get_omni3d_train_cfg(
         data_backend=data_backend,
         omni3d50=omni3d50,
         remove_empty=True,
-        with_depth=with_depth,
+        with_depth=True,
         cache_as_binary=cache_as_binary,
     )
 
-    train_preprocess_cfg = get_train_transforms_cfg(
-        shape=shape, with_depth=with_depth
-    )
+    train_preprocess_cfg = get_train_transforms_cfg(shape=shape)
 
     return class_config(
         DataPipe,

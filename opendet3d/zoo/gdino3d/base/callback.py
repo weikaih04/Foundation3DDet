@@ -1,4 +1,4 @@
-"""Grounding DINO 3D Callbacks."""
+"""Callbacks for 3D-MOOD."""
 
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ from opendet3d.zoo.gdino3d.base.connector import (
 
 def get_callback_cfg(
     output_dir: str | FieldReference,
-    omni3d_evaluator: ConfigDict | None,
     open_test_datasets: list[str] | None,
+    omni3d_evaluator: ConfigDict | None = None,
     visualize_depth: bool = False,
 ) -> list[ConfigDict]:
     """Get callbacks for Omni3D."""
@@ -92,6 +92,7 @@ def get_callback_cfg(
             )
         )
     else:
+        assert omni3d_evaluator is not None, "No evaluator provided."
         callbacks.append(
             class_config(
                 EvaluatorCallback,
