@@ -80,8 +80,6 @@ class DepthVisualizer(Visualizer):
         depths: ArrayLikeFloat,
         depth_gts: ArrayLikeFloat | None = None,
         intrinsics: ArrayLikeFloat | None = None,
-        masks: list[ArrayLikeUInt] | None = None,
-        class_ids: list[ArrayLikeInt] | None = None,
     ) -> None:
         """Process data of a batch of data."""
         if self._run_on_batch(cur_iter):
@@ -102,8 +100,6 @@ class DepthVisualizer(Visualizer):
                             if intrinsics is not None
                             else None
                         ),
-                        None if masks is None else masks[i],
-                        None if class_ids is None else class_ids[i],
                     )
                 )
 

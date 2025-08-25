@@ -4,6 +4,8 @@
 
 <a href="https://arxiv.org/abs/2507.23567"><img src='https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white' alt='arXiv'></a>
 <a href='https://royyang0714.github.io/3D-MOOD'><img src='https://img.shields.io/badge/Project_Page-Website-green?logo=googlechrome&logoColor=white' alt='Project Page'></a>
+<a href='https://huggingface.co/RoyYang0714/3D-MOOD'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-blue'></a>
+<a href='https://huggingface.co/datasets/RoyYang0714/3D-MOOD'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Datasets-blue'></a>
 
 </div>
 
@@ -136,7 +138,7 @@ vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_b_scannet200.py --gpus 1 
 It will dump all the visualization results under `vis4d-workspace/gdino3d_swin-b_omni3d/${VERSION}/vis/test/`.
 
 ```bash
-vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_b_omni3d.py --gpus 1 --ckpt https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-b_120e_omni3d_834c97.pt --vis
+vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_b_omni3d.py --gpus 1 --ckpt https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-b_120e_omni3d_834c97.pt --vis --config.params.nms=True --config.params.score_threshold=0.1
 ```
 
 

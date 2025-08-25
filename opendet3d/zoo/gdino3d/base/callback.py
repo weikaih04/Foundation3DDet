@@ -36,7 +36,7 @@ def get_callback_cfg(
     output_dir: str | FieldReference,
     open_test_datasets: list[str] | None,
     omni3d_evaluator: ConfigDict | None = None,
-    visualize_depth: bool = False,
+    visualize_depth: bool = True,
 ) -> list[ConfigDict]:
     """Get callbacks for Omni3D."""
     # Logger
@@ -205,7 +205,7 @@ def get_visualizer_callback_cfg(
     vis_freq: int = 50,
     width: int = 4,
     font_size: int = 16,
-    save_boxes3d: bool = False,
+    save_boxes3d: bool = True,
 ) -> list[ConfigDict]:
     """Get basic callbacks."""
     callbacks = []
