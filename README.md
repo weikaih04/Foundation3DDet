@@ -96,10 +96,12 @@ Or you can just change the `data_backend` in the configs to `FileBackend`.
 
 Note that the score of Argoverse 2 and ScanNet is the proposed open detection score (**ODS**) and the score for Omni3D test set is AP.
 
-| Model | Config | KITTI | nuScenes | SUNRGBD | Hypersim | ARKitScenes | Objectron | **Omni3D** | **Argoverse 2** | **ScanNet** |
-|:-----:|:------:|:-----:|:--------:|:-------:|:--------:|:-----------:|:---------:|:------:|:---------------:|:-----------:|
-| [Swin-T](https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-t_120e_omni3d_699f69.pt) | [config](./opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py) | 32.8 | 31.5 | 21.9 | 10.5 | 51.0 | 64.3 | 28.4 | 22.4 | 30.2 |
-| [Swin-B](https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-b_120e_omni3d_834c97.pt) | [config](./opendet3d/zoo/gdino3d/gdino3d_swin_b_omni3d.py) | 31.4 | 35.8 | 23.8 |  9.1 | 53.9 | 67.9 | 30.0 | 23.8 | 31.5 |
+| Backbone | Config | Omni3D | **Argoverse 2** | **ScanNet** |
+|:--------:|:------:|:------:|:---------------:|:-----------:|
+| [Swin-T](https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-t_120e_omni3d_699f69.pt) | [config](./opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py) | 28.4 | 22.4 | 30.2 |
+| [Swin-B](https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-b_120e_omni3d_834c97.pt) | [config](./opendet3d/zoo/gdino3d/gdino3d_swin_b_omni3d.py) | 30.0 | 23.8 | 31.5 |
+
+For per-dataset results for Omni3D, please refer to the Table 3 of the paper.
 
 ### Testing
 
@@ -126,7 +128,7 @@ vis4d fit --config opendet3d/zoo/gdino3d/gdino3d_swin_b_omni3d.py --gpus 8 --nod
 
 ### ScanNet200
 
-We provide the scripts to reproduce our ScanNet200 results in supplementray.
+We also provide the code to reproduce our ScanNet200 results in supplementray.
 Note that it will take longer time since we need to chunk the classes.
 
 ```bash
