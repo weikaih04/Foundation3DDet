@@ -2,7 +2,8 @@
 
 ## Omni3D
 
-Download the Omni3D annotations.
+We provide the instruction to prepare Omni3D data and annotations.
+We also provide the preprocessed HDF5 depth GT [here](https://huggingface.co/datasets/RoyYang0714/3D-MOOD).
 
 ```bash
 cd data
@@ -23,7 +24,7 @@ data
         ├── XXX.json
 ```
 
-## KITTI Object
+### KITTI Object
 
 Download the left color images from [KITTI's official website](http://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=3d).
 
@@ -58,7 +59,7 @@ data
 ├── KITTI_object_depth
 ```
 
-## NuScenes
+### NuScenes
 
 1. Download the `trainval` and `CAN bus` from the [official nuScenes website](https://www.nuscenes.org/nuscenes#download).
 Unzip or softlink the data into the root `data/nuscenes`.
@@ -81,7 +82,7 @@ data
 ├── nuscenes_depth
 ```
 
-## Objectron
+### Objectron
 
 1. Get the data provided by Omni3D.
 
@@ -128,7 +129,7 @@ data
 ├── objectron_depth
 ```
 
-## SUN RGB-D
+### SUN RGB-D
 
 Download the "SUNRGBD V1" images at SUN RGB-D's official website.
 ```bash
@@ -150,7 +151,7 @@ data
 │   ├── realsense
 ```
 
-## ARKitScenes
+### ARKitScenes
 
 1. Download the data provided by Omni3D.
 
@@ -184,7 +185,7 @@ data
 ├── ARKitScenes_depth
 ```
 
-## Hypersim
+### Hypersim
 
 1. Clone the hypersim repo under `data` folder.
 
@@ -226,3 +227,34 @@ data
 ├── hypersim
 ├── hypersim_depth
 ```
+
+## Argoverse 2
+
+1. Download Argoverse 2 data.
+
+```bash
+python scripts/argoverse/download.py
+```
+
+It will download the sensor dataset under `data/av2`.
+
+2. Convert dataset.
+
+```bash
+python scripts/argoverse/convert_av2.py
+```
+
+The final data folder structure will be like:
+
+```bash
+data
+├── av2
+├── argoverse
+├── argoverse
+│   ├── val
+│   ├── annotations
+```
+
+## ScanNet
+
+Please refer [here](../scripts/scannet/README.md) for preprocessing ScanNet.

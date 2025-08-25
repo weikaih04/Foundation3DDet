@@ -103,10 +103,10 @@ Note that the score of Argoverse 2 and ScanNet is the proposed open detection sc
 
 ```bash
 # Swin-T
-vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py --gpus 8 ---ckpt https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-t_120e_omni3d_699f69.pt
+vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py --gpus 1 ---ckpt https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-t_120e_omni3d_699f69.pt
 
 # Swin-B 
-vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py --gpus 8 --ckpt https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-b_120e_omni3d_834c97.pt
+vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_b_omni3d.py --gpus 1 --ckpt https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-b_120e_omni3d_834c97.pt
 ```
 
 ### Training
@@ -119,7 +119,16 @@ The setting is assumed running on the cluster using RTX 4090.
 vis4d fit --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py --gpus 8 --nodes 4 --config.params.samples_per_gpu=4
 
 # Swin-B 
-vis4d fit --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py --gpus 8 --nodes 8
+vis4d fit --config opendet3d/zoo/gdino3d/gdino3d_swin_b_omni3d.py --gpus 8 --nodes 8
+```
+
+### ScanNet200
+
+We provide the scripts to reproduce our ScanNet200 results in supplementray.
+Note that it will take longer time since we need to chunk the classes.
+
+```bash
+vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_b_scannet200.py --gpus 1 --ckpt https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-b_120e_omni3d_834c97.pt
 ```
 
 ### Visualization
@@ -127,7 +136,7 @@ vis4d fit --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py --gpus 8 --nod
 It will dump all the visualization results under `vis4d-workspace/gdino3d_swin-b_omni3d/${VERSION}/vis/test/`.
 
 ```bash
-vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py --gpus 1 --ckpt https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-b_120e_omni3d_834c97.pt --vis
+vis4d test --config opendet3d/zoo/gdino3d/gdino3d_swin_b_omni3d.py --gpus 1 --ckpt https://huggingface.co/RoyYang0714/3D-MOOD/resolve/main/gdino3d_swin-b_120e_omni3d_834c97.pt --vis
 ```
 
 

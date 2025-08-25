@@ -5,3 +5,4 @@ nltk
 transformers
 fairscale
 mmengine
+pyarrow

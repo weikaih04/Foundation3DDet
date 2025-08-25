@@ -121,11 +121,7 @@ def get_config() -> ExperimentConfig:
     )
 
     # Open Detect3D Evaluator
-    open_test_datasets = [
-        "Argoverse_val",
-        "ScanNet_val",
-        # "ScanNet200_val",
-    ]
+    open_test_datasets = ["Argoverse_val", "ScanNet_val"]
 
     callbacks = get_callback_cfg(
         output_dir=config.output_dir,

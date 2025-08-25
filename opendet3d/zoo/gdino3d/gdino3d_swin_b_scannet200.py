@@ -7,20 +7,12 @@ from vis4d.config.typing import ExperimentConfig
 from vis4d.data.io.hdf5 import HDF5Backend
 from vis4d.zoo.base import get_default_cfg
 
-from opendet3d.zoo.gdino3d.base.callback import (
-    get_callback_cfg,
-    get_omni3d_evaluator_cfg,
-)
+from opendet3d.data.datasets.scannet import scannet200_det_map
+from opendet3d.zoo.gdino3d.base.callback import get_callback_cfg
 from opendet3d.zoo.gdino3d.base.connector import get_data_connector_cfg
 from opendet3d.zoo.gdino3d.base.data import get_data_cfg
-from opendet3d.zoo.gdino3d.base.dataset.omni3d import (
-    get_omni3d_test_cfg,
-    get_omni3d_train_cfg,
-)
-from opendet3d.zoo.gdino3d.base.dataset.open import (
-    get_av2_data_cfg,
-    get_scannet_data_cfg,
-)
+from opendet3d.zoo.gdino3d.base.dataset.omni3d import get_omni3d_train_cfg
+from opendet3d.zoo.gdino3d.base.dataset.open import get_scannet_data_cfg
 from opendet3d.zoo.gdino3d.base.loss import get_loss_cfg
 from opendet3d.zoo.gdino3d.base.model import (
     get_gdino3d_hyperparams_cfg,
@@ -35,7 +27,7 @@ def get_config() -> ExperimentConfig:
     ######################################################
     ##                    General Config                ##
     ######################################################
-    config = get_default_cfg(exp_name="gdino3d_swin-b_omni3d")
+    config = get_default_cfg(exp_name="gdino3d_swin-b_scannet200")
 
     config.use_checkpoint = True
 
@@ -53,31 +45,14 @@ def get_config() -> ExperimentConfig:
 
     # Omni3D
     omni3d_data_root = "data/omni3d"
-    omni3d_test_datasets = (
-        "KITTI_test",
-        "nuScenes_test",
-        "SUNRGBD_test",
-        "Hypersim_test",
-        "ARKitScenes_test",
-        "Objectron_test",
-    )
 
     omni3d_train_data_cfg = get_omni3d_train_cfg(
         data_root=omni3d_data_root, data_backend=data_backend
     )
 
-    omni3d_test_data_cfg = get_omni3d_test_cfg(
-        data_root=omni3d_data_root,
-        test_datasets=omni3d_test_datasets,
-        data_backend=data_backend,
-    )
-
-    test_datasets_cfg.append(omni3d_test_data_cfg)
-
     # Open Datasets
     test_datasets_cfg += [
-        get_av2_data_cfg(data_backend=data_backend),
-        get_scannet_data_cfg(data_backend=data_backend),
+        get_scannet_data_cfg(data_backend=data_backend, scannet200=True),
     ]
 
     config.data = get_data_cfg(
@@ -93,6 +68,8 @@ def get_config() -> ExperimentConfig:
     config.model, box_coder = get_gdino3d_swin_base_cfg(
         params=params,
         pretrained="mm_gdino_swin_base_all",
+        chunked_size=20,
+        cat_mapping=scannet200_det_map,
         use_checkpoint=config.use_checkpoint,
     )
 
@@ -113,20 +90,11 @@ def get_config() -> ExperimentConfig:
     ######################################################
     ##                     CALLBACKS                    ##
     ######################################################
-    # Omni3D Evaluator
-    omni3d_evaluator_cfg = get_omni3d_evaluator_cfg(
-        data_root=omni3d_data_root,
-        omni3d50=True,
-        test_datasets=omni3d_test_datasets,
-    )
-
     # Open Detect3D Evaluator
-    open_test_datasets = ["Argoverse_val", "ScanNet_val"]
+    open_test_datasets = ["ScanNet200_val"]
 
     callbacks = get_callback_cfg(
-        output_dir=config.output_dir,
-        omni3d_evaluator=omni3d_evaluator_cfg,
-        open_test_datasets=open_test_datasets,
+        output_dir=config.output_dir, open_test_datasets=open_test_datasets
     )
 
     config.callbacks = callbacks
