@@ -37,7 +37,7 @@ def get_config() -> ExperimentConfig:
     ######################################################
     config = get_default_cfg(exp_name="gdino3d_swin-b_omni3d")
 
-    config.use_checkpoint = False
+    config.use_checkpoint = True
 
     # High level hyper parameters
     params = get_gdino3d_hyperparams_cfg()

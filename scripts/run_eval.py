@@ -4,7 +4,6 @@ import argparse
 import json
 
 from opendet3d.eval.omni3d import Omni3DEvaluator
-from opendet3d.eval.open import OpenDetect3DEvaluator
 from opendet3d.eval.detect3d import Detect3DEvaluator
 from opendet3d.data.datasets.argoverse import av2_class_map, av2_det_map
 from opendet3d.data.datasets.scannet import (
@@ -78,73 +77,6 @@ def eval_scannet(prediction_file_path: str) -> None:
     print(log_str)
 
 
-def eval_open(output_dir: str):
-    """Evaluate Open datasets."""
-    evaluator = OpenDetect3DEvaluator(
-        datasets=["Argoverse_val", "ScanNet_val"],
-        evaluators=[
-            Detect3DEvaluator(
-                det_map=av2_det_map,
-                cat_map=av2_class_map,
-                annotation="data/argoverse/annotations/Argoverse_val.json",
-                eval_prox=True,
-                iou_type="dist",
-                num_columns=2,
-                base_classes=[
-                    "regular vehicle",
-                    "pedestrian",
-                    "bicyclist",
-                    "construction cone",
-                    "construction barrel",
-                    "large vehicle",
-                    "bus",
-                    "truck",
-                    "vehicular trailer",
-                    "bicycle",
-                    "motorcycle",
-                ],
-            ),
-            Detect3DEvaluator(
-                det_map=scannet_det_map,
-                cat_map=scannet_class_map,
-                annotation=f"data/scannet/annotations/ScanNet_val.json",
-                iou_type="dist",
-                num_columns=2,
-                base_classes=[
-                    "cabinet",
-                    "bed",
-                    "chair",
-                    "sofa",
-                    "table",
-                    "door",
-                    "window",
-                    "picture",
-                    "counter",
-                    "desk",
-                    "curtain",
-                    "refrigerator",
-                    "toilet",
-                    "sink",
-                    "bathtub",
-                ],
-            ),
-        ],
-    )
-
-    for dataset in evaluator.dataset_names:
-        with open(f"{output_dir}/{dataset}/detect_3D_results.json", "r") as f:
-            results = json.load(f)
-
-        evaluator.evaluators[dataset]._predictions = results
-
-    log_dict, log_str = evaluator.evaluate("3D")
-
-    for k, v in log_dict.items():
-        print(f"{k}: {v}")
-
-    print(log_str)
-
-
 if __name__ == "__main__":
     """Run evaluation."""
     parser = argparse.ArgumentParser(
@@ -160,8 +92,6 @@ if __name__ == "__main__":
 
     if args.dataset == "omni3d":
         eval_omni3d(args.path)
-    elif args.dataset == "open":
-        eval_open(args.path)
     elif args.dataset == "av2":
         eval_av2(args.path)
     elif args.dataset == "scannet":

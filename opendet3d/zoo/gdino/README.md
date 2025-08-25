@@ -2,14 +2,18 @@
 
 ## Getting Started
 
-- Test the pre-trained G-DINO model on COCO
+- Test the pre-trained G-DINO model on COCO.
 ```bash
 vis4d test --config opendet3d/zoo/gdino/gdino_swin_t_o365.py --gpus 1
 ```
 
-- Train G-DINO with Objects365v1
+- Train G-DINO with Objects365v1.
+
+Please comment out [line 110](./gdino_swin_t_o365.py#L110) to train the model from scratch.
+And refer to the MM Grounding DINO for data preprocessing.
+
 ```bash
-vis4d fit --config opendet3d/zoo/gdino/gdino_swin_t_o365.py --gpus 8 --nodes 2
+vis4d fit --config opendet3d/zoo/gdino/gdino_swin_t_o365.py --gpus 8 --nodes 4 # batch size = 128
 ```
 
 ## Acknowledgement

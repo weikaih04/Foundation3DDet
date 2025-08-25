@@ -1,8 +1,7 @@
 """Box operations for 2D bounding boxes."""
 
-import torch
 import numpy as np
-
+import torch
 from torch import Tensor
 
 

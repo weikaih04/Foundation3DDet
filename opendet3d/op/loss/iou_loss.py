@@ -2,9 +2,10 @@
 
 import torch
 from torch import Tensor
-from unidet3d.op.box.box2d import bbox_overlaps
 from vis4d.op.loss.base import Loss
 from vis4d.op.loss.reducer import LossReducer, mean_loss
+
+from opendet3d.op.box.box2d import bbox_overlaps
 
 
 def giou_loss(pred: Tensor, target: Tensor, eps: float = 1e-7) -> Tensor:

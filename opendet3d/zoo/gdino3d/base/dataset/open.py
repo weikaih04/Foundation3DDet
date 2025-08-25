@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-
 from ml_collections import ConfigDict
-
 from vis4d.config import class_config
 from vis4d.data.data_pipe import DataPipe
 
