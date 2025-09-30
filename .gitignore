@@ -80,3 +80,4 @@ wandb/
 
 # No lightning logs
 lightning_logs/
+xtreme1/point_cloud_lidar.zip
