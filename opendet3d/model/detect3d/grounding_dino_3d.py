@@ -21,6 +21,10 @@ from opendet3d.op.detect3d.grounding_dino_3d import (
 from opendet3d.op.detect.grounding_dino import GroundingDINOHead, RoI2Det
 from opendet3d.op.fpp.channel_mapper import ChannelMapper
 
+# CUT3R Fusion imports
+from opendet3d.model.cut3r_tower import CUT3RTower
+from opendet3d.model.cut3r_fusion import MultiScaleCUT3RFusion
+
 
 class Det3DOut(NamedTuple):
     """Output of the detection model.
@@ -77,6 +81,14 @@ class GroundingDINO3D(GroundingDINO):
         freeze_detector: bool = False,
         weights: str | None = None,
         cat_mapping: dict[str, int] | None = None,
+        # CUT3R Fusion parameters
+        cut3r_checkpoint: str | None = None,
+        cut3r_freeze: bool = True,
+        fusion_levels: list[int] | None = None,
+        fusion_strategies: dict[int, dict] | None = None,
+        fusion_num_heads: int = 8,
+        fusion_dropout: float = 0.1,
+        use_relative_pos_bias: bool = False,
     ) -> None:
         """Create the Grounding DINO model."""
         super().__init__(
@@ -100,6 +112,51 @@ class GroundingDINO3D(GroundingDINO):
         # Depth Head
         self.fpn = fpn
         self.depth_head = depth_head
+
+        # ========== CUT3R Fusion Setup ==========
+        if cut3r_checkpoint is not None:
+            print(f"[GroundingDINO3D] Initializing CUT3R Fusion...")
+
+            # Create CUT3R Tower
+            self.cut3r_tower = CUT3RTower(
+                cut3r_checkpoint=cut3r_checkpoint,
+                freeze=cut3r_freeze
+            )
+
+            # Default fusion levels if not specified
+            if fusion_levels is None:
+                fusion_levels = [2, 3]  # Recommended: fuse L2 + L3
+
+            # Default fusion strategies if not specified
+            if fusion_strategies is None:
+                fusion_strategies = {
+                    0: {'type': 'deformable', 'n_points': 2},
+                    1: {'type': 'deformable', 'n_points': 4},
+                    2: {'type': 'deformable', 'n_points': 4},
+                    3: {'type': 'full', 'n_points': 730}
+                }
+
+            # Get d_models from backbone
+            # Swin Transformer outputs: [96, 192, 384, 768]
+            d_models = [96, 192, 384, 768]
+
+            # Create Multi-Scale Fusion
+            self.cut3r_fusion = MultiScaleCUT3RFusion(
+                d_models=d_models,
+                d_cut3r=1024,
+                num_heads=fusion_num_heads,
+                fusion_levels=fusion_levels,
+                fusion_strategies=fusion_strategies,
+                dropout=fusion_dropout,
+                use_relative_pos_bias=use_relative_pos_bias
+            )
+
+            # Print fusion summary
+            print(self.cut3r_fusion.get_fusion_summary())
+        else:
+            self.cut3r_tower = None
+            self.cut3r_fusion = None
+            print("[GroundingDINO3D] CUT3R Fusion disabled (no checkpoint provided)")
 
         if freeze_detector:
             self._freeze_detector()
@@ -279,19 +336,49 @@ class GroundingDINO3D(GroundingDINO):
         self, images: Tensor
     ) -> tuple[list[Tensor], list[Tensor] | None]:
         """Extract image features."""
+        # Step 1: Backbone
         visual_feats = self.backbone(images)[2:]
+        # visual_feats: List of 4 tensors
+        # - Level 0: [B, 96, 200, 333]
+        # - Level 1: [B, 192, 100, 166]
+        # - Level 2: [B, 384, 50, 83]
+        # - Level 3: [B, 768, 25, 41]
 
+        # ========== Step 2: CUT3R Fusion (INSERT HERE) ==========
+        # This happens BEFORE FPN and Neck, so both branches benefit
+        if self.cut3r_tower is not None and self.cut3r_fusion is not None:
+            # Extract CUT3R features
+            camera_tokens, patch_tokens = self.cut3r_tower(images)
+            # camera_tokens: [B, 1, 1024]
+            # patch_tokens: [B, 729, 1024]
+
+            # Concatenate camera and patch tokens
+            cut3r_features = torch.cat([camera_tokens, patch_tokens], dim=1)
+            # cut3r_features: [B, 730, 1024]
+
+            # Fuse with visual features
+            visual_feats, fusion_info = self.cut3r_fusion(visual_feats, cut3r_features)
+
+            # Optional: Log fusion strength during training
+            if self.training and hasattr(self, '_log_fusion_strength'):
+                for level, strength in fusion_info['fusion_strength'].items():
+                    print(f"  {level}: gate={strength:.4f}")
+
+        # Step 3: FPN (for Depth Head)
         if self.fpn is not None:
             depth_feats = self.fpn(visual_feats)
 
+        # Step 4: Adjust visual_feats for Neck if needed
         if len(visual_feats) > len(self.neck.in_channels):
             start_index = len(visual_feats) - len(self.neck.in_channels)
             # NOTE: This is to make sure the number of input channels is the
             # same as the number of input channels of the neck.
             visual_feats = visual_feats[start_index:]
 
+        # Step 5: Neck (Channel Mapper)
         visual_feats = self.neck(visual_feats)
 
+        # Step 6: Fallback for depth_feats
         if self.fpn is None:
             depth_feats = visual_feats
 
