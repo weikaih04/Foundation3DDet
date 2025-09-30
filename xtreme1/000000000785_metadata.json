@@ -1,0 +1,37 @@
+{
+  "image_path": "/home/murphy/data-ssd/weikai/3d_bounding_box_generation/sa1b_100_sampled_data/val2017/000000000785.jpg",
+  "image_name": "000000000785",
+  "image_shape": [
+    425,
+    640,
+    3
+  ],
+  "depth_path": "/mnt/sdd1/weikai/3d_bounding_box_generation/3d_box_estimation_pipeline/batch_30_results/depth_results/000000000785_depth.npy",
+  "depth_png_path": "/mnt/sdd1/weikai/3d_bounding_box_generation/3d_box_estimation_pipeline/batch_30_results/depth_results/000000000785_depth.png",
+  "depth_vis_path": "/mnt/sdd1/weikai/3d_bounding_box_generation/3d_box_estimation_pipeline/batch_30_results/depth_results/000000000785_depth_vis.png",
+  "intrinsics_path": "/mnt/sdd1/weikai/3d_bounding_box_generation/3d_box_estimation_pipeline/batch_30_results/depth_results/000000000785_intrinsics.npy",
+  "pcd_cam_rgb_vis_path": "/mnt/sdd1/weikai/3d_bounding_box_generation/3d_box_estimation_pipeline/batch_30_results/depth_results/000000000785_pcd_cam_rgb.png",
+  "processing_time": 0.056882619857788086,
+  "depth_range": {
+    "min": 4.984967231750488,
+    "max": 73.19586944580078,
+    "mean": 20.479511260986328
+  },
+  "intrinsics": [
+    [
+      1080.8787841796875,
+      0.0,
+      327.974609375
+    ],
+    [
+      0.0,
+      1060.4903564453125,
+      214.56298828125
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ]
+}
