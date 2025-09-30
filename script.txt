@@ -1,0 +1,45 @@
+apt update && apt install -y libgl1-mesa-glx libglib2.0-0
+
+vis4d fit --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py \
+    --gpus 8 \
+    --config.params.samples_per_gpu=8 \
+    --config.params.accumulate_grad_batches=16
+
+
+vis4d fit --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py \
+    --gpus 1 \
+    --config.params.samples_per_gpu=8 \
+    --config.params.accumulate_grad_batches=16
+
+
+
+
+python -m vis4d.data.io.to_hdf5 -p KITTI_object
+python -m vis4d.data.io.to_hdf5 -p nuscenes
+python -m vis4d.data.io.to_hdf5 -p objectron
+python -m vis4d.data.io.to_hdf5 -p SUNRGBD
+python -m vis4d.data.io.to_hdf5 -p ARKitScenes
+python -m vis4d.data.io.to_hdf5 -p hypersim
+
+python ../scripts/fast_to_hdf5.py -p nuscenes -w 64 -b 200
+python ../scripts/fast_to_hdf5.py -p KITTI_object -w 16 -b 200
+python ../scripts/fast_to_hdf5.py -p objectron -w 16 -b 200
+python ../scripts/fast_to_hdf5.py -p SUNRGBD -w 128 -b 256
+python ../scripts/fast_to_hdf5.py -p ARKitScenes -w 16 -b 200
+python ../scripts/fast_to_hdf5.py -p hypersim -w 16 -b 200
+
+# 激活正确的环境并设置库路径
+conda activate opendet3d
+export LD_LIBRARY_PATH=/weka/oe-training-default/jieyuz2/improve_segments/miniconda3/envs/opendet3d/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH
+
+# 然后运行你的训练命令
+cd /weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/3D-MOOD
+vis4d fit --config opendet3d/zoo/gdino3d/gdino3d_swin_t_omni3d.py \
+    --gpus 1 \
+    --config.params.samples_per_gpu=16 \
+    --config.params.accumulate_grad_batches=16
+
+
+export TORCH_CUDA_ARCH_LIST="9.0"
+pip uninstall -y vis4d-cuda-ops vis4d_cuda_ops
+pip install git+https://github.com/SysCV/vis4d_cuda_ops.git --no-build-isolation --no-cache-dir
