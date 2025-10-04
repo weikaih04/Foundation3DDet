@@ -159,6 +159,25 @@ class GroundingDINO3D(GroundingDINO):
 
         self.cat_mapping = cat_mapping
 
+        # Flag to indicate if we should skip FPN weights during checkpoint loading
+        self._skip_fpn_weights = cut3r_checkpoint is not None
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Override load_state_dict to skip FPN weights when using CUT3R fusion."""
+        if getattr(self, '_skip_fpn_weights', False):
+            filtered_state_dict = {}
+            skipped_keys = []
+
+            for key, value in state_dict.items():
+                if 'fpn.' in key:
+                    skipped_keys.append(key)
+                else:
+                    filtered_state_dict[key] = value
+
+            return super().load_state_dict(filtered_state_dict, strict=False)
+        else:
+            return super().load_state_dict(state_dict, strict=strict)
+
     def _freeze_detector(self):
         """Freeze the detector."""
         for model in [
