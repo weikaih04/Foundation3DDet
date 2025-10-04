@@ -78,7 +78,7 @@ class MultiScaleCUT3RFusion(nn.Module):
     def __init__(
         self,
         d_models: List[int] = [96, 192, 384, 768],
-        d_cut3r: int = 1024,
+        d_cut3r: int = 768,
         num_heads: int = 8,
         fusion_levels: List[int] = [2, 3],
         fusion_strategies: Optional[Dict[int, Dict]] = None,
@@ -114,7 +114,7 @@ class MultiScaleCUT3RFusion(nn.Module):
             strategy = fusion_strategies[lvl]
             
             if strategy['type'] == 'full':
-                # Full Cross-Attention Fusion (Recommended)
+                # Full Cross-Attention Fusion
                 self.fusion_modules[f'level_{lvl}'] = GatedCUT3RFusion(
                     d_model=d_model,
                     d_cut3r=d_cut3r,
@@ -144,10 +144,7 @@ class MultiScaleCUT3RFusion(nn.Module):
                     f"Must be 'full' or 'deformable'."
                 )
         
-        print(f"[MultiScaleCUT3RFusion] Initialized with:")
-        print(f"  - Fusion levels: {fusion_levels}")
-        print(f"  - Strategies: {fusion_strategies}")
-        print(f"  - Use relative pos bias: {use_relative_pos_bias}")
+
     
     def forward(
         self,

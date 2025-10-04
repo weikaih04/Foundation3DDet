@@ -18,7 +18,7 @@ class GatedCUT3RFusion(nn.Module):
     
     Args:
         d_model: Visual feature dimension (e.g., 768 for Level 3)
-        d_cut3r: CUT3R feature dimension (1024)
+        d_cut3r: CUT3R feature dimension (768, actual output from CUT3R model)
         num_heads: Number of attention heads (default: 8)
         dropout: Dropout probability (default: 0.1)
         use_relative_pos_bias: Whether to use relative position bias (default: False)
@@ -27,7 +27,7 @@ class GatedCUT3RFusion(nn.Module):
     def __init__(
         self,
         d_model: int = 768,
-        d_cut3r: int = 1024,
+        d_cut3r: int = 768,
         num_heads: int = 8,
         dropout: float = 0.1,
         use_relative_pos_bias: bool = False
@@ -43,7 +43,7 @@ class GatedCUT3RFusion(nn.Module):
         self.norm_cut3r = nn.LayerNorm(d_cut3r)
         
         # ========== 2. CUT3R Projection ==========
-        # Project CUT3R features from 1024 to d_model
+        # Project CUT3R features from 768 to d_model
         self.cut3r_proj = nn.Sequential(
             nn.Linear(d_cut3r, d_model * 2),
             nn.GELU(),
@@ -107,7 +107,7 @@ class GatedCUT3RFusion(nn.Module):
         visual_norm = self.norm_visual(visual_flat)
         
         # ========== Step 2: Project CUT3R Features ==========
-        cut3r_norm = self.norm_cut3r(cut3r_features)  # [B, 730, 1024]
+        cut3r_norm = self.norm_cut3r(cut3r_features)  # [B, 730, 768]
         cut3r_proj = self.cut3r_proj(cut3r_norm)      # [B, 730, C]
         
         # ========== Step 3: Cross-Attention ==========
@@ -135,10 +135,8 @@ class GatedCUT3RFusion(nn.Module):
         gate_values = self.gate(visual_flat)  # [B, H*W, 1]
         # Initial: gate ≈ 0.007, so fused ≈ visual_flat (smooth start)
         # After training: gate ≈ 0.5, so fused = visual + 0.5 * 3D_info
-        fused = visual_flat + gate_values * ffn_out  # [B, H*W, C]
-        
-        # ========== Step 6: Output Normalization ==========
-        fused = self.norm_out(fused)
+        # IMPORTANT: Apply norm BEFORE gating to preserve identity when gate=0
+        fused = visual_flat + gate_values * self.norm_out(ffn_out)  # [B, H*W, C]
         
         # ========== Step 7: Reshape Back ==========
         fused = fused.transpose(1, 2).reshape(B, C, H, W)  # [B, C, H, W]
