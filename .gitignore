@@ -80,3 +80,5 @@ wandb/
 
 # No lightning logs
 lightning_logs/
+
+*/data
