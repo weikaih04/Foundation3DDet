@@ -181,10 +181,8 @@ class DeformableGatedFusion(nn.Module):
         
         # ========== Step 5: Gated Residual Connection ==========
         gate_values = self.gate(visual_flat)  # [B, H*W, 1]
-        fused = visual_flat + gate_values * ffn_out  # [B, H*W, C]
-        
-        # ========== Step 6: Output Normalization ==========
-        fused = self.norm_out(fused)
+        # IMPORTANT: Apply norm BEFORE gating to preserve identity when gate=0
+        fused = visual_flat + gate_values * self.norm_out(ffn_out)  # [B, H*W, C]
         
         # ========== Step 7: Reshape Back ==========
         fused = fused.transpose(1, 2).reshape(B, C, H, W)  # [B, C, H, W]

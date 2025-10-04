@@ -154,8 +154,9 @@ def get_gdino3d_swin_tiny_cut3r_cfg(
         in_channels=[96, 192, 384, 768],
         kernel_size=1,
         out_channels=256,
-        act_cfg=None,
-        norm_cfg={"type": "GN", "num_groups": 32},
+        activation=None,
+        norm="GroupNorm",
+        num_groups=32,
         num_outs=4,
     )
 
@@ -163,6 +164,8 @@ def get_gdino3d_swin_tiny_cut3r_cfg(
         FPN,
         in_channels_list=[96, 192, 384, 768],
         out_channels=256,
+        extra_blocks=None,
+        start_index=0,
     )
 
     return get_gdino3d_cut3r_cfg(
