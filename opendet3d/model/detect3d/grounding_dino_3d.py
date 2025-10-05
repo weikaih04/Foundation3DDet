@@ -115,16 +115,15 @@ class GroundingDINO3D(GroundingDINO):
         self.depth_head = depth_head
 
         # ========== CUT3R Fusion Setup ==========
-        # Save CUT3R checkpoint path for later loading
-        self._cut3r_checkpoint_path = cut3r_checkpoint
+        # Save freeze setting
         self._cut3r_freeze = cut3r_freeze
-        self._cut3r_loaded = False
 
         if cut3r_checkpoint is not None:
-            # Create CUT3R Tower (weights will be loaded later)
+            # Create CUT3R Tower and load pretrained weights from fixed path
+            # NOTE: These weights will be overwritten if loading a complete checkpoint
+            # (3D-MOOD + CUT3R + Fusion) via load_state_dict() later
             self.cut3r_tower = CUT3RTower(
-                cut3r_checkpoint=None,  # Don't load in __init__
-                freeze=False  # Will freeze after loading weights
+                freeze=cut3r_freeze  # Freeze if specified
             )
 
             # Default fusion levels if not specified
@@ -166,6 +165,9 @@ class GroundingDINO3D(GroundingDINO):
         if freeze_backbone:
             self._freeze_backbone()
 
+        # Print trainable parameter statistics
+        self._print_trainable_params()
+
         self.cat_mapping = cat_mapping
 
     def load_state_dict(self, state_dict, strict=True):
@@ -175,95 +177,44 @@ class GroundingDINO3D(GroundingDINO):
         Scenarios:
         1. Baseline checkpoint → Fusion model:
            - Load 3D-MOOD weights (backbone, neck, head)
-           - Auto-load CUT3R weights from config path
+           - CUT3R weights already loaded in __init__ (from fixed path)
            - Keep fusion random init (gate ≈ 0)
 
         2. Complete checkpoint → Fusion model:
            - Load all weights (3D-MOOD + CUT3R + Fusion)
-           - Skip CUT3R auto-loading
+           - Overwrite CUT3R weights from __init__ with checkpoint weights
 
         3. Any checkpoint → Baseline model:
            - Normal loading
         """
         # Check if checkpoint contains CUT3R/Fusion weights
         has_cut3r = any('cut3r_tower' in key for key in state_dict.keys())
-        has_fusion = any('cut3r_fusion' in key for key in state_dict.keys())
 
         if self.cut3r_tower is not None:
             if has_cut3r:
                 # Scenario 2: Complete checkpoint with CUT3R weights
                 print("[INFO] Loading complete checkpoint (3D-MOOD + CUT3R + Fusion)")
+                print("[INFO] CUT3R weights from __init__ will be overwritten")
                 result = super().load_state_dict(state_dict, strict=False)
-                self._cut3r_loaded = True
 
-                # Freeze CUT3R if needed
+                # Freeze CUT3R if needed (re-freeze after loading)
                 if self._cut3r_freeze:
                     self._freeze_cut3r()
 
                 return result
             else:
-                # Scenario 1: Baseline checkpoint, need to load CUT3R separately
+                # Scenario 1: Baseline checkpoint
                 print("[INFO] Loading 3D-MOOD checkpoint (baseline weights)")
-                print("[INFO] CUT3R weights will be loaded separately")
+                print("[INFO] CUT3R weights already loaded from: CUT3R/src/cut3r_512_dpt_4_64.pth")
 
-                # Load 3D-MOOD weights
+                # Load 3D-MOOD weights only
                 result = super().load_state_dict(state_dict, strict=False)
-
-                # Auto-load CUT3R weights from config
-                if not self._cut3r_loaded:
-                    self._load_cut3r_from_config()
 
                 return result
         else:
             # Scenario 3: Baseline model (no CUT3R)
             print("[INFO] Loading checkpoint into baseline model (no CUT3R)")
             return super().load_state_dict(state_dict, strict=strict)
-
-    def _load_cut3r_from_config(self):
-        """Load CUT3R checkpoint from the path specified in config."""
-        if self._cut3r_checkpoint_path is None:
-            print("[WARNING] No CUT3R checkpoint path specified in config")
-            return
-
-        print(f"[INFO] Loading CUT3R checkpoint from {self._cut3r_checkpoint_path}")
-
-        try:
-            import os
-            if not os.path.exists(self._cut3r_checkpoint_path):
-                print(f"[ERROR] CUT3R checkpoint not found: {self._cut3r_checkpoint_path}")
-                raise FileNotFoundError(f"CUT3R checkpoint not found: {self._cut3r_checkpoint_path}")
-
-            cut3r_state_dict = torch.load(
-                self._cut3r_checkpoint_path,
-                map_location='cpu'
-            )
-
-            # Handle different checkpoint formats
-            if 'model' in cut3r_state_dict:
-                cut3r_state_dict = cut3r_state_dict['model']
-            elif 'state_dict' in cut3r_state_dict:
-                cut3r_state_dict = cut3r_state_dict['state_dict']
-
-            # Load CUT3R weights
-            missing_keys, unexpected_keys = self.cut3r_tower.load_state_dict(
-                cut3r_state_dict, strict=False
-            )
-
-            print("[INFO] CUT3R checkpoint loaded successfully")
-            if missing_keys:
-                print(f"[INFO] Missing keys (expected): {len(missing_keys)} keys")
-            if unexpected_keys:
-                print(f"[INFO] Unexpected keys: {len(unexpected_keys)} keys")
-
-            self._cut3r_loaded = True
-
-            # Freeze CUT3R if needed
-            if self._cut3r_freeze:
-                self._freeze_cut3r()
-
-        except Exception as e:
-            print(f"[ERROR] Failed to load CUT3R checkpoint: {e}")
-            raise
 
     def _freeze_cut3r(self):
         """Freeze CUT3R tower."""
@@ -283,8 +234,11 @@ class GroundingDINO3D(GroundingDINO):
             param.requires_grad = False
 
     def _freeze_detector(self):
-        """Freeze the detector."""
-        for model in [
+        """Freeze the detector (everything except CUT3R fusion)."""
+        print("[INFO] Freezing detector (backbone, neck, encoder, decoder, 2D head, 3D head, depth head)")
+
+        # Freeze all detector components
+        modules_to_freeze = [
             self.backbone,
             self.neck,
             self.encoder,
@@ -292,17 +246,97 @@ class GroundingDINO3D(GroundingDINO):
             self.memory_trans_fc,
             self.memory_trans_norm,
             self.decoder,
-            self.bbox_head,
+            self.bbox_head,        # 2D detection head
+            self.bbox3d_head,      # 3D detection head
+            self.roi2det3d,        # 3D RoI to detection converter
             self.dn_query_generator,
             self.language_model,
             self.text_feat_map,
-        ]:
-            model.eval()
-            for param in model.parameters():
-                param.requires_grad = False
+        ]
 
+        # Add depth-related modules if they exist
+        if self.depth_head is not None:
+            modules_to_freeze.append(self.depth_head)
+        if self.fpn is not None:
+            modules_to_freeze.append(self.fpn)
+
+        for model in modules_to_freeze:
+            # Skip if not a nn.Module (e.g., RoI2Det3D is not a module)
+            if hasattr(model, 'eval') and hasattr(model, 'parameters'):
+                model.eval()
+                for param in model.parameters():
+                    param.requires_grad = False
+
+        # Freeze embeddings
         self.level_embed.requires_grad = False
-        self.query_embedding.requires_grad = False
+        # For nn.Embedding, need to freeze the weight parameter
+        self.query_embedding.weight.requires_grad = False
+
+    def _print_trainable_params(self):
+        """Print trainable parameter statistics."""
+        total_params = 0
+        trainable_params = 0
+
+        # Count by component
+        component_stats = {}
+
+        for name, param in self.named_parameters():
+            total_params += param.numel()
+
+            # Determine component
+            if 'backbone' in name:
+                component = 'backbone'
+            elif 'neck' in name:
+                component = 'neck'
+            elif 'encoder' in name:
+                component = 'encoder'
+            elif 'decoder' in name:
+                component = 'decoder'
+            elif 'bbox_head' in name or 'bbox3d_head' in name:
+                component = 'bbox_head'
+            elif 'cut3r_tower' in name:
+                component = 'cut3r_tower'
+            elif 'cut3r_fusion' in name:
+                component = 'cut3r_fusion'
+            else:
+                component = 'other'
+
+            if component not in component_stats:
+                component_stats[component] = {'total': 0, 'trainable': 0}
+
+            component_stats[component]['total'] += param.numel()
+
+            if param.requires_grad:
+                trainable_params += param.numel()
+                component_stats[component]['trainable'] += param.numel()
+
+        print("\n" + "="*80)
+        print("📊 Trainable Parameter Statistics")
+        print("="*80)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+        print(f"Frozen parameters: {total_params - trainable_params:,} ({100*(total_params - trainable_params)/total_params:.2f}%)")
+
+        print("\nBy Component:")
+        print(f"{'Component':<20} {'Total':<15} {'Trainable':<15} {'%':<10} {'Status'}")
+        print("-"*80)
+
+        for component in sorted(component_stats.keys()):
+            stats = component_stats[component]
+            total = stats['total']
+            trainable = stats['trainable']
+            pct = 100 * trainable / total if total > 0 else 0
+
+            if trainable == 0:
+                status = "❄️  FROZEN"
+            elif trainable == total:
+                status = "✅ TRAINABLE"
+            else:
+                status = "⚠️  PARTIAL"
+
+            print(f"{component:<20} {total:>12,}   {trainable:>12,}   {pct:>6.2f}%   {status}")
+
+        print("="*80 + "\n")
 
     def forward_transformer(
         self,

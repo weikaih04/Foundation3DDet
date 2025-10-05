@@ -34,7 +34,7 @@ def prepare_input(pixel_values):
     pixel_values = F.interpolate(pixel_values, size=(512, 512), mode='bilinear')
 
     # Add frame dimension: [B, C, H, W] -> [1, B, C, H, W] (SAME AS VLM-3R)
-    pixel_values = pixel_values.unsqueeze(1)  # Note: unsqueeze(1) not unsqueeze(0)
+    pixel_values = pixel_values.unsqueeze(0)  # Add frame dimension at position 0
 
     # Check shape
     if not isinstance(pixel_values, torch.Tensor) or pixel_values.ndim != 5:
@@ -82,38 +82,36 @@ class CUT3RTower(nn.Module):
 
     def __init__(
         self,
-        cut3r_checkpoint: str | None = None,
         freeze: bool = True
     ):
+        """
+        Initialize CUT3R tower.
+
+        Args:
+            freeze: Whether to freeze CUT3R weights after loading.
+
+        Note:
+            CUT3R checkpoint is loaded from a fixed path: CUT3R/src/cut3r_512_dpt_4_64.pth
+            If loading a complete checkpoint (3D-MOOD + CUT3R + Fusion) later via
+            load_state_dict(), these weights will be overwritten.
+        """
         super().__init__()
 
-        # Load CUT3R model
-        if cut3r_checkpoint is not None:
-            # Load from checkpoint
-            self.cut3r = ARCroco3DStereo.from_pretrained(cut3r_checkpoint)
+        # Fixed CUT3R checkpoint path
+        cut3r_checkpoint = "CUT3R/src/cut3r_512_dpt_4_64.pth"
 
-            # Freeze weights if specified
-            if freeze:
-                self.cut3r.eval()
-                for param in self.cut3r.parameters():
-                    param.requires_grad = False
-        else:
-            # Initialize architecture only (random weights)
-            # Weights will be loaded later via:
-            # 1. GroundingDINO3D._load_cut3r_from_config() (from mixin path)
-            # 2. Or load_state_dict() (from complete checkpoint)
-            from CUT3R.src.croco.models.croco import CroCoNet
+        # Load CUT3R model from fixed checkpoint
+        self.cut3r = ARCroco3DStereo.from_pretrained(cut3r_checkpoint)
 
-            self.cut3r = CroCoNet(
-                output_mode='pts3d',
-                head_type='dpt',
-                depth_mode=('exp', -float('inf'), float('inf')),
-                conf_mode=('exp', 1, float('inf')),
-                freeze='none',
-                landscape_only=False,
-                patch_embed_cls='ManyAR_PatchEmbed'
-            )
-            # Note: Random weights - will be loaded later
+        # NOTE: If loading a unified checkpoint (3D-MOOD + CUT3R fusion trained together),
+        # the weights here will be overwritten by load_state_dict() later.
+        # This is intentional - we need to initialize the architecture first.
+
+        # Freeze weights if specified
+        if freeze:
+            self.cut3r.eval()
+            for param in self.cut3r.parameters():
+                param.requires_grad = False
 
         self.freeze = freeze
 

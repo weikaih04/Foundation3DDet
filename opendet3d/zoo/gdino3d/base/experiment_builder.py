@@ -9,11 +9,20 @@ from vis4d.config.typing import ExperimentConfig
 from vis4d.data.io.hdf5 import HDF5Backend
 from vis4d.zoo.base import get_default_cfg
 
-from opendet3d.zoo.gdino3d.base.callback import get_callback_cfg
+from opendet3d.zoo.gdino3d.base.callback import (
+    get_callback_cfg,
+    get_omni3d_evaluator_cfg,
+)
 from opendet3d.zoo.gdino3d.base.connector import get_data_connector_cfg
 from opendet3d.zoo.gdino3d.base.data import get_data_cfg
-from opendet3d.zoo.gdino3d.base.dataset.omni3d import get_omni3d_data_cfg
-from opendet3d.zoo.gdino3d.base.dataset.open import get_av2_data_cfg
+from opendet3d.zoo.gdino3d.base.dataset.omni3d import (
+    get_omni3d_test_cfg,
+    get_omni3d_train_cfg,
+)
+from opendet3d.zoo.gdino3d.base.dataset.open import (
+    get_av2_data_cfg,
+    get_scannet_data_cfg,
+)
 from opendet3d.zoo.gdino3d.base.loss import get_loss_cfg
 from opendet3d.zoo.gdino3d.base.model import (
     get_gdino3d_hyperparams_cfg,
@@ -79,15 +88,40 @@ def build_experiment(
     ##          Datasets with augmentations             ##
     ######################################################
     data_backend = class_config(HDF5Backend)
-    
-    # Training datasets: Omni3D
-    train_datasets_cfg = [get_omni3d_data_cfg(data_backend=data_backend)]
-    
-    # Test datasets: Argoverse
-    test_datasets_cfg = [get_av2_data_cfg(data_backend=data_backend)]
-    
+
+    test_datasets_cfg = []
+
+    # Omni3D
+    omni3d_data_root = "data/omni3d"
+    omni3d_test_datasets = (
+        "KITTI_test",
+        "nuScenes_test",
+        "SUNRGBD_test",
+        "Hypersim_test",
+        "ARKitScenes_test",
+        "Objectron_test",
+    )
+
+    omni3d_train_data_cfg = get_omni3d_train_cfg(
+        data_root=omni3d_data_root, data_backend=data_backend
+    )
+
+    omni3d_test_data_cfg = get_omni3d_test_cfg(
+        data_root=omni3d_data_root,
+        test_datasets=omni3d_test_datasets,
+        data_backend=data_backend,
+    )
+
+    test_datasets_cfg.append(omni3d_test_data_cfg)
+
+    # Open Datasets
+    test_datasets_cfg += [
+        get_av2_data_cfg(data_backend=data_backend),
+        get_scannet_data_cfg(data_backend=data_backend),
+    ]
+
     config.data = get_data_cfg(
-        train_datasets=train_datasets_cfg,
+        train_datasets=omni3d_train_data_cfg,
         test_datasets=test_datasets_cfg,
         samples_per_gpu=params.samples_per_gpu,
         workers_per_gpu=params.workers_per_gpu,
@@ -149,12 +183,19 @@ def build_experiment(
     ######################################################
     ##                     CALLBACKS                    ##
     ######################################################
-    # Omni3D evaluation + Argoverse evaluation
-    open_test_datasets = ["Argoverse_val"]
-    
+    # Omni3D Evaluator
+    omni3d_evaluator_cfg = get_omni3d_evaluator_cfg(
+        data_root=omni3d_data_root,
+        omni3d50=True,
+        test_datasets=omni3d_test_datasets,
+    )
+
+    # Open Detect3D Evaluator
+    open_test_datasets = ["Argoverse_val", "ScanNet_val"]
+
     callbacks = get_callback_cfg(
         output_dir=config.output_dir,
-        omni3d_evaluator="Omni3D_val",
+        omni3d_evaluator=omni3d_evaluator_cfg,
         open_test_datasets=open_test_datasets,
     )
     

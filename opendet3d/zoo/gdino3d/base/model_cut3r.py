@@ -37,8 +37,9 @@ def get_gdino3d_cut3r_cfg(
     fusion_num_heads: int = 8,
     fusion_dropout: float = 0.1,
     use_relative_pos_bias: bool = False,
-    # Backbone freeze
+    # Freeze options
     freeze_backbone: bool = False,
+    freeze_detector: bool = False,
     # Optional: Load pretrained 3D-MOOD checkpoint
     pretrained_3dmood_checkpoint: str | None = None,
 ) -> ConfigDict:
@@ -108,7 +109,9 @@ def get_gdino3d_cut3r_cfg(
         fusion_num_heads=fusion_num_heads,
         fusion_dropout=fusion_dropout,
         use_relative_pos_bias=use_relative_pos_bias,
+        # Freeze options
         freeze_backbone=freeze_backbone,
+        freeze_detector=freeze_detector,
     )
 
     return model, box_coder
@@ -128,8 +131,9 @@ def get_gdino3d_swin_tiny_cut3r_cfg(
     fusion_num_heads: int = 8,
     fusion_dropout: float = 0.1,
     use_relative_pos_bias: bool = False,
-    # Backbone freeze
+    # Freeze options
     freeze_backbone: bool = False,
+    freeze_detector: bool = False,
     # Optional: Load pretrained 3D-MOOD checkpoint
     pretrained_3dmood_checkpoint: str | None = None,
 ) -> ConfigDict:
@@ -185,7 +189,9 @@ def get_gdino3d_swin_tiny_cut3r_cfg(
         fusion_num_heads=fusion_num_heads,
         fusion_dropout=fusion_dropout,
         use_relative_pos_bias=use_relative_pos_bias,
+        # Freeze options
         freeze_backbone=freeze_backbone,
+        freeze_detector=freeze_detector,
         # Optional: Load pretrained 3D-MOOD checkpoint
         pretrained_3dmood_checkpoint=pretrained_3dmood_checkpoint,
     )
