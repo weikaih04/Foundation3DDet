@@ -160,9 +160,9 @@ class MultiScaleCUT3RFusion(nn.Module):
                 - Level 1: [B, 192, 100, 166]
                 - Level 2: [B, 384, 50, 83]
                 - Level 3: [B, 768, 25, 41]
-            cut3r_features: [B, 730, 1024]
-                - Camera token: [B, 1, 1024]
-                - Patch tokens: [B, 729, 1024] (27x27 grid)
+            cut3r_features: [B, 730, 768]
+                - Camera token: [B, 1, 768]
+                - Patch tokens: [B, 729, 768] (27x27 grid)
         
         Returns:
             fused_feats: List of 4 tensors (same shapes as input)

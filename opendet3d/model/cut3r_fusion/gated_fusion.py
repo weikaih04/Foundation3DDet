@@ -92,7 +92,7 @@ class GatedCUT3RFusion(nn.Module):
         
         Args:
             visual_feat: [B, C, H, W] visual features
-            cut3r_features: [B, 730, 1024] CUT3R features (1 camera + 729 patch tokens)
+            cut3r_features: [B, 730, 768] CUT3R features (1 camera + 729 patch tokens)
             pos_bias: [num_heads, H*W, 730] optional relative position bias
         
         Returns:

@@ -120,8 +120,8 @@ class CUT3RTower(nn.Module):
             pixel_values: [B, 3, H, W] input images
 
         Returns:
-            camera_tokens: [B, 1, 1024] global 3D scene representation
-            patch_features: [B, 1024, 1024] local 3D geometric features (32x32 grid)
+            camera_tokens: [B, 1, 768] global 3D scene representation
+            patch_tokens: [B, 729, 768] local 3D geometric features (27x27 grid)
         """
         # Prepare input (SAME AS VLM-3R)
         views = prepare_input(pixel_values=pixel_values)
