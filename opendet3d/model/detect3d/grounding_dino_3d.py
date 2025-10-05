@@ -89,6 +89,7 @@ class GroundingDINO3D(GroundingDINO):
         fusion_num_heads: int = 8,
         fusion_dropout: float = 0.1,
         use_relative_pos_bias: bool = False,
+        freeze_backbone: bool = False,
     ) -> None:
         """Create the Grounding DINO model."""
         super().__init__(
@@ -114,11 +115,16 @@ class GroundingDINO3D(GroundingDINO):
         self.depth_head = depth_head
 
         # ========== CUT3R Fusion Setup ==========
+        # Save CUT3R checkpoint path for later loading
+        self._cut3r_checkpoint_path = cut3r_checkpoint
+        self._cut3r_freeze = cut3r_freeze
+        self._cut3r_loaded = False
+
         if cut3r_checkpoint is not None:
-            # Create CUT3R Tower
+            # Create CUT3R Tower (weights will be loaded later)
             self.cut3r_tower = CUT3RTower(
-                cut3r_checkpoint=cut3r_checkpoint,
-                freeze=cut3r_freeze
+                cut3r_checkpoint=None,  # Don't load in __init__
+                freeze=False  # Will freeze after loading weights
             )
 
             # Default fusion levels if not specified
@@ -157,23 +163,124 @@ class GroundingDINO3D(GroundingDINO):
         if freeze_detector:
             self._freeze_detector()
 
+        if freeze_backbone:
+            self._freeze_backbone()
+
         self.cat_mapping = cat_mapping
 
     def load_state_dict(self, state_dict, strict=True):
-        """Override load_state_dict to skip FPN weights when using CUT3R fusion."""
-        if getattr(self, '_skip_fpn_weights', False):
-            filtered_state_dict = {}
-            skipped_keys = []
+        """
+        Smart checkpoint loading with automatic CUT3R weight handling.
 
-            for key, value in state_dict.items():
-                if 'fpn.' in key:
-                    skipped_keys.append(key)
-                else:
-                    filtered_state_dict[key] = value
+        Scenarios:
+        1. Baseline checkpoint → Fusion model:
+           - Load 3D-MOOD weights (backbone, neck, head)
+           - Auto-load CUT3R weights from config path
+           - Keep fusion random init (gate ≈ 0)
 
-            return super().load_state_dict(filtered_state_dict, strict=False)
+        2. Complete checkpoint → Fusion model:
+           - Load all weights (3D-MOOD + CUT3R + Fusion)
+           - Skip CUT3R auto-loading
+
+        3. Any checkpoint → Baseline model:
+           - Normal loading
+        """
+        # Check if checkpoint contains CUT3R/Fusion weights
+        has_cut3r = any('cut3r_tower' in key for key in state_dict.keys())
+        has_fusion = any('cut3r_fusion' in key for key in state_dict.keys())
+
+        if self.cut3r_tower is not None:
+            if has_cut3r:
+                # Scenario 2: Complete checkpoint with CUT3R weights
+                print("[INFO] Loading complete checkpoint (3D-MOOD + CUT3R + Fusion)")
+                result = super().load_state_dict(state_dict, strict=False)
+                self._cut3r_loaded = True
+
+                # Freeze CUT3R if needed
+                if self._cut3r_freeze:
+                    self._freeze_cut3r()
+
+                return result
+            else:
+                # Scenario 1: Baseline checkpoint, need to load CUT3R separately
+                print("[INFO] Loading 3D-MOOD checkpoint (baseline weights)")
+                print("[INFO] CUT3R weights will be loaded separately")
+
+                # Load 3D-MOOD weights
+                result = super().load_state_dict(state_dict, strict=False)
+
+                # Auto-load CUT3R weights from config
+                if not self._cut3r_loaded:
+                    self._load_cut3r_from_config()
+
+                return result
         else:
+            # Scenario 3: Baseline model (no CUT3R)
+            print("[INFO] Loading checkpoint into baseline model (no CUT3R)")
             return super().load_state_dict(state_dict, strict=strict)
+
+    def _load_cut3r_from_config(self):
+        """Load CUT3R checkpoint from the path specified in config."""
+        if self._cut3r_checkpoint_path is None:
+            print("[WARNING] No CUT3R checkpoint path specified in config")
+            return
+
+        print(f"[INFO] Loading CUT3R checkpoint from {self._cut3r_checkpoint_path}")
+
+        try:
+            import os
+            if not os.path.exists(self._cut3r_checkpoint_path):
+                print(f"[ERROR] CUT3R checkpoint not found: {self._cut3r_checkpoint_path}")
+                raise FileNotFoundError(f"CUT3R checkpoint not found: {self._cut3r_checkpoint_path}")
+
+            cut3r_state_dict = torch.load(
+                self._cut3r_checkpoint_path,
+                map_location='cpu'
+            )
+
+            # Handle different checkpoint formats
+            if 'model' in cut3r_state_dict:
+                cut3r_state_dict = cut3r_state_dict['model']
+            elif 'state_dict' in cut3r_state_dict:
+                cut3r_state_dict = cut3r_state_dict['state_dict']
+
+            # Load CUT3R weights
+            missing_keys, unexpected_keys = self.cut3r_tower.load_state_dict(
+                cut3r_state_dict, strict=False
+            )
+
+            print("[INFO] CUT3R checkpoint loaded successfully")
+            if missing_keys:
+                print(f"[INFO] Missing keys (expected): {len(missing_keys)} keys")
+            if unexpected_keys:
+                print(f"[INFO] Unexpected keys: {len(unexpected_keys)} keys")
+
+            self._cut3r_loaded = True
+
+            # Freeze CUT3R if needed
+            if self._cut3r_freeze:
+                self._freeze_cut3r()
+
+        except Exception as e:
+            print(f"[ERROR] Failed to load CUT3R checkpoint: {e}")
+            raise
+
+    def _freeze_cut3r(self):
+        """Freeze CUT3R tower."""
+        if self.cut3r_tower is None:
+            return
+
+        print("[INFO] Freezing CUT3R tower")
+        self.cut3r_tower.eval()
+        for param in self.cut3r_tower.parameters():
+            param.requires_grad = False
+
+    def _freeze_backbone(self):
+        """Freeze only the backbone (for fusion training)."""
+        print("[INFO] Freezing backbone")
+        self.backbone.eval()
+        for param in self.backbone.parameters():
+            param.requires_grad = False
 
     def _freeze_detector(self):
         """Freeze the detector."""
@@ -358,7 +465,7 @@ class GroundingDINO3D(GroundingDINO):
 
         # ========== Step 2: CUT3R Fusion ==========
         if self.cut3r_tower is not None and self.cut3r_fusion is not None:
-            # Extract CUT3R features (SAME AS VLM-3R)
+            # Extract CUT3R features
             camera_tokens, patch_tokens = self.cut3r_tower(images)
             # camera_tokens: [B, 1, 768]
             # patch_tokens: [B, 729, 768] (27x27 patches for 432x432 input)
@@ -368,7 +475,7 @@ class GroundingDINO3D(GroundingDINO):
             # cut3r_features: [B, 730, 768] (1 camera + 729 patches)
 
             # Fuse with visual features
-            visual_feats, fusion_info = self.cut3r_fusion(visual_feats, cut3r_features)
+            visual_feats, _ = self.cut3r_fusion(visual_feats, cut3r_features)
 
         # ========== Step 3: FPN (for Depth Head) ==========
         if self.fpn is not None:

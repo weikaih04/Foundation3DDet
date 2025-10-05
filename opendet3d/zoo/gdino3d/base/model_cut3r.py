@@ -37,6 +37,8 @@ def get_gdino3d_cut3r_cfg(
     fusion_num_heads: int = 8,
     fusion_dropout: float = 0.1,
     use_relative_pos_bias: bool = False,
+    # Backbone freeze
+    freeze_backbone: bool = False,
     # Optional: Load pretrained 3D-MOOD checkpoint
     pretrained_3dmood_checkpoint: str | None = None,
 ) -> ConfigDict:
@@ -106,6 +108,7 @@ def get_gdino3d_cut3r_cfg(
         fusion_num_heads=fusion_num_heads,
         fusion_dropout=fusion_dropout,
         use_relative_pos_bias=use_relative_pos_bias,
+        freeze_backbone=freeze_backbone,
     )
 
     return model, box_coder
@@ -125,39 +128,35 @@ def get_gdino3d_swin_tiny_cut3r_cfg(
     fusion_num_heads: int = 8,
     fusion_dropout: float = 0.1,
     use_relative_pos_bias: bool = False,
+    # Backbone freeze
+    freeze_backbone: bool = False,
     # Optional: Load pretrained 3D-MOOD checkpoint
     pretrained_3dmood_checkpoint: str | None = None,
 ) -> ConfigDict:
     """Get the config of Swin-Tiny with CUT3R Fusion."""
     basemodel = class_config(
         SwinTransformer,
-        pretrain_img_size=224,
+        convert_weights=True,
         embed_dims=96,
         depths=[2, 2, 6, 2],
         num_heads=[3, 6, 12, 24],
         window_size=7,
-        mlp_ratio=4,
-        qkv_bias=True,
-        qk_scale=None,
-        drop_rate=0.0,
-        attn_drop_rate=0.0,
         drop_path_rate=0.2,
-        patch_norm=True,
         out_indices=(0, 1, 2, 3),
-        with_cp=False,
-        convert_weights=True,
-        frozen_stages=-1,
+        with_cp=use_checkpoint,
+        pretrained="https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth",
     )
 
     neck = class_config(
         ChannelMapper,
-        in_channels=[96, 192, 384, 768],
+        in_channels=[192, 384, 768],  # Match baseline: only last 3 levels
         kernel_size=1,
         out_channels=256,
         activation=None,
         norm="GroupNorm",
         num_groups=32,
         num_outs=4,
+        bias=True,  # Match baseline
     )
 
     depth_fpn = class_config(
@@ -186,6 +185,7 @@ def get_gdino3d_swin_tiny_cut3r_cfg(
         fusion_num_heads=fusion_num_heads,
         fusion_dropout=fusion_dropout,
         use_relative_pos_bias=use_relative_pos_bias,
+        freeze_backbone=freeze_backbone,
         # Optional: Load pretrained 3D-MOOD checkpoint
         pretrained_3dmood_checkpoint=pretrained_3dmood_checkpoint,
     )
