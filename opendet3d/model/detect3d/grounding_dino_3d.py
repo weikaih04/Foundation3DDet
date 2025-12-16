@@ -20,6 +20,7 @@ from opendet3d.op.detect3d.grounding_dino_3d import (
 )
 from opendet3d.op.detect.grounding_dino import GroundingDINOHead, RoI2Det
 from opendet3d.op.fpp.channel_mapper import ChannelMapper
+from opendet3d.op.detect3d.geometry import GeometryBackendBase, UniDepthHeadBackend
 
 # CUT3R Fusion imports
 from opendet3d.model.cut3r_tower import CUT3RTower
@@ -56,6 +57,7 @@ class GroundingDINO3DOut(NamedTuple):
     dn_meta: dict[str, Tensor]
     positive_maps: list[Tensor]
     depth_maps: Tensor | None
+    geom_losses: dict[str, Tensor] | None = None
 
 
 class GroundingDINO3D(GroundingDINO):
@@ -81,6 +83,9 @@ class GroundingDINO3D(GroundingDINO):
         freeze_detector: bool = False,
         weights: str | None = None,
         cat_mapping: dict[str, int] | None = None,
+        # Geometry Backend (new unified interface)
+        geometry_backend: GeometryBackendBase | None = None,
+        depth_loss_weight: float = 10.0,
         # CUT3R Fusion parameters
         cut3r_checkpoint: str | None = None,
         cut3r_freeze: bool = True,
@@ -110,9 +115,23 @@ class GroundingDINO3D(GroundingDINO):
         self.bbox3d_head = bbox3d_head or GroundingDINO3DHead()
         self.roi2det3d = roi2det3d or RoI2Det3D()
 
-        # Depth Head
+        # Depth Head / Geometry Backend
         self.fpn = fpn
         self.depth_head = depth_head
+
+        # Setup geometry backend
+        # If geometry_backend is provided, use it directly
+        # Otherwise, wrap depth_head in UniDepthHeadBackend for backward compat
+        if geometry_backend is not None:
+            self.geometry_backend = geometry_backend
+        elif depth_head is not None:
+            # Backward compatibility: wrap depth_head in UniDepthHeadBackend
+            self.geometry_backend = UniDepthHeadBackend(
+                depth_head=depth_head,
+                depth_loss_weight=depth_loss_weight,
+            )
+        else:
+            self.geometry_backend = None
 
         # ========== CUT3R Fusion Setup ==========
         # Save freeze setting
@@ -255,7 +274,9 @@ class GroundingDINO3D(GroundingDINO):
         ]
 
         # Add depth-related modules if they exist
-        if self.depth_head is not None:
+        if self.geometry_backend is not None:
+            modules_to_freeze.append(self.geometry_backend)
+        elif self.depth_head is not None:
             modules_to_freeze.append(self.depth_head)
         if self.fpn is not None:
             modules_to_freeze.append(self.fpn)
@@ -541,6 +562,8 @@ class GroundingDINO3D(GroundingDINO):
         intrinsics: Tensor,
         input_tokens_positive: list[list[int, int]] | list[None] | None = None,
         padding: list[list[int]] | None = None,
+        depth_gt: Tensor | None = None,
+        depth_mask: Tensor | None = None,
     ) -> GroundingDINO3DOut:
         """Forward function for training."""
         batch_size = images.shape[0]
@@ -657,10 +680,27 @@ class GroundingDINO3D(GroundingDINO):
             intrinsics, batch_input_shape
         )
 
-        # Depth Head
-        depth_preds, depth_latents = self.depth_head(
-            depth_feats, intrinsics, batch_input_shape
-        )
+        # Geometry Backend / Depth Head
+        geom_losses = {}
+        if self.geometry_backend is not None:
+            geom_out = self.geometry_backend(
+                images=images,
+                depth_feats=depth_feats,
+                intrinsics=intrinsics,
+                image_hw=batch_input_shape,
+                depth_gt=depth_gt,
+                depth_mask=depth_mask,
+            )
+            depth_preds = geom_out["depth_map"].squeeze(1)  # [B, H, W]
+            depth_latents = geom_out["depth_latents"]
+            geom_losses = geom_out.get("losses", {})
+        elif self.depth_head is not None:
+            # Fallback to direct depth_head call (backward compat)
+            depth_preds, depth_latents = self.depth_head(
+                depth_feats, intrinsics, batch_input_shape
+            )
+        else:
+            raise ValueError("Either geometry_backend or depth_head must be set")
 
         (
             memory_text,
@@ -710,6 +750,7 @@ class GroundingDINO3D(GroundingDINO):
             dn_meta,
             positive_maps,
             depth_maps=depth_preds,
+            geom_losses=geom_losses,
         )
 
     def _forward_test(
@@ -796,10 +837,22 @@ class GroundingDINO3D(GroundingDINO):
                     intrinsics, batch_input_shape
                 )
 
-                # Depth Head
-                depth_preds, depth_latents = self.depth_head(
-                    depth_feats, intrinsics, batch_input_shape
-                )
+                # Geometry Backend / Depth Head
+                if self.geometry_backend is not None:
+                    geom_out = self.geometry_backend(
+                        images=images,
+                        depth_feats=depth_feats,
+                        intrinsics=intrinsics,
+                        image_hw=batch_input_shape,
+                    )
+                    depth_preds = geom_out["depth_map"].squeeze(1)  # [B, H, W]
+                    depth_latents = geom_out["depth_latents"]
+                elif self.depth_head is not None:
+                    depth_preds, depth_latents = self.depth_head(
+                        depth_feats, intrinsics, batch_input_shape
+                    )
+                else:
+                    raise ValueError("Either geometry_backend or depth_head must be set")
 
                 depth_maps = []
                 for i, depth_pred in enumerate(depth_preds):
@@ -908,10 +961,22 @@ class GroundingDINO3D(GroundingDINO):
                 intrinsics, batch_input_shape
             )
 
-            # Depth Head
-            depth_preds, depth_latents = self.depth_head(
-                depth_feats, intrinsics, batch_input_shape
-            )
+            # Geometry Backend / Depth Head
+            if self.geometry_backend is not None:
+                geom_out = self.geometry_backend(
+                    images=images,
+                    depth_feats=depth_feats,
+                    intrinsics=intrinsics,
+                    image_hw=batch_input_shape,
+                )
+                depth_preds = geom_out["depth_map"].squeeze(1)  # [B, H, W]
+                depth_latents = geom_out["depth_latents"]
+            elif self.depth_head is not None:
+                depth_preds, depth_latents = self.depth_head(
+                    depth_feats, intrinsics, batch_input_shape
+                )
+            else:
+                raise ValueError("Either geometry_backend or depth_head must be set")
 
             depth_maps = []
             for i, depth_pred in enumerate(depth_preds):

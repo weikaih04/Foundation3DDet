@@ -29,6 +29,7 @@ CONN_BBOX_3D_TRAIN = {
     "boxes2d": K.boxes2d,
     "boxes2d_classes": K.boxes2d_classes,
     "intrinsics": K.intrinsics,
+    "depth_gt": K.depth_maps,  # For geometry backend internal loss computation
 }
 
 CONN_BBOX_3D_TEST = {
@@ -67,6 +68,11 @@ CONN_BBOX_3D_VIS = {
 CONN_DEPTH_LOSS = {
     "depths": pred_key("depth_maps"),
     "target_depths": data_key(K.depth_maps),
+}
+
+# Connector for geometry backend internal losses
+CONN_GEOM_LOSS = {
+    "geom_losses": pred_key("geom_losses"),
 }
 
 CONN_DEPTH_VIS = {
