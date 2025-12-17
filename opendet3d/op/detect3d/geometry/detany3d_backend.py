@@ -15,6 +15,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .base import GeometryBackendBase, GeometryBackendOutput
+from .unidepth_decoder_dino_only import UnidepthDecoderDinoOnly
 
 # Import loss directly from DetAny3D - DO NOT reimplement
 from DetAny3D.train_utils import SILogLoss
@@ -24,9 +25,15 @@ from DetAny3D.detect_anything.modeling.depth_predictor.unidepth_utils import (
     generate_rays,
 )
 
+# Import DINOv2 model factory from DetAny3D
+from DetAny3D.detect_anything.modeling.backbones import _make_dinov2_model
+
 # ImageNet normalization constants (same as DetAny3D uses for DINO)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+# Default DINO output indices (same as DetAny3D uses)
+DEFAULT_DINO_OUTPUT_IDX = [21, 22, 23, 24]
 
 
 class DetAny3DGeometryBackend(GeometryBackendBase):
@@ -42,8 +49,10 @@ class DetAny3DGeometryBackend(GeometryBackendBase):
     resolution (1/8, 1/4, or 1/2) and projected to target_latent_dim.
 
     Args:
-        dino_encoder: DINOv2 encoder (from DetAny3D.detect_anything.modeling.backbones)
-        depth_decoder: DINO-only Unidepth_Decoder
+        dino_model: DINOv2 model variant ("vit_large", "vit_base", "vit_small").
+        dino_pretrained: Path to pretrained DINO weights, or "" for default hub weights.
+        output_scales: Which resolution latents to return (1=1/8, 2=1/4, 3=1/2).
+        target_latent_dim: Target dimension for depth_latents (for 3D head).
         depth_loss_weight: Weight for depth SILog loss.
         phi_loss_weight: Weight for phi angle loss.
         theta_loss_weight: Weight for theta angle loss.
@@ -55,23 +64,96 @@ class DetAny3DGeometryBackend(GeometryBackendBase):
             If True, gradients from 3D head won't flow back to depth head.
     """
 
+    # DINOv2 embedding dimensions
+    DINO_EMBED_DIMS = {
+        "vit_small": 384,
+        "vit_base": 768,
+        "vit_large": 1024,
+        "vit_giant2": 1536,
+    }
+
     def __init__(
         self,
-        dino_encoder: nn.Module,
-        depth_decoder: nn.Module,
+        dino_model: str = "vit_large",
+        dino_pretrained: str = "",
+        decoder_pretrained: str = "",
+        output_scales: int = 1,
+        target_latent_dim: int = 128,
         depth_loss_weight: float = 10.0,
         phi_loss_weight: float = 2.5,
         theta_loss_weight: float = 2.5,
         depth_coefficient: float = 0.15,
         phi_coefficient: float = 1.0,
         theta_coefficient: float = 1.0,
-        freeze_dino: bool = False,
+        freeze_dino: bool = True,
         detach_depth_latents: bool = False,
     ) -> None:
         """Initialize the DetAny3DGeometryBackend."""
         super().__init__(detach_depth_latents=detach_depth_latents)
-        self.dino_encoder = dino_encoder
-        self.depth_decoder = depth_decoder
+
+        # Get DINO embed dim based on model variant
+        if dino_model not in self.DINO_EMBED_DIMS:
+            raise ValueError(
+                f"Unknown dino_model: {dino_model}. "
+                f"Available: {list(self.DINO_EMBED_DIMS.keys())}"
+            )
+        dino_embed_dim = self.DINO_EMBED_DIMS[dino_model]
+
+        # Build DINOv2 encoder using DetAny3D's factory
+        self.dino_encoder = _make_dinov2_model(
+            arch_name=dino_model,
+            pretrained=dino_pretrained,
+            output_idx=DEFAULT_DINO_OUTPUT_IDX,
+            drop_path_rate=0.0,
+            num_register_tokens=0,
+            use_norm=True,
+        )
+
+        # Build DINO-only Unidepth_Decoder
+        self.depth_decoder = UnidepthDecoderDinoOnly(
+            hidden_dim=512,
+            num_heads=8,
+            expansion=4,
+            dropout=0.0,
+            depth_layers=[6, 0, 0],
+            num_resolutions=4,
+            dino_embed_dim=dino_embed_dim,
+            output_scales=output_scales,
+            target_latent_dim=target_latent_dim,
+        )
+
+        # Load pretrained decoder weights if provided
+        if decoder_pretrained:
+            print(f"Loading DetAny3D decoder weights from {decoder_pretrained}")
+            decoder_state = torch.load(decoder_pretrained, map_location="cpu")
+
+            # Filter out SAM-related keys (we only want DINO-related keys)
+            # Keys with "_for_sam" suffix are for SAM features, we don't need them
+            filtered_state = {
+                k: v for k, v in decoder_state.items()
+                if "_for_sam" not in k
+            }
+
+            print(f"  Total keys in checkpoint: {len(decoder_state)}")
+            print(f"  Filtered keys (DINO-only): {len(filtered_state)}")
+
+            # Load with strict=False to allow missing/unexpected keys
+            missing, unexpected = self.depth_decoder.load_state_dict(
+                filtered_state, strict=False
+            )
+
+            if missing:
+                print(f"  Warning: Missing decoder keys: {len(missing)}")
+                if len(missing) <= 10:
+                    for key in missing:
+                        print(f"    - {key}")
+            if unexpected:
+                print(f"  Warning: Unexpected decoder keys: {len(unexpected)}")
+                if len(unexpected) <= 10:
+                    for key in unexpected:
+                        print(f"    - {key}")
+
+            print(f"  ✅ Loaded DetAny3D decoder weights successfully!")
 
         # Loss weights (applied after loss computation)
         self.depth_loss_weight = depth_loss_weight
@@ -84,7 +166,8 @@ class DetAny3DGeometryBackend(GeometryBackendBase):
         self.theta_coefficient = theta_coefficient
 
         if freeze_dino:
-            self.dino_encoder.freeze()
+            for param in self.dino_encoder.parameters():
+                param.requires_grad = False
 
         # Register normalization constants
         self.register_buffer(

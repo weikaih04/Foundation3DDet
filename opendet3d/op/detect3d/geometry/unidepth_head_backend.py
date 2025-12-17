@@ -11,13 +11,17 @@ the original 3D-MOOD implementation.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import Tensor, nn
 
-from opendet3d.op.detect3d.grounding_dino_3d.depth import UniDepthHead
 from opendet3d.op.loss.silog_loss import SILogLoss
 
 from .base import GeometryBackendBase, GeometryBackendOutput
+
+if TYPE_CHECKING:
+    from opendet3d.op.detect3d.grounding_dino_3d.depth import UniDepthHead
 
 
 class UniDepthHeadBackend(GeometryBackendBase):

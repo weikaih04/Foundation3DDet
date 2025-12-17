@@ -18,9 +18,19 @@ import torch.nn.functional as F
 
 from .base import GeometryBackendBase, GeometryBackendOutput
 
+# Import UniDepthV2 model
+from unidepth.models import UniDepthV2
+
 # ImageNet normalization constants (used by UniDepthV2)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+# Map version string to HuggingFace model name
+VERSION_TO_HF_NAME = {
+    "v2-vitl14": "lpiccinelli/unidepth-v2-vitl14",
+    "v2-vitb14": "lpiccinelli/unidepth-v2-vitb14",
+    "v2-vits14": "lpiccinelli/unidepth-v2-vits14",
+}
 
 
 class UniDepthV2GeometryBackend(GeometryBackendBase):
@@ -40,32 +50,100 @@ class UniDepthV2GeometryBackend(GeometryBackendBase):
     - output_scales=3: Return 1/2 resolution latents
 
     Args:
-        unidepth_model: The UniDepthV2 model instance.
+        version: UniDepthV2 version string ("v2-vitl14", "v2-vitb14", "v2-vits14").
+        pretrained_path: Path to local full checkpoint, or None to load from HuggingFace.
+        encoder_pretrained: Path to encoder-only weights (DINOv2 backbone).
+        decoder_pretrained: Path to decoder-only weights.
         use_native_losses: Whether to use UniDepthV2's native loss functions.
         depth_loss_weight: Weight multiplier for depth losses.
         output_scales: Which resolution latents to return (1=1/8, 2=1/4, 3=1/2).
         target_latent_dim: Target dimension for depth_latents (for 3D head).
+        freeze_encoder: Whether to freeze pixel encoder weights.
         detach_depth_latents: Whether to detach depth_latents from graph.
     """
 
     def __init__(
         self,
-        unidepth_model: nn.Module,
+        version: str = "v2-vitl14",
+        pretrained_path: str | None = None,
+        encoder_pretrained: str | None = None,
+        decoder_pretrained: str | None = None,
         use_native_losses: bool = True,
         depth_loss_weight: float = 1.0,
         output_scales: int = 1,
         target_latent_dim: int = 128,
+        freeze_encoder: bool = True,
         detach_depth_latents: bool = False,
     ) -> None:
         """Initialize the UniDepthV2GeometryBackend."""
         super().__init__(detach_depth_latents=detach_depth_latents)
-        self.unidepth_model = unidepth_model
+
+        # Build UniDepthV2 model
+        if pretrained_path is not None:
+            # Load from local full checkpoint (encoder + decoder)
+            print(f"Loading UniDepthV2 from local checkpoint: {pretrained_path}")
+            self.unidepth_model = UniDepthV2.from_pretrained(pretrained_path)
+        elif encoder_pretrained is not None and decoder_pretrained is not None:
+            # Load encoder and decoder separately
+            print(f"Building UniDepthV2 with separate encoder/decoder weights:")
+            print(f"  Encoder: {encoder_pretrained}")
+            print(f"  Decoder: {decoder_pretrained}")
+
+            # First, download/load the full model to get the architecture
+            hf_name = VERSION_TO_HF_NAME.get(version)
+            if hf_name is None:
+                raise ValueError(
+                    f"Unknown version: {version}. "
+                    f"Available versions: {list(VERSION_TO_HF_NAME.keys())}"
+                )
+
+            # Load full model from HuggingFace (to get architecture)
+            print(f"  Loading architecture from HuggingFace: {hf_name}")
+            self.unidepth_model = UniDepthV2.from_pretrained(hf_name)
+
+            # Load encoder weights
+            print(f"  Loading encoder weights from {encoder_pretrained}")
+            encoder_state = torch.load(encoder_pretrained, map_location="cpu")
+            missing, unexpected = self.unidepth_model.pixel_encoder.load_state_dict(
+                encoder_state, strict=False
+            )
+            if missing:
+                print(f"    Warning: Missing encoder keys: {len(missing)}")
+            if unexpected:
+                print(f"    Warning: Unexpected encoder keys: {len(unexpected)}")
+
+            # Load decoder weights
+            print(f"  Loading decoder weights from {decoder_pretrained}")
+            decoder_state = torch.load(decoder_pretrained, map_location="cpu")
+            missing, unexpected = self.unidepth_model.pixel_decoder.load_state_dict(
+                decoder_state, strict=False
+            )
+            if missing:
+                print(f"    Warning: Missing decoder keys: {len(missing)}")
+            if unexpected:
+                print(f"    Warning: Unexpected decoder keys: {len(unexpected)}")
+        else:
+            # Load from HuggingFace
+            hf_name = VERSION_TO_HF_NAME.get(version)
+            if hf_name is None:
+                raise ValueError(
+                    f"Unknown version: {version}. "
+                    f"Available versions: {list(VERSION_TO_HF_NAME.keys())}"
+                )
+            print(f"Loading UniDepthV2 from HuggingFace: {hf_name}")
+            self.unidepth_model = UniDepthV2.from_pretrained(hf_name)
+
         self.use_native_losses = use_native_losses
         self.depth_loss_weight = depth_loss_weight
         self.output_scales = output_scales
         self.target_latent_dim = target_latent_dim
 
         assert output_scales >= 1 and output_scales <= 3, "output_scales must be 1, 2, or 3"
+
+        # Freeze encoder if requested
+        if freeze_encoder:
+            for param in self.unidepth_model.pixel_encoder.parameters():
+                param.requires_grad = False
 
         # Projection layer to align latent dimension
         # UniDepthV2 hidden_dim is typically 512
