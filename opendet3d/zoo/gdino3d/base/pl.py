@@ -17,7 +17,16 @@ def get_pl_cfg(
     pl_trainer.max_epochs = params.num_epochs
     pl_trainer.check_val_every_n_epoch = params.check_val_every_n_epoch
 
+    # Initialize val_check_interval to allow command-line override
+    # Default to 1.0 (validate every epoch), can be overridden to 0.5 for twice per epoch
+    pl_trainer.val_check_interval = 1.0
+
     pl_trainer.gradient_clip_val = 0.1
     pl_trainer.accumulate_grad_batches = params.accumulate_grad_batches
+
+    # Enable find_unused_parameters for DDP to handle frozen/unused parameters
+    # This is needed when using geometry backends with frozen encoders
+    # NOTE: PLTrainer will create DDPStrategy with this parameter when devices > 1
+    pl_trainer.find_unused_parameters = True
 
     return pl_trainer

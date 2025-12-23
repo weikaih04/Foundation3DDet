@@ -1,0 +1,64 @@
+version: v2
+description: Geometry Backend Ablation - UniDepthV2 (12 epochs finetune)
+budget: ai2/oe-mm
+tasks:
+- name: geom-ablation-unidepth-v2-12e
+  replicas: 1
+  image:
+    docker: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+  envVars:
+    - name: WEIKAI_UW_WANDB_KEY
+      secret: WEIKAI_UW_WANDB_KEY
+  command: ['bash', '-c']
+  arguments:
+  - |
+    # Set experiment name
+    EXP_NAME="geom_ablation_unidepth_v2_12e"
+
+    # Set timezone non-interactively
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=America/Los_Angeles
+
+    apt-get update && \
+    apt-get install -y libstdc++6 libgl1-mesa-glx libglib2.0-0 g++ git && \
+    source /weka/oe-training-default/jieyuz2/improve_segments/miniconda3/bin/activate && \
+    conda activate opendet3d && \
+    cd /weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet && \
+    export PYTHONPATH=/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet:/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet/UniDepth:/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet/Depth-Anything-3:$PYTHONPATH && \
+    export WANDB_API_KEY=$WEIKAI_UW_WANDB_KEY && \
+    export WANDB_PROJECT="3D-MOOD-GeometryBackend" && \
+    export WANDB_NAME=$EXP_NAME && \
+    export WANDB_TAGS="geometry_ablation,unidepth_v2,dinov2,12epochs,finetune" && \
+    vis4d fit \
+        --config opendet3d/zoo/gdino3d/experiments/geometry_backend_ablation.py::get_unidepth_v2_config \
+        --gpus 8 \
+        --ckpt checkpoints/gdino3d_swin-t_120e_omni3d_699f69.pt \
+        --config.use_checkpoint=False \
+        --config.params.samples_per_gpu=4 \
+        --config.params.accumulate_grad_batches=4 \
+        --config.params.lr=1e-4 \
+        --config.params.num_epochs=12 \
+        --config.params.step_1=8 \
+        --config.params.step_2=11 \
+        --config.experiment_name=$EXP_NAME \
+        --config.work_dir=vis4d-workspace/$EXP_NAME \
+        --config.pl_trainer.val_check_interval=0.5 \
+        --wandb \
+        --resume
+  result:
+    path: /exp_outputs
+  datasets:
+    - mountPath: /weka/oe-training-default
+      source:
+        weka: oe-training-default
+  resources:
+    gpuCount: 8
+    sharedMemory: 1000GiB
+  context:
+    priority: normal
+    preemptible: true
+  constraints:
+    cluster: [ai2/jupiter-cirrascale-2, ai2/saturn, ai2/ceres]
+  hostNetworking: true
+  leaderSelection: true
+

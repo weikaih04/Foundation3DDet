@@ -28,9 +28,25 @@ def get_omni3d_dataset_cfg(
     remove_empty: bool = False,
     with_depth: bool = False,
     cache_as_binary: bool = False,
+    use_mini_dataset: bool = False,
+    mini_dataset_size: int = 100,
 ) -> list[ConfigDict]:
-    """Get the dataset configs for Omni3D."""
-    if omni3d50:
+    """Get the dataset configs for Omni3D.
+
+    Args:
+        data_root: Root directory for Omni3D data
+        datasets: List of dataset names (e.g., "KITTI_train", "nuScenes_val")
+        data_backend: Data backend configuration
+        omni3d50: Whether to use Omni3D-50 class mapping
+        remove_empty: Whether to remove empty samples
+        with_depth: Whether to load depth maps
+        cache_as_binary: Whether to cache as binary
+        use_mini_dataset: If True, use mini dataset (cache_omni3d50_miniN)
+        mini_dataset_size: Size of mini dataset (default: 100)
+    """
+    if use_mini_dataset:
+        cached_dir = os.path.join(data_root, f"cache_omni3d50_mini{mini_dataset_size}")
+    elif omni3d50:
         cached_dir = os.path.join(data_root, "cache_omni3d50")
     else:
         cached_dir = os.path.join(data_root, "cache")
@@ -92,8 +108,21 @@ def get_omni3d_train_cfg(
     omni3d50: bool = True,
     shape: tuple[int, int] = (800, 1333),
     cache_as_binary: bool = True,
+    use_mini_dataset: bool = False,
+    mini_dataset_size: int = 100,
 ) -> ConfigDict:
-    """Get the train config for Omni3D."""
+    """Get the train config for Omni3D.
+
+    Args:
+        data_root: Root directory for Omni3D data
+        train_datasets: List of training dataset names
+        data_backend: Data backend configuration
+        omni3d50: Whether to use Omni3D-50 class mapping
+        shape: Input image shape (H, W)
+        cache_as_binary: Whether to cache as binary
+        use_mini_dataset: If True, use mini dataset for fast testing
+        mini_dataset_size: Size of mini dataset (default: 100)
+    """
     train_dataset_cfg = get_omni3d_dataset_cfg(
         data_root=data_root,
         datasets=train_datasets,
@@ -102,6 +131,8 @@ def get_omni3d_train_cfg(
         remove_empty=True,
         with_depth=True,
         cache_as_binary=cache_as_binary,
+        use_mini_dataset=use_mini_dataset,
+        mini_dataset_size=mini_dataset_size,
     )
 
     train_preprocess_cfg = get_train_transforms_cfg(shape=shape)
@@ -128,8 +159,22 @@ def get_omni3d_test_cfg(
     with_depth: bool = False,
     shape: tuple[int, int] = (800, 1333),
     cache_as_binary: bool = True,
+    use_mini_dataset: bool = False,
+    mini_dataset_size: int = 100,
 ) -> ConfigDict:
-    """Get the test config for Omni3D."""
+    """Get the test config for Omni3D.
+
+    Args:
+        data_root: Root directory for Omni3D data
+        test_datasets: List of test dataset names
+        data_backend: Data backend configuration
+        omni3d50: Whether to use Omni3D-50 class mapping
+        with_depth: Whether to load depth maps
+        shape: Input image shape (H, W)
+        cache_as_binary: Whether to cache as binary
+        use_mini_dataset: If True, use mini dataset for fast testing
+        mini_dataset_size: Size of mini dataset (default: 100)
+    """
     test_dataset_cfg = get_omni3d_dataset_cfg(
         data_root=data_root,
         datasets=test_datasets,
@@ -137,6 +182,8 @@ def get_omni3d_test_cfg(
         omni3d50=omni3d50,
         with_depth=with_depth,
         cache_as_binary=cache_as_binary,
+        use_mini_dataset=use_mini_dataset,
+        mini_dataset_size=mini_dataset_size,
     )
 
     test_preprocess_cfg = get_test_transforms_cfg(shape=shape)

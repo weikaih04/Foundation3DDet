@@ -21,19 +21,16 @@ from torch import Tensor, nn
 from opendet3d.op.loss.silog_loss import SILogLoss
 
 from .base import GeometryBackendBase, GeometryBackendOutput
+from .dinov2_mixin import DINOv2Mixin
 
 # Import DINOv2 model factory from DetAny3D
 from DetAny3D.detect_anything.modeling.backbones import _make_dinov2_model
-
-# ImageNet normalization constants
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
 
 if TYPE_CHECKING:
     from opendet3d.op.detect3d.grounding_dino_3d.depth import UniDepthHead
 
 
-class UniDepthHeadDinoBackend(GeometryBackendBase):
+class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
     """Backend using DINOv2 (all blocks, grouped) + UniDepthHead.
 
     This backend:
@@ -75,6 +72,10 @@ class UniDepthHeadDinoBackend(GeometryBackendBase):
         """Initialize the UniDepthHeadDinoBackend."""
         super().__init__(detach_depth_latents=detach_depth_latents)
 
+        # Store pretrained paths for logging
+        self.dino_model = dino_model
+        self._dino_pretrained_path = dino_pretrained if dino_pretrained else None
+
         # Get DINOv2 config
         if dino_model not in self.DINO_CONFIGS:
             raise ValueError(
@@ -86,19 +87,22 @@ class UniDepthHeadDinoBackend(GeometryBackendBase):
         self.dino_embed_dim = dino_config["embed_dim"]
 
         # Build DINOv2 encoder - extract ALL blocks
+        # Don't load pretrained weights here - will load in load_pretrained_weights()
+        # IMPORTANT: Use pretrained=None (not "") to avoid auto-downloading from torch hub
         self.dino_encoder = _make_dinov2_model(
             arch_name=dino_model,
-            pretrained=dino_pretrained,
+            pretrained=None,  # None = no loading; "" = download from torch hub!
             output_idx=list(range(1, self.dino_depth + 1)),  # All blocks
             drop_path_rate=0.0,
             num_register_tokens=0,
             use_norm=True,
         )
 
-        # Freeze DINOv2 if requested
-        if freeze_dino:
-            for param in self.dino_encoder.parameters():
-                param.requires_grad = False
+        # Note: Freezing is now handled by optimizer's lr_mult=0.0 instead of requires_grad=False
+        # This avoids DDP's find_unused_parameters overhead
+        # if freeze_dino:
+        #     for param in self.dino_encoder.parameters():
+        #         param.requires_grad = False
 
         # Define slicing ranges for grouping blocks (like UniDepthV2)
         # For vit_large (24 blocks): [(0, 6), (6, 12), (12, 18), (18, 24)]
@@ -145,17 +149,29 @@ class UniDepthHeadDinoBackend(GeometryBackendBase):
         self.depth_loss = SILogLoss()
         self.depth_loss_weight = depth_loss_weight
 
-        # Register normalization constants
-        self.register_buffer(
-            "pixel_mean",
-            torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1),
-            persistent=False,
-        )
-        self.register_buffer(
-            "pixel_std",
-            torch.tensor(IMAGENET_STD).view(1, 3, 1, 1),
-            persistent=False,
-        )
+    def load_pretrained_weights(self) -> None:
+        """Load pretrained weights for DINOv2 encoder.
+
+        This should be called BEFORE loading the full model checkpoint.
+        It's called from GroundingDINO3D.load_state_dict().
+        """
+        # Load DINOv2 encoder weights
+        if self._dino_pretrained_path:
+            print(f"[UniDepthHeadDino] Loading DINOv2 encoder from: {self._dino_pretrained_path}")
+            dino_state = torch.load(self._dino_pretrained_path, map_location="cpu")
+
+            # Handle different checkpoint formats
+            if "model" in dino_state:
+                dino_state = dino_state["model"]
+
+            missing, unexpected = self.dino_encoder.load_state_dict(dino_state, strict=False)
+
+            if missing:
+                print(f"  Warning: Missing DINOv2 keys: {len(missing)}")
+            if unexpected:
+                print(f"  Warning: Unexpected DINOv2 keys: {len(unexpected)}")
+
+            print(f"  ✅ Loaded DINOv2 encoder weights successfully!")
 
     @staticmethod
     def _mean_stack(tensors: list[Tensor]) -> Tensor:
@@ -175,20 +191,6 @@ class UniDepthHeadDinoBackend(GeometryBackendBase):
     def _last_stack(tensors: list[Tensor]) -> Tensor:
         """Take last tensor."""
         return tensors[-1]
-
-    def _normalize_image(self, images: Tensor) -> Tensor:
-        """Normalize images to ImageNet format for DINOv2.
-
-        Args:
-            images: Input images in [0, 255] range, shape [B, 3, H, W]
-
-        Returns:
-            Normalized images for DINOv2
-        """
-        # Normalize to [0, 1] then apply ImageNet normalization
-        images = images.float() / 255.0
-        images = (images - self.pixel_mean) / self.pixel_std
-        return images
 
     def _extract_dino_features(self, images: Tensor) -> list[Tensor]:
         """Extract and group DINOv2 features.
@@ -248,29 +250,46 @@ class UniDepthHeadDinoBackend(GeometryBackendBase):
         Returns:
             GeometryBackendOutput with depth_map, depth_latents, and losses.
         """
-        # 1. Normalize images for DINOv2
-        images_normalized = self._normalize_image(images)
+        # Store original dimensions
+        orig_H, orig_W = image_hw
 
-        # 2. Extract and group DINOv2 features
+        # 1. Resize images to be divisible by DINOv2 patch size (14) and adjust intrinsics
+        images_resized, intrinsics_adjusted = self._make_divisible_by_dinov2_patch(
+            images, intrinsics
+        )
+
+        # Update image_hw to match resized dimensions
+        _, _, new_H, new_W = images_resized.shape
+        image_hw_adjusted = (new_H, new_W)
+
+        # 2. Normalize images for DINOv2
+        images_normalized = self._normalize_image_for_dinov2(images_resized)
+
+        # 3. Extract and group DINOv2 features
         depth_feats = self._extract_dino_features(images_normalized)
         # depth_feats: List[4] of [B, embed_dim, H/14, W/14]
 
-        # 3. Run UniDepthHead
+        # 4. Run UniDepthHead with adjusted intrinsics and image_hw
         depth_preds, depth_latent = self.depth_head(
-            depth_feats, intrinsics, image_hw
+            depth_feats, intrinsics_adjusted, image_hw_adjusted
         )
+
+        # 5. Resize depth_preds back to original dimensions
+        depth_preds_resized = self._resize_depth_to_original(
+            depth_preds.unsqueeze(1), (orig_H, orig_W)
+        ).squeeze(1)  # [B, H, W]
 
         # Apply optional detach
         depth_latent = self._maybe_detach_latents(depth_latent)
 
-        # 4. Compute losses
+        # 6. Compute losses using original dimensions
         losses: dict[str, Tensor] = {}
         if depth_gt is not None:
-            depth_loss = self.depth_loss(depth_preds, depth_gt, mask=depth_mask)
+            depth_loss = self.depth_loss(depth_preds_resized, depth_gt, mask=depth_mask)
             losses["depth_loss"] = depth_loss * self.depth_loss_weight
 
         return GeometryBackendOutput(
-            depth_map=depth_preds.unsqueeze(1),  # [B, 1, H, W]
+            depth_map=depth_preds_resized.unsqueeze(1),  # [B, 1, H, W]
             depth_latents=depth_latent,  # [B, N, C]
             K_pred=None,  # UniDepthHead doesn't predict intrinsics
             aux={},
@@ -297,22 +316,39 @@ class UniDepthHeadDinoBackend(GeometryBackendBase):
         Returns:
             GeometryBackendOutput with depth_map and depth_latents.
         """
-        # 1. Normalize images for DINOv2
-        images_normalized = self._normalize_image(images)
+        # Store original dimensions
+        orig_H, orig_W = image_hw
 
-        # 2. Extract and group DINOv2 features
+        # 1. Resize images to be divisible by DINOv2 patch size (14) and adjust intrinsics
+        images_resized, intrinsics_adjusted = self._make_divisible_by_dinov2_patch(
+            images, intrinsics
+        )
+
+        # Update image_hw to match resized dimensions
+        _, _, new_H, new_W = images_resized.shape
+        image_hw_adjusted = (new_H, new_W)
+
+        # 2. Normalize images for DINOv2
+        images_normalized = self._normalize_image_for_dinov2(images_resized)
+
+        # 3. Extract and group DINOv2 features
         depth_feats = self._extract_dino_features(images_normalized)
 
-        # 3. Run UniDepthHead
+        # 4. Run UniDepthHead with adjusted intrinsics and image_hw
         depth_preds, depth_latent = self.depth_head(
-            depth_feats, intrinsics, image_hw
+            depth_feats, intrinsics_adjusted, image_hw_adjusted
         )
+
+        # 5. Resize depth_preds back to original dimensions
+        depth_preds_resized = self._resize_depth_to_original(
+            depth_preds.unsqueeze(1), (orig_H, orig_W)
+        ).squeeze(1)  # [B, H, W]
 
         # Apply optional detach
         depth_latent = self._maybe_detach_latents(depth_latent)
 
         return GeometryBackendOutput(
-            depth_map=depth_preds.unsqueeze(1),  # [B, 1, H, W]
+            depth_map=depth_preds_resized.unsqueeze(1),  # [B, 1, H, W]
             depth_latents=depth_latent,  # [B, N, C]
             K_pred=None,
             aux={},

@@ -1,4 +1,4 @@
-I I"""3D-MOOD model config."""
+"""3D-MOOD model config."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def get_unidepth_head_dino_backend_cfg(
     params: ExperimentParameters,
     dino_model: str = "vit_large",
     dino_pretrained: str = "",
-    freeze_dino: bool = True,
+    freeze_dino: bool = False,  # Changed to False - freezing now handled by optimizer lr_mult=0.0
     detach_depth_latents: bool = True,
     depth_loss_weight: float = 10.0,
     stacking_mode: str = "mean",
@@ -130,7 +130,8 @@ def get_detany3d_backend_cfg(
     dino_model: str = "vit_large",
     dino_pretrained: str = "",
     decoder_pretrained: str = "",
-    freeze_dino: bool = True,
+    decoder_dino_model: str | None = None,
+    freeze_dino: bool = False,  # Changed to False - freezing now handled by optimizer lr_mult=0.0
     detach_depth_latents: bool = True,
     target_latent_dim: int = 128,
 ) -> ConfigDict:
@@ -143,6 +144,9 @@ def get_detany3d_backend_cfg(
         dino_model: DINO model variant (vit_large, vit_base, vit_small).
         dino_pretrained: Path to pretrained DINO weights, or "" for hub weights.
         decoder_pretrained: Path to pretrained decoder weights, or "" for random init.
+        decoder_dino_model: DINO model variant that decoder expects (for dimension matching).
+            If None, assumes decoder expects same dimension as dino_model.
+            If different from dino_model, a linear projector will be added.
         freeze_dino: Whether to freeze DINO encoder.
         detach_depth_latents: Whether to detach latents from gradient graph.
         target_latent_dim: Target dimension for depth_latents (default 128).
@@ -155,6 +159,7 @@ def get_detany3d_backend_cfg(
         dino_model=dino_model,
         dino_pretrained=dino_pretrained,
         decoder_pretrained=decoder_pretrained,
+        decoder_dino_model=decoder_dino_model,
         freeze_dino=freeze_dino,
         output_scales=params.depth_output_scales,
         target_latent_dim=target_latent_dim,
@@ -168,7 +173,7 @@ def get_unidepth_v2_backend_cfg(
     pretrained_path: str | None = None,
     encoder_pretrained: str | None = None,
     decoder_pretrained: str | None = None,
-    freeze_encoder: bool = True,
+    freeze_encoder: bool = False,  # Changed to False - freezing now handled by optimizer lr_mult=0.0
     detach_depth_latents: bool = True,
     target_latent_dim: int = 128,
 ) -> ConfigDict:
@@ -243,6 +248,13 @@ def get_gdino3d_hyperparams_cfg() -> ExperimentParameters:
 
     # Depth Head
     params.depth_output_scales = 1
+
+    # Geometry Backend Learning Rates (for ablation experiments)
+    # These control the learning rate multipliers for geometry backend components
+    # Default: train all components at reduced lr
+    params.geom_encoder_lr_mult = 0.1   # Train encoder at 10% lr (DINOv2/pixel_encoder)
+    params.geom_decoder_lr_mult = 1.0   # Train decoder at full lr
+    params.geom_projector_lr_mult = 1.0 # Train projector at full lr (DetAny3D only)
 
     return params
 
@@ -442,13 +454,14 @@ def get_gdino3d_with_geometry_backend_cfg(
     use_checkpoint: bool | FieldReference = False,
     # Geometry backend options
     detach_depth_latents: bool = True,
-    freeze_dino: bool = True,
-    freeze_encoder: bool = True,
+    freeze_dino: bool = False,  # Changed to False - freezing now handled by optimizer lr_mult=0.0
+    freeze_encoder: bool = False,  # Changed to False - freezing now handled by optimizer lr_mult=0.0
     target_latent_dim: int = 128,
     depth_loss_weight: float = 10.0,
     dino_model: str = "vit_small",
     dino_pretrained: str = "",
     detany3d_decoder_pretrained: str = "",
+    detany3d_decoder_dino_model: str | None = None,
     unidepth_v2_version: str = "v2-vits14",
     unidepth_v2_pretrained: str | None = None,
     unidepth_v2_encoder_pretrained: str | None = None,
@@ -476,6 +489,7 @@ def get_gdino3d_with_geometry_backend_cfg(
         depth_loss_weight: Weight for depth loss (for unidepth_head).
         dino_model: DINOv2 model variant (for unidepth_head_dino, detany3d).
         dino_pretrained: Path to DINOv2 pretrained weights (for unidepth_head_dino, detany3d).
+        detany3d_decoder_pretrained: Path to DetAny3D decoder weights (for detany3d).
         unidepth_v2_version: UniDepthV2 version (for unidepth_v2).
         unidepth_v2_pretrained: Path to UniDepthV2 full checkpoint (for unidepth_v2).
         unidepth_v2_encoder_pretrained: Path to UniDepthV2 encoder-only weights (for unidepth_v2).
@@ -540,6 +554,8 @@ def get_gdino3d_with_geometry_backend_cfg(
             params=params,
             dino_model=dino_model,
             dino_pretrained=dino_pretrained,
+            decoder_pretrained=detany3d_decoder_pretrained,
+            decoder_dino_model=detany3d_decoder_dino_model,
             freeze_dino=freeze_dino,
             detach_depth_latents=detach_depth_latents,
             target_latent_dim=target_latent_dim,

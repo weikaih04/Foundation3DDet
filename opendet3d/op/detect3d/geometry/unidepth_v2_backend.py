@@ -17,13 +17,10 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .base import GeometryBackendBase, GeometryBackendOutput
+from .dinov2_mixin import DINOv2Mixin
 
 # Import UniDepthV2 model
 from unidepth.models import UniDepthV2
-
-# ImageNet normalization constants (used by UniDepthV2)
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
 
 # Map version string to HuggingFace model name
 VERSION_TO_HF_NAME = {
@@ -33,7 +30,7 @@ VERSION_TO_HF_NAME = {
 }
 
 
-class UniDepthV2GeometryBackend(GeometryBackendBase):
+class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
     """Backend wrapping UniDepthV2's complete depth estimation system.
 
     This backend:
@@ -78,60 +75,48 @@ class UniDepthV2GeometryBackend(GeometryBackendBase):
         """Initialize the UniDepthV2GeometryBackend."""
         super().__init__(detach_depth_latents=detach_depth_latents)
 
-        # Build UniDepthV2 model
-        if pretrained_path is not None:
-            # Load from local full checkpoint (encoder + decoder)
-            print(f"Loading UniDepthV2 from local checkpoint: {pretrained_path}")
-            self.unidepth_model = UniDepthV2.from_pretrained(pretrained_path)
-        elif encoder_pretrained is not None and decoder_pretrained is not None:
-            # Load encoder and decoder separately
-            print(f"Building UniDepthV2 with separate encoder/decoder weights:")
-            print(f"  Encoder: {encoder_pretrained}")
-            print(f"  Decoder: {decoder_pretrained}")
+        # Store pretrained paths for logging
+        self._pretrained_path = pretrained_path
+        self._encoder_pretrained_path = encoder_pretrained
+        self._decoder_pretrained_path = decoder_pretrained
 
-            # First, download/load the full model to get the architecture
-            hf_name = VERSION_TO_HF_NAME.get(version)
-            if hf_name is None:
-                raise ValueError(
-                    f"Unknown version: {version}. "
-                    f"Available versions: {list(VERSION_TO_HF_NAME.keys())}"
-                )
+        # Store version for loading weights later
+        self._version = version
 
-            # Load full model from HuggingFace (to get architecture)
-            print(f"  Loading architecture from HuggingFace: {hf_name}")
-            self.unidepth_model = UniDepthV2.from_pretrained(hf_name)
-
-            # Load encoder weights
-            print(f"  Loading encoder weights from {encoder_pretrained}")
-            encoder_state = torch.load(encoder_pretrained, map_location="cpu")
-            missing, unexpected = self.unidepth_model.pixel_encoder.load_state_dict(
-                encoder_state, strict=False
+        # Build UniDepthV2 model architecture (without loading pretrained weights yet)
+        # Get HuggingFace model name
+        hf_name = VERSION_TO_HF_NAME.get(version)
+        if hf_name is None:
+            raise ValueError(
+                f"Unknown version: {version}. "
+                f"Available versions: {list(VERSION_TO_HF_NAME.keys())}"
             )
-            if missing:
-                print(f"    Warning: Missing encoder keys: {len(missing)}")
-            if unexpected:
-                print(f"    Warning: Unexpected encoder keys: {len(unexpected)}")
 
-            # Load decoder weights
-            print(f"  Loading decoder weights from {decoder_pretrained}")
-            decoder_state = torch.load(decoder_pretrained, map_location="cpu")
-            missing, unexpected = self.unidepth_model.pixel_decoder.load_state_dict(
-                decoder_state, strict=False
-            )
-            if missing:
-                print(f"    Warning: Missing decoder keys: {len(missing)}")
-            if unexpected:
-                print(f"    Warning: Unexpected decoder keys: {len(unexpected)}")
-        else:
-            # Load from HuggingFace
-            hf_name = VERSION_TO_HF_NAME.get(version)
-            if hf_name is None:
-                raise ValueError(
-                    f"Unknown version: {version}. "
-                    f"Available versions: {list(VERSION_TO_HF_NAME.keys())}"
-                )
-            print(f"Loading UniDepthV2 from HuggingFace: {hf_name}")
-            self.unidepth_model = UniDepthV2.from_pretrained(hf_name)
+        # Download config from HuggingFace
+        print(f"[UniDepthV2] Loading config from HuggingFace: {hf_name}")
+        from huggingface_hub import hf_hub_download
+        import json
+
+        config_file = hf_hub_download(
+            repo_id=hf_name,
+            filename="config.json"
+        )
+        with open(config_file, "r") as f:
+            config = json.load(f)
+
+        # IMPORTANT: Ensure pretrained is None to avoid auto-downloading weights
+        # The HuggingFace config should have "pretrained": null, but we verify here
+        if "model" in config and "pixel_encoder" in config["model"]:
+            encoder_pretrained = config["model"]["pixel_encoder"].get("pretrained")
+            if encoder_pretrained is not None and encoder_pretrained != "":
+                print(f"  WARNING: Config has pretrained={encoder_pretrained}, setting to None")
+                config["model"]["pixel_encoder"]["pretrained"] = None
+            else:
+                print(f"  ✅ Config pretrained={encoder_pretrained} (no auto-download)")
+
+        # Create model from config (without loading pretrained weights)
+        print(f"[UniDepthV2] Creating model architecture (no pretrained weights yet)")
+        self.unidepth_model = UniDepthV2(config=config)
 
         self.use_native_losses = use_native_losses
         self.depth_loss_weight = depth_loss_weight
@@ -140,10 +125,31 @@ class UniDepthV2GeometryBackend(GeometryBackendBase):
 
         assert output_scales >= 1 and output_scales <= 3, "output_scales must be 1, 2, or 3"
 
-        # Freeze encoder if requested
-        if freeze_encoder:
-            for param in self.unidepth_model.pixel_encoder.parameters():
-                param.requires_grad = False
+        # Fix HuggingFace config bug: confidence loss is incorrectly set to Regression
+        # The HuggingFace config has "name": "Regression" for confidence loss,
+        # but UniDepthV2.compute_losses() calls it with Confidence signature:
+        #   loss(input, target_gt=..., target_pred=..., mask=...)
+        # Regression only accepts: loss(input, target, mask)
+        # This causes runtime errors, so we replace with the correct Confidence class.
+        if "confidence" in self.unidepth_model.losses:
+            loss_obj = self.unidepth_model.losses["confidence"]
+            if loss_obj.name == "Regression":
+                print(f"  [UniDepthV2] Fixing HuggingFace config bug: replacing Regression with Confidence")
+                from unidepth.ops.losses.confidence import Confidence
+                # Use the same config as in official UniDepthV2 training
+                confidence_config = {
+                    "weight": 0.1,
+                    "output_fn": "sqrt",
+                    "input_fn": "linear",
+                    "rescale": True,
+                }
+                self.unidepth_model.losses["confidence"] = Confidence.build(confidence_config)
+
+        # Note: Freezing is now handled by optimizer's lr_mult=0.0 instead of requires_grad=False
+        # This avoids DDP's find_unused_parameters overhead
+        # if freeze_encoder:
+        #     for param in self.unidepth_model.pixel_encoder.parameters():
+        #         param.requires_grad = False
 
         # Projection layer to align latent dimension
         # UniDepthV2 hidden_dim is typically 512
@@ -152,31 +158,113 @@ class UniDepthV2GeometryBackend(GeometryBackendBase):
         self.latent_proj = None
         self._latent_proj_initialized = False
 
-        # Register normalization constants
-        self.register_buffer(
-            "pixel_mean",
-            torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1),
-            persistent=False,
-        )
-        self.register_buffer(
-            "pixel_std",
-            torch.tensor(IMAGENET_STD).view(1, 3, 1, 1),
-            persistent=False,
-        )
+    def load_pretrained_weights(self) -> None:
+        """Load pretrained weights for UniDepthV2 encoder and decoder.
 
-    def _normalize_image(self, images: Tensor) -> Tensor:
-        """Normalize images to ImageNet format for UniDepthV2.
-
-        Args:
-            images: Input images in [0, 255] range, shape [B, 3, H, W]
-
-        Returns:
-            Normalized images for UniDepthV2
+        This should be called BEFORE loading the full model checkpoint.
+        It's called from GroundingDINO3D.load_state_dict().
         """
-        # Normalize to [0, 1] then apply ImageNet normalization
-        images = images.float() / 255.0
-        images = (images - self.pixel_mean) / self.pixel_std
-        return images
+        # Determine which weights to load
+        if self._pretrained_path is not None:
+            # Load from local full checkpoint (encoder + decoder)
+            print(f"[UniDepthV2] Loading full model from: {self._pretrained_path}")
+            state_dict = torch.load(self._pretrained_path, map_location="cpu")
+            missing, unexpected = self.unidepth_model.load_state_dict(state_dict, strict=False)
+
+            if missing:
+                print(f"  Warning: Missing keys: {len(missing)}")
+            if unexpected:
+                print(f"  Warning: Unexpected keys: {len(unexpected)}")
+
+            print(f"  ✅ Loaded UniDepthV2 full model successfully!")
+
+        elif self._encoder_pretrained_path is not None and self._decoder_pretrained_path is not None:
+            # Load encoder and decoder separately
+            print(f"[UniDepthV2] Loading encoder and decoder separately:")
+
+            # Load encoder weights
+            # IMPORTANT: The encoder checkpoint has 'pixel_encoder.' prefix, need to remove it
+            print(f"  Loading encoder from: {self._encoder_pretrained_path}")
+            encoder_state = torch.load(self._encoder_pretrained_path, map_location="cpu")
+
+            # Remove 'pixel_encoder.' prefix from keys
+            encoder_state_clean = {}
+            for key, value in encoder_state.items():
+                if key.startswith('pixel_encoder.'):
+                    new_key = key.replace('pixel_encoder.', '', 1)
+                    encoder_state_clean[new_key] = value
+                else:
+                    encoder_state_clean[key] = value
+
+            print(f"    Original keys: {len(encoder_state)}, Cleaned keys: {len(encoder_state_clean)}")
+            missing, unexpected = self.unidepth_model.pixel_encoder.load_state_dict(
+                encoder_state_clean, strict=False
+            )
+            if missing:
+                print(f"    ⚠️ Missing encoder keys: {len(missing)}")
+                if len(missing) <= 10:
+                    for k in missing:
+                        print(f"      - {k}")
+            if unexpected:
+                print(f"    ⚠️ Unexpected encoder keys: {len(unexpected)}")
+                if len(unexpected) <= 10:
+                    for k in unexpected:
+                        print(f"      - {k}")
+
+            # Load decoder weights
+            # The decoder checkpoint does NOT have 'pixel_decoder.' prefix, load directly
+            print(f"  Loading decoder from: {self._decoder_pretrained_path}")
+            decoder_state = torch.load(self._decoder_pretrained_path, map_location="cpu")
+            missing, unexpected = self.unidepth_model.pixel_decoder.load_state_dict(
+                decoder_state, strict=False
+            )
+            if missing:
+                print(f"    ⚠️ Missing decoder keys: {len(missing)}")
+                if len(missing) <= 10:
+                    for k in missing:
+                        print(f"      - {k}")
+            if unexpected:
+                print(f"    ⚠️ Unexpected decoder keys: {len(unexpected)}")
+                if len(unexpected) <= 10:
+                    for k in unexpected:
+                        print(f"      - {k}")
+
+            print(f"  ✅ Loaded encoder and decoder weights successfully!")
+
+        else:
+            # Load from HuggingFace (full pretrained model: encoder + decoder)
+            hf_name = VERSION_TO_HF_NAME.get(self._version)
+            print(f"[UniDepthV2] Loading pretrained weights from HuggingFace: {hf_name}")
+
+            # Download weights file
+            from huggingface_hub import hf_hub_download
+            try:
+                # Try safetensors first
+                weights_file = hf_hub_download(
+                    repo_id=hf_name,
+                    filename="model.safetensors"
+                )
+                from safetensors.torch import load_file
+                state_dict = load_file(weights_file)
+            except:
+                # Fall back to pytorch_model.bin
+                weights_file = hf_hub_download(
+                    repo_id=hf_name,
+                    filename="pytorch_model.bin"
+                )
+                state_dict = torch.load(weights_file, map_location="cpu")
+
+            # Load weights
+            missing, unexpected = self.unidepth_model.load_state_dict(state_dict, strict=False)
+
+            if missing:
+                print(f"  Warning: Missing keys: {len(missing)}")
+            if unexpected:
+                print(f"  Warning: Unexpected keys: {len(unexpected)}")
+
+            print(f"  ✅ Loaded UniDepthV2 pretrained weights from HuggingFace!")
+            print(f"     Encoder (pixel_encoder): ✅ Pretrained")
+            print(f"     Decoder (pixel_decoder): ✅ Pretrained")
 
     def _prepare_inputs(
         self,
@@ -198,8 +286,20 @@ class UniDepthV2GeometryBackend(GeometryBackendBase):
         # Build camera object if intrinsics provided
         camera = None
         if intrinsics is not None:
-            camera = Pinhole(K=intrinsics)
-            camera = BatchCamera.from_camera(camera)
+            # Create individual Pinhole cameras for each batch element
+            cameras = [Pinhole(K=intrinsics[i:i+1]) for i in range(B)]
+            # Stack all camera parameters
+            params_list = [cam.params for cam in cameras]
+            K_list = [cam.K for cam in cameras]
+            params_stacked = torch.cat(params_list, dim=0)
+            K_stacked = torch.cat(K_list, dim=0)
+            # Create BatchCamera manually
+            camera = BatchCamera(
+                params=params_stacked,
+                K=K_stacked,
+                original_class=[Pinhole.__name__] * B,
+                cameras=cameras
+            )
             camera = camera.to(device)
 
         inputs = {
@@ -207,16 +307,12 @@ class UniDepthV2GeometryBackend(GeometryBackendBase):
             "camera": camera,
         }
 
-        # Add depth GT if provided
+        # Add depth GT if provided (should already be [B, 1, H, W])
         if depth_gt is not None:
-            if depth_gt.ndim == 3:
-                depth_gt = depth_gt.unsqueeze(1)  # [B, 1, H, W]
             inputs["depth"] = depth_gt
 
-        # Add depth mask
+        # Add depth mask (should already be [B, 1, H, W])
         if depth_mask is not None:
-            if depth_mask.ndim == 3:
-                depth_mask = depth_mask.unsqueeze(1)
             inputs["depth_mask"] = depth_mask
         elif depth_gt is not None:
             inputs["depth_mask"] = (depth_gt > 0).float()
@@ -307,23 +403,82 @@ class UniDepthV2GeometryBackend(GeometryBackendBase):
         Returns:
             GeometryBackendOutput with depth_map, depth_latents, K_pred, losses
         """
-        # 1. Normalize images for UniDepthV2 (ImageNet normalization)
-        images_normalized = self._normalize_image(images)
+        # Store original dimensions
+        orig_H, orig_W = image_hw
 
-        # 2. Prepare inputs
+        # 1. Resize images to be divisible by DINOv2 patch size (14) and adjust intrinsics
+        images_resized, intrinsics_adjusted = self._make_divisible_by_dinov2_patch(
+            images, intrinsics
+        )
+
+        # Update image_hw to match resized dimensions
+        _, _, new_H, new_W = images_resized.shape
+        image_hw_adjusted = (new_H, new_W)
+
+        # 2. Resize depth_gt and depth_mask to match resized image dimensions
+        depth_gt_resized = None
+        depth_mask_resized = None
+        if depth_gt is not None:
+            if depth_gt.ndim == 3:
+                depth_gt = depth_gt.unsqueeze(1)  # [B, 1, H, W]
+            depth_gt_resized = F.interpolate(
+                depth_gt, size=(new_H, new_W), mode='nearest'
+            )
+        if depth_mask is not None:
+            if depth_mask.ndim == 3:
+                depth_mask = depth_mask.unsqueeze(1)  # [B, 1, H, W]
+            depth_mask_resized = F.interpolate(
+                depth_mask.float(), size=(new_H, new_W), mode='nearest'
+            ).bool()
+
+        # 3. Normalize images for UniDepthV2 (ImageNet normalization)
+        images_normalized = self._normalize_image_for_dinov2(images_resized)
+
+        # 4. Prepare inputs with adjusted intrinsics and image_hw
         inputs, image_metas = self._prepare_inputs(
             images=images_normalized,
-            intrinsics=intrinsics,
-            image_hw=image_hw,
-            depth_gt=depth_gt,
-            depth_mask=depth_mask,
+            intrinsics=intrinsics_adjusted,
+            image_hw=image_hw_adjusted,
+            depth_gt=depth_gt_resized,
+            depth_mask=depth_mask_resized,
         )
+
+        # DEBUG: Check inputs for nan/inf
+        if torch.isnan(inputs["image"]).any() or torch.isinf(inputs["image"]).any():
+            print(f"[DEBUG NaN/Inf] inputs['image'] has nan={torch.isnan(inputs['image']).any().item()}, inf={torch.isinf(inputs['image']).any().item()}")
+        if "camera" in inputs and inputs["camera"] is not None:
+            K = inputs["camera"].K
+            if torch.isnan(K).any() or torch.isinf(K).any():
+                print(f"[DEBUG NaN/Inf] camera.K has nan={torch.isnan(K).any().item()}, inf={torch.isinf(K).any().item()}")
 
         # 3. Run UniDepthV2 forward_train (uses native compute_losses)
         if self.use_native_losses and depth_gt is not None:
+            # DEBUG: Manually run encode_decode to check intermediate values
+            B, _, H, W = inputs["image"].shape
+
+            # Check if camera rays have nan
+            if inputs.get("camera", None) is not None:
+                rays = inputs["camera"].get_rays(shapes=(B, H, W))
+                if torch.isnan(rays).any() or torch.isinf(rays).any():
+                    print(f"[DEBUG NaN/Inf] camera rays has nan={torch.isnan(rays).any().item()}, inf={torch.isinf(rays).any().item()}")
+                    print(f"[DEBUG NaN/Inf] camera.K = {inputs['camera'].K}")
+
             outputs, losses_dict = self.unidepth_model.forward_train(
                 inputs, image_metas
             )
+
+            # DEBUG: Check decoder outputs
+            if "radius" in outputs:
+                radius = outputs["radius"]
+                if torch.isnan(radius).any() or torch.isinf(radius).any():
+                    print(f"[DEBUG NaN/Inf] decoder radius has nan={torch.isnan(radius).any().item()}, inf={torch.isinf(radius).any().item()}")
+                    print(f"[DEBUG NaN/Inf] radius stats: min={radius.min().item():.4f}, max={radius.max().item():.4f}, mean={radius.mean().item():.4f}")
+
+            if "rays" in outputs:
+                rays_out = outputs["rays"]
+                if torch.isnan(rays_out).any() or torch.isinf(rays_out).any():
+                    print(f"[DEBUG NaN/Inf] decoder rays has nan={torch.isnan(rays_out).any().item()}, inf={torch.isinf(rays_out).any().item()}")
+
             # Flatten losses from {"opt": {...}, "stat": {...}} format
             losses = {}
             for loss_type in ["opt", "stat"]:
@@ -335,16 +490,43 @@ class UniDepthV2GeometryBackend(GeometryBackendBase):
             losses = {}
 
         # 4. Extract outputs
-        depth_map = outputs.get("depth")  # [B, 1, H, W]
+        depth_map = outputs.get("depth")  # [B, 1, H', W']
         out_features = outputs.get("out_features")  # [1/8, 1/4, 1/2] resolution latents
         pred_K = outputs.get("intrinsics")  # [B, 3, 3]
 
-        # 5. Extract and project depth latents
+        # DEBUG: Check for nan/inf in depth predictions
+        if depth_map is not None:
+            has_nan = torch.isnan(depth_map).any().item()
+            has_inf = torch.isinf(depth_map).any().item()
+            if has_nan or has_inf:
+                print(f"[DEBUG NaN/Inf] depth_map has nan={has_nan}, inf={has_inf}")
+                print(f"[DEBUG NaN/Inf] depth_map stats: min={depth_map.min().item():.4f}, max={depth_map.max().item():.4f}, mean={depth_map.mean().item():.4f}")
+                # Check which batch elements have nan/inf
+                for i in range(depth_map.shape[0]):
+                    batch_has_nan = torch.isnan(depth_map[i]).any().item()
+                    batch_has_inf = torch.isinf(depth_map[i]).any().item()
+                    if batch_has_nan or batch_has_inf:
+                        print(f"[DEBUG NaN/Inf] Batch {i}: nan={batch_has_nan}, inf={batch_has_inf}")
+
+        # DEBUG: Check for nan/inf in losses
+        if losses:
+            for loss_name, loss_value in losses.items():
+                if torch.isnan(loss_value).any().item() or torch.isinf(loss_value).any().item():
+                    print(f"[DEBUG NaN/Inf] Loss {loss_name} has nan/inf: {loss_value.item()}")
+                    # Print depth_gt stats to see if GT has issues
+                    if depth_gt_resized is not None:
+                        print(f"[DEBUG NaN/Inf] depth_gt_resized stats: min={depth_gt_resized.min().item():.4f}, max={depth_gt_resized.max().item():.4f}, mean={depth_gt_resized.mean().item():.4f}")
+                        print(f"[DEBUG NaN/Inf] depth_gt_resized has nan={torch.isnan(depth_gt_resized).any().item()}, inf={torch.isinf(depth_gt_resized).any().item()}")
+
+        # 5. Resize depth_map back to original dimensions
+        depth_map_resized = self._resize_depth_to_original(depth_map, (orig_H, orig_W))
+
+        # 6. Extract and project depth latents
         depth_latents, depth_latents_hw = self._extract_depth_latents(out_features)
         depth_latents = self._maybe_detach_latents(depth_latents)
 
         return GeometryBackendOutput(
-            depth_map=depth_map,
+            depth_map=depth_map_resized,
             depth_latents=depth_latents,
             K_pred=pred_K,
             aux={
@@ -376,30 +558,45 @@ class UniDepthV2GeometryBackend(GeometryBackendBase):
         Returns:
             GeometryBackendOutput with depth_map, depth_latents, K_pred
         """
-        # 1. Normalize images for UniDepthV2
-        images_normalized = self._normalize_image(images)
+        # Store original dimensions
+        orig_H, orig_W = image_hw
 
-        # 2. Prepare inputs (no depth GT)
-        inputs, image_metas = self._prepare_inputs(
-            images=images_normalized,
-            intrinsics=intrinsics,
-            image_hw=image_hw,
+        # 1. Resize images to be divisible by DINOv2 patch size (14) and adjust intrinsics
+        images_resized, intrinsics_adjusted = self._make_divisible_by_dinov2_patch(
+            images, intrinsics
         )
 
-        # 3. Run UniDepthV2 encode_decode
+        # Update image_hw to match resized dimensions
+        _, _, new_H, new_W = images_resized.shape
+        image_hw_adjusted = (new_H, new_W)
+
+        # 2. Normalize images for UniDepthV2
+        images_normalized = self._normalize_image_for_dinov2(images_resized)
+
+        # 3. Prepare inputs (no depth GT) with adjusted intrinsics and image_hw
+        inputs, image_metas = self._prepare_inputs(
+            images=images_normalized,
+            intrinsics=intrinsics_adjusted,
+            image_hw=image_hw_adjusted,
+        )
+
+        # 4. Run UniDepthV2 encode_decode
         inputs, outputs = self.unidepth_model.encode_decode(inputs, image_metas)
 
-        # 4. Extract outputs
-        depth_map = outputs.get("depth")
+        # 5. Extract outputs
+        depth_map = outputs.get("depth")  # [B, 1, H', W']
         out_features = outputs.get("out_features")
         pred_K = outputs.get("intrinsics")
 
-        # 5. Extract and project depth latents
+        # 6. Resize depth_map back to original dimensions
+        depth_map_resized = self._resize_depth_to_original(depth_map, (orig_H, orig_W))
+
+        # 7. Extract and project depth latents
         depth_latents, depth_latents_hw = self._extract_depth_latents(out_features)
         depth_latents = self._maybe_detach_latents(depth_latents)
 
         return GeometryBackendOutput(
-            depth_map=depth_map,
+            depth_map=depth_map_resized,
             depth_latents=depth_latents,
             K_pred=pred_K,
             aux={

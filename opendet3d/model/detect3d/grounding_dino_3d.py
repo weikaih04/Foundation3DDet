@@ -22,9 +22,9 @@ from opendet3d.op.detect.grounding_dino import GroundingDINOHead, RoI2Det
 from opendet3d.op.fpp.channel_mapper import ChannelMapper
 from opendet3d.op.detect3d.geometry import GeometryBackendBase, UniDepthHeadBackend
 
-# CUT3R Fusion imports
-from opendet3d.model.cut3r_tower import CUT3RTower
-from opendet3d.model.cut3r_fusion import MultiScaleCUT3RFusion
+# CUT3R Fusion imports - DISABLED for geometry ablation experiments
+# from opendet3d.model.cut3r_tower import CUT3RTower
+# from opendet3d.model.cut3r_fusion import MultiScaleCUT3RFusion
 
 
 class Det3DOut(NamedTuple):
@@ -122,61 +122,39 @@ class GroundingDINO3D(GroundingDINO):
         # Setup geometry backend
         # If geometry_backend is provided, use it directly
         # Otherwise, wrap depth_head in UniDepthHeadBackend for backward compat
+        print(f"\n[DEBUG __init__] geometry_backend parameter: {type(geometry_backend) if geometry_backend is not None else None}")
+        print(f"[DEBUG __init__] depth_head parameter: {type(depth_head) if depth_head is not None else None}")
+
         if geometry_backend is not None:
+            print(f"[DEBUG __init__] Using provided geometry_backend: {type(geometry_backend).__name__}")
             self.geometry_backend = geometry_backend
         elif depth_head is not None:
             # Backward compatibility: wrap depth_head in UniDepthHeadBackend
+            print(f"[DEBUG __init__] Wrapping depth_head in UniDepthHeadBackend")
             self.geometry_backend = UniDepthHeadBackend(
                 depth_head=depth_head,
                 depth_loss_weight=depth_loss_weight,
             )
         else:
+            print(f"[DEBUG __init__] No geometry backend or depth_head provided")
             self.geometry_backend = None
 
         # ========== CUT3R Fusion Setup ==========
+        # DISABLED for geometry ablation experiments
         # Save freeze setting
         self._cut3r_freeze = cut3r_freeze
 
-        if cut3r_checkpoint is not None:
-            # Create CUT3R Tower and load pretrained weights from fixed path
-            # NOTE: These weights will be overwritten if loading a complete checkpoint
-            # (3D-MOOD + CUT3R + Fusion) via load_state_dict() later
-            self.cut3r_tower = CUT3RTower(
-                freeze=cut3r_freeze  # Freeze if specified
-            )
+        # Always disable CUT3R for now
+        self.cut3r_tower = None
+        self.cut3r_fusion = None
 
-            # Default fusion levels if not specified
-            if fusion_levels is None:
-                fusion_levels = [2, 3]  # Recommended: fuse L2 + L3
-
-            # Default fusion strategies if not specified
-            # All levels use full attention (simple and effective)
-            if fusion_strategies is None:
-                fusion_strategies = {
-                    0: {'type': 'full'},
-                    1: {'type': 'full'},
-                    2: {'type': 'full'},
-                    3: {'type': 'full'}
-                }
-
-            # Get d_models from backbone
-            # Swin Transformer outputs: [96, 192, 384, 768]
-            d_models = [96, 192, 384, 768]
-
-            # Create Multi-Scale Fusion
-            self.cut3r_fusion = MultiScaleCUT3RFusion(
-                d_models=d_models,
-                d_cut3r=768,  # CUT3R actual output dimension
-                num_heads=fusion_num_heads,
-                fusion_levels=fusion_levels,
-                fusion_strategies=fusion_strategies,
-                dropout=fusion_dropout,
-                use_relative_pos_bias=use_relative_pos_bias
-            )
-
-        else:
-            self.cut3r_tower = None
-            self.cut3r_fusion = None
+        # if cut3r_checkpoint is not None:
+        #     # Create CUT3R Tower and load pretrained weights from fixed path
+        #     self.cut3r_tower = CUT3RTower(freeze=cut3r_freeze)
+        #     # ... fusion setup ...
+        # else:
+        #     self.cut3r_tower = None
+        #     self.cut3r_fusion = None
 
         if freeze_detector:
             self._freeze_detector()
@@ -187,53 +165,161 @@ class GroundingDINO3D(GroundingDINO):
         # Print trainable parameter statistics
         self._print_trainable_params()
 
+        # Save weights path for later use in summary
+        self._weights_path = weights
+
+        # Note: Weight loading summary will be printed in load_state_dict()
+        # after all weights are actually loaded
+
         self.cat_mapping = cat_mapping
+
+    def on_load_checkpoint(self, checkpoint):
+        """
+        PyTorch Lightning hook called when loading a checkpoint.
+
+        This is called BEFORE load_state_dict, so we can:
+        1. Load geometry backend pretrained weights first
+        2. Filter out incompatible keys from the checkpoint
+        3. Let PyTorch Lightning load the filtered checkpoint
+        """
+        print("\n" + "="*80)
+        print("📦 CHECKPOINT LOADING (PyTorch Lightning Hook)")
+        print("="*80)
+
+        # Get the state_dict from checkpoint
+        state_dict = checkpoint.get('state_dict', {})
+
+        # Analyze checkpoint content
+        has_geometry_backend = any('geometry_backend' in key for key in state_dict.keys())
+        has_depth_head = any(key.startswith('depth_head.') for key in state_dict.keys())
+        has_cut3r = any('cut3r_tower' in key for key in state_dict.keys())
+
+        # Determine if this is resume training or first training
+        is_resume = has_geometry_backend
+
+        if is_resume:
+            # Resume training: load everything from checkpoint
+            print("\n📌 Mode: Resume Training")
+            print("Loading complete checkpoint (all components)")
+            print(f"  Resuming from epoch {checkpoint.get('epoch', 'unknown')}")
+            print(f"  Resuming from global_step {checkpoint.get('global_step', 'unknown')}")
+
+        else:
+            # First training: load pretrained weights + 3D-MOOD checkpoint
+            print("\n📌 Mode: First Training (Fine-tuning)")
+
+            # Step 1: Load geometry backend pretrained weights
+            if self.geometry_backend is not None and hasattr(self.geometry_backend, 'load_pretrained_weights'):
+                print("\n[Step 1/2] Loading geometry backend pretrained weights...")
+                self.geometry_backend.load_pretrained_weights()
+
+            # Step 2: Filter out incompatible keys from checkpoint
+            print("\n[Step 2/2] Filtering 3D-MOOD checkpoint...")
+
+            if has_depth_head:
+                print("  Filtering out old depth_head/fpn keys (using geometry_backend instead)")
+                original_count = len(state_dict)
+                filtered_state_dict = {
+                    k: v for k, v in state_dict.items()
+                    if not k.startswith('depth_head.') and not k.startswith('fpn.')
+                }
+                filtered_count = original_count - len(filtered_state_dict)
+                print(f"  Loaded: {len(filtered_state_dict)} keys")
+                print(f"  Filtered: {filtered_count} keys (depth_head/fpn)")
+
+                # Update checkpoint with filtered state_dict
+                checkpoint['state_dict'] = filtered_state_dict
+
+            # Step 3: Reset training state (epoch, step, optimizer)
+            # This ensures we start from epoch 0 when fine-tuning from 3D-MOOD
+            print("\n[Step 3/3] Resetting training state for fine-tuning...")
+            if 'epoch' in checkpoint:
+                old_epoch = checkpoint['epoch']
+                checkpoint['epoch'] = 0
+                print(f"  Reset epoch: {old_epoch} → 0")
+
+            if 'global_step' in checkpoint:
+                old_step = checkpoint['global_step']
+                checkpoint['global_step'] = 0
+                print(f"  Reset global_step: {old_step} → 0")
+
+            # Remove optimizer states (they won't match our new optimizer config)
+            if 'optimizer_states' in checkpoint:
+                del checkpoint['optimizer_states']
+                print(f"  Removed optimizer_states (will initialize fresh)")
+
+            # Remove lr_scheduler states
+            if 'lr_schedulers' in checkpoint:
+                del checkpoint['lr_schedulers']
+                print(f"  Removed lr_schedulers (will initialize fresh)")
+
+        # Store resume status for later use in summary
+        self._is_resume_training = is_resume
+
+        # Let PyTorch Lightning continue with the (possibly filtered) checkpoint
+        # No need to call super() - PyTorch Lightning will handle the rest
 
     def load_state_dict(self, state_dict, strict=True):
         """
-        Smart checkpoint loading with automatic CUT3R weight handling.
+        Load state dict and print weight loading summary.
 
-        Scenarios:
-        1. Baseline checkpoint → Fusion model:
-           - Load 3D-MOOD weights (backbone, neck, head)
-           - CUT3R weights already loaded in __init__ (from fixed path)
-           - Keep fusion random init (gate ≈ 0)
-
-        2. Complete checkpoint → Fusion model:
-           - Load all weights (3D-MOOD + CUT3R + Fusion)
-           - Overwrite CUT3R weights from __init__ with checkpoint weights
-
-        3. Any checkpoint → Baseline model:
-           - Normal loading
+        This method is called by vis4d's checkpoint loading system.
+        It handles:
+        1. Filtering out incompatible keys (e.g., depth_head when using geometry_backend)
+        2. Loading checkpoint weights (Swin, BERT, GroundingDINO heads)
+        3. Loading geometry backend pretrained weights (DINOv2, decoder)
         """
-        # Check if checkpoint contains CUT3R/Fusion weights
-        has_cut3r = any('cut3r_tower' in key for key in state_dict.keys())
+        print(f"\n[DEBUG] load_state_dict called")
+        print(f"[DEBUG] self.depth_head: {type(self.depth_head) if self.depth_head is not None else None}")
+        print(f"[DEBUG] self.geometry_backend: {type(self.geometry_backend)}")
 
-        if self.cut3r_tower is not None:
-            if has_cut3r:
-                # Scenario 2: Complete checkpoint with CUT3R weights
-                print("[INFO] Loading complete checkpoint (3D-MOOD + CUT3R + Fusion)")
-                print("[INFO] CUT3R weights from __init__ will be overwritten")
-                result = super().load_state_dict(state_dict, strict=False)
+        # Mark that we're loading from checkpoint
+        # This is used by the weight loading summary to show correct status
+        self._checkpoint_loaded = True
 
-                # Freeze CUT3R if needed (re-freeze after loading)
-                if self._cut3r_freeze:
-                    self._freeze_cut3r()
+        # Filter out depth_head keys if we're using a different geometry backend
+        # This prevents checkpoint's depth_head/fpn from overwriting our geometry_backend
+        if self.geometry_backend is not None and not isinstance(self.geometry_backend, UniDepthHeadBackend):
+            # We're using a custom geometry backend (DetAny3D, UniDepthV2, etc.)
+            # Remove depth_head and fpn keys from checkpoint to avoid conflicts
+            depth_head_keys = [k for k in state_dict.keys() if k.startswith('depth_head.')]
+            fpn_keys = [k for k in state_dict.keys() if k.startswith('fpn.')]
 
-                return result
-            else:
-                # Scenario 1: Baseline checkpoint
-                print("[INFO] Loading 3D-MOOD checkpoint (baseline weights)")
-                print("[INFO] CUT3R weights already loaded from: CUT3R/src/cut3r_512_dpt_4_64.pth")
+            if depth_head_keys or fpn_keys:
+                print(f"\n[DEBUG] Filtering out incompatible keys from checkpoint:")
+                if depth_head_keys:
+                    print(f"[DEBUG]   - {len(depth_head_keys)} depth_head.* keys")
+                    for k in depth_head_keys:
+                        del state_dict[k]
+                if fpn_keys:
+                    print(f"[DEBUG]   - {len(fpn_keys)} fpn.* keys")
+                    for k in fpn_keys:
+                        del state_dict[k]
+                print(f"[DEBUG] (Using custom geometry backend: {type(self.geometry_backend).__name__})")
 
-                # Load 3D-MOOD weights only
-                result = super().load_state_dict(state_dict, strict=False)
+        # Call parent's load_state_dict to load checkpoint weights
+        result = super().load_state_dict(state_dict, strict=False)
 
-                return result
+        # Load geometry backend pretrained weights if available
+        print(f"\n[DEBUG] After loading checkpoint:")
+        print(f"[DEBUG] geometry_backend type: {type(self.geometry_backend)}")
+        print(f"[DEBUG] hasattr load_pretrained_weights: {hasattr(self.geometry_backend, 'load_pretrained_weights')}")
+
+        if hasattr(self.geometry_backend, 'load_pretrained_weights'):
+            print("\n" + "="*80)
+            print("🔧 Loading Geometry Backend Pretrained Weights")
+            print("="*80)
+            self.geometry_backend.load_pretrained_weights()
+            print("="*80 + "\n")
         else:
-            # Scenario 3: Baseline model (no CUT3R)
-            print("[INFO] Loading checkpoint into baseline model (no CUT3R)")
-            return super().load_state_dict(state_dict, strict=strict)
+            print(f"[DEBUG] geometry_backend does not have load_pretrained_weights method")
+            print(f"[DEBUG] Available methods: {[m for m in dir(self.geometry_backend) if not m.startswith('_')][:20]}")
+
+        # Print weight loading summary after loading is complete
+        is_resume = getattr(self, '_is_resume_training', False)
+        self._print_weight_loading_summary_after_load(is_resume)
+
+        return result
 
     def _freeze_cut3r(self):
         """Freeze CUT3R tower."""
@@ -358,6 +444,277 @@ class GroundingDINO3D(GroundingDINO):
             print(f"{component:<20} {total:>12,}   {trainable:>12,}   {pct:>6.2f}%   {status}")
 
         print("="*80 + "\n")
+
+    def _get_component_name(self, param_name: str) -> str:
+        """Get component name from parameter name for detailed statistics."""
+        if 'backbone' in param_name:
+            return 'backbone'
+        elif 'neck' in param_name:
+            return 'neck'
+        elif 'language_model' in param_name or 'bert' in param_name:
+            return 'language_model'
+        elif 'geometry_backend' in param_name:
+            # Further breakdown geometry backend
+            if 'dino_encoder' in param_name or 'pixel_encoder' in param_name:
+                return 'geom_encoder'
+            elif 'depth_decoder' in param_name or 'depth_head' in param_name or 'unidepth_model.decoder' in param_name:
+                return 'geom_decoder'
+            elif 'feature_projector' in param_name or 'latent_proj' in param_name:
+                return 'geom_projector'
+            else:
+                return 'geometry_backend_other'
+        elif 'encoder' in param_name:
+            return 'encoder'
+        elif 'decoder' in param_name:
+            return 'decoder'
+        elif 'bbox_head' in param_name or 'bbox3d_head' in param_name:
+            return 'bbox_head'
+        elif 'cut3r_tower' in param_name:
+            return 'cut3r_tower'
+        elif 'cut3r_fusion' in param_name:
+            return 'cut3r_fusion'
+        else:
+            return 'other'
+
+    def print_trainable_params_with_lr(self, optimizer):
+        """Print trainable parameter statistics with learning rate info.
+
+        This function shows which parameters are actually trainable (lr > 0) vs
+        frozen by lr=0.0 vs frozen by requires_grad=False.
+
+        Args:
+            optimizer: The optimizer instance with param_groups.
+        """
+        # Build param -> lr mapping from optimizer
+        param_to_lr = {}
+        for param_group in optimizer.param_groups:
+            lr = param_group['lr']  # base_lr * lr_mult
+            for param in param_group['params']:
+                param_to_lr[id(param)] = lr
+
+        total_params = 0
+        actually_trainable = 0  # lr > 0
+        frozen_by_lr = 0        # lr == 0
+        frozen_by_grad = 0      # requires_grad == False
+
+        component_stats = {}
+
+        for name, param in self.named_parameters():
+            total_params += param.numel()
+
+            # Determine component
+            component = self._get_component_name(name)
+            if component not in component_stats:
+                component_stats[component] = {
+                    'total': 0,
+                    'trainable': 0,      # lr > 0
+                    'frozen_lr': 0,      # lr == 0
+                    'frozen_grad': 0,    # requires_grad == False
+                }
+
+            component_stats[component]['total'] += param.numel()
+
+            # Check freeze status
+            if not param.requires_grad:
+                # Frozen by requires_grad=False
+                frozen_by_grad += param.numel()
+                component_stats[component]['frozen_grad'] += param.numel()
+            elif id(param) in param_to_lr:
+                lr = param_to_lr[id(param)]
+                if lr == 0.0:
+                    # Frozen by lr=0.0
+                    frozen_by_lr += param.numel()
+                    component_stats[component]['frozen_lr'] += param.numel()
+                else:
+                    # Actually trainable
+                    actually_trainable += param.numel()
+                    component_stats[component]['trainable'] += param.numel()
+            else:
+                # Not in optimizer (shouldn't happen, but count as trainable)
+                print(f"  ⚠️  WARNING: Parameter {name} not found in optimizer!")
+                actually_trainable += param.numel()
+                component_stats[component]['trainable'] += param.numel()
+
+        # Print statistics
+        print("\n" + "="*105)
+        print("📊 Trainable Parameter Statistics (with Learning Rate)")
+        print("="*105)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Actually trainable (lr > 0): {actually_trainable:,} ({100*actually_trainable/total_params:.2f}%)")
+        print(f"Frozen by lr=0.0: {frozen_by_lr:,} ({100*frozen_by_lr/total_params:.2f}%)")
+        print(f"Frozen by requires_grad=False: {frozen_by_grad:,} ({100*frozen_by_grad/total_params:.2f}%)")
+
+        print("\nBy Component:")
+        print(f"{'Component':<25} {'Total':<15} {'Trainable':<15} {'Frozen(lr=0)':<17} {'Frozen(grad=F)':<17} {'Status'}")
+        print("-"*105)
+
+        for component in sorted(component_stats.keys()):
+            stats = component_stats[component]
+            total = stats['total']
+            trainable = stats['trainable']
+            frozen_lr = stats['frozen_lr']
+            frozen_grad = stats['frozen_grad']
+
+            if frozen_lr + frozen_grad == total:
+                status = "🔒 FROZEN"
+            elif trainable == total:
+                status = "✅ TRAINABLE"
+            else:
+                status = "⚠️  PARTIAL"
+
+            print(f"{component:<25} {total:<15,} {trainable:<15,} {frozen_lr:<17,} {frozen_grad:<17,} {status}")
+
+        print("="*105)
+        print()
+
+    def _print_weight_loading_summary_after_load(self, is_resume: bool):
+        """Print weight loading summary AFTER all weights are loaded.
+
+        Args:
+            is_resume: Whether this is resume training (True) or first training (False)
+        """
+        print("\n" + "=" * 80)
+        print("🔍 WEIGHT LOADING SUMMARY (FINAL)")
+        print("=" * 80)
+
+        if is_resume:
+            print("\n📌 Mode: Resume Training")
+            print("All components loaded from unified checkpoint")
+            print("No separate pretrained weights needed")
+            print("\n" + "=" * 80)
+            print("✅ Weight Loading Summary Complete")
+            print("=" * 80 + "\n")
+            return
+
+        print("\n📌 Mode: First Training (Fine-tuning)")
+        print("-" * 80)
+
+        # Check if checkpoint was loaded (via --ckpt flag)
+        checkpoint_loaded = getattr(self, '_checkpoint_loaded', False)
+
+        # 1. Backbone (Swin Transformer)
+        print(f"\n📦 Backbone (Swin Transformer):")
+        if checkpoint_loaded or self._weights_path:
+            source = "checkpoint (--ckpt)" if checkpoint_loaded else self._weights_path
+            print(f"   ✅ Loaded from: {source}")
+            print(f"   └─ Status: Pretrained (3D-MOOD)")
+        else:
+            print(f"   ⚠️  Random initialization")
+
+        # 2. Language Model
+        print(f"\n📝 Language Model (BERT):")
+        if checkpoint_loaded or self._weights_path:
+            source = "checkpoint (--ckpt)" if checkpoint_loaded else self._weights_path
+            print(f"   ✅ Loaded from: {source}")
+            print(f"   └─ Status: Pretrained (3D-MOOD)")
+        else:
+            print(f"   ⚠️  Random initialization")
+
+        # 3. GroundingDINO Head
+        print(f"\n🎯 GroundingDINO Head (2D Detection):")
+        if checkpoint_loaded or self._weights_path:
+            source = "checkpoint (--ckpt)" if checkpoint_loaded else self._weights_path
+            print(f"   ✅ Loaded from: {source}")
+            print(f"   └─ Status: Pretrained (3D-MOOD)")
+        else:
+            print(f"   ⚠️  Random initialization")
+
+        # 4. GroundingDINO3D Head
+        print(f"\n🎯 GroundingDINO3D Head (3D Detection):")
+        if checkpoint_loaded or self._weights_path:
+            source = "checkpoint (--ckpt)" if checkpoint_loaded else self._weights_path
+            print(f"   ✅ Loaded from: {source}")
+            print(f"   └─ Status: Pretrained (3D-MOOD)")
+        else:
+            print(f"   ⚠️  Random initialization")
+
+        # 5. Geometry Backend
+        if self.geometry_backend is not None:
+            backend_type = type(self.geometry_backend).__name__
+            print(f"\n🌍 Geometry Backend ({backend_type}):")
+
+            if backend_type == "UniDepthHeadBackend":
+                if self._weights_path:
+                    print(f"   ✅ UniDepthHead decoder loaded from: {self._weights_path}")
+                    print(f"   └─ Status: Pretrained (3D-MOOD checkpoint)")
+                else:
+                    print(f"   ⚠️  Random initialization")
+
+            elif backend_type == "UniDepthHeadDinoBackend":
+                backend = self.geometry_backend
+                dino_model = getattr(backend, 'dino_model', 'unknown')
+                dino_pretrained = getattr(backend, '_dino_pretrained_path', None)
+
+                print(f"   📌 DINOv2 Encoder ({dino_model}):")
+                if dino_pretrained:
+                    print(f"      ✅ Loaded from: {dino_pretrained}")
+                    print(f"      └─ Status: Pretrained (frozen)")
+                else:
+                    print(f"      ⚠️  Random initialization or hub weights")
+
+                print(f"   📌 Feature Projection:")
+                print(f"      ⚠️  Random init (~1M params, adapts DINOv2 to UniDepthHead)")
+
+                print(f"   📌 UniDepthHead Decoder:")
+                if self._weights_path:
+                    print(f"      ✅ Loaded from: {self._weights_path}")
+                    print(f"      └─ Status: Pretrained (finetuned from Swin-based)")
+                else:
+                    print(f"      ⚠️  Random initialization")
+
+            elif backend_type == "DetAny3DGeometryBackend":
+                backend = self.geometry_backend
+                dino_model = getattr(backend, 'dino_model', 'unknown')
+                dino_pretrained = getattr(backend, '_dino_pretrained_path', None)
+                decoder_pretrained = getattr(backend, '_decoder_pretrained_path', None)
+                has_projector = getattr(backend, '_has_projector', False)
+
+                print(f"   📌 DINOv2 Encoder ({dino_model}):")
+                if dino_pretrained:
+                    print(f"      ✅ Loaded from: {dino_pretrained}")
+                    print(f"      └─ Status: Pretrained (frozen)")
+                else:
+                    print(f"      ⚠️  Random initialization")
+
+                if has_projector:
+                    # Get projector dimensions
+                    projector = backend.feature_projector
+                    if hasattr(projector, 'in_features') and hasattr(projector, 'out_features'):
+                        in_dim = projector.in_features
+                        out_dim = projector.out_features
+                        num_params = in_dim * out_dim + out_dim  # weights + bias
+                        print(f"   📌 Feature Projector:")
+                        print(f"      ⚠️  Random init ({in_dim} → {out_dim}, ~{num_params/1000:.0f}K params)")
+                        print(f"      └─ Purpose: Adapt encoder to decoder dimension")
+
+                print(f"   📌 DetAny3D Decoder (UnidepthDecoderDinoOnly):")
+                if decoder_pretrained:
+                    print(f"      ✅ Loaded from: {decoder_pretrained}")
+                    print(f"      └─ Status: Pretrained (trainable)")
+                else:
+                    print(f"      ⚠️  Random initialization")
+
+            elif backend_type == "UniDepthV2GeometryBackend":
+                backend = self.geometry_backend
+                encoder_pretrained = getattr(backend, '_encoder_pretrained_path', None)
+                decoder_pretrained = getattr(backend, '_decoder_pretrained_path', None)
+                pretrained_path = getattr(backend, '_pretrained_path', None)
+
+                print(f"   📌 UniDepthV2 Model:")
+                if encoder_pretrained and decoder_pretrained:
+                    print(f"      ✅ Encoder (DINOv2) loaded from: {encoder_pretrained}")
+                    print(f"      ✅ Decoder loaded from: {decoder_pretrained}")
+                    print(f"      └─ Status: Pretrained (trainable)")
+                elif pretrained_path:
+                    print(f"      ✅ Full model loaded from: {pretrained_path}")
+                    print(f"      └─ Status: Pretrained (trainable)")
+                else:
+                    print(f"      ✅ Loaded from HuggingFace")
+                    print(f"      └─ Status: Pretrained (trainable)")
+
+        print("\n" + "=" * 80)
+        print("✅ Weight Loading Summary Complete")
+        print("=" * 80 + "\n")
 
     def forward_transformer(
         self,
