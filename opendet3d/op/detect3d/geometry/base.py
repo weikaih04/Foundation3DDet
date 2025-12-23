@@ -26,6 +26,12 @@ class GeometryBackendOutput(TypedDict, total=False):
         depth_latents: Depth latent tokens [B, N, C] for 3D head.
             Dimension C is aligned to target_latent_dim (default: 128).
         K_pred: Predicted camera intrinsics [B, 3, 3] (optional).
+        ray_intrinsics: Intrinsics to use for ray_embeddings generation [B, 3, 3].
+            This may be adjusted intrinsics for DINOv2-based backends.
+        ray_image_hw: Image (H, W) to use for ray_embeddings generation.
+            This corresponds to the space where depth_latents were computed.
+        ray_downsample: Downsample factor for ray_embeddings (8 or 16).
+            Must match the spatial resolution of depth_latents.
         aux: Auxiliary outputs (rays, points, confidence, etc.).
         losses: Dictionary of geometry losses (only in training).
     """
@@ -33,6 +39,9 @@ class GeometryBackendOutput(TypedDict, total=False):
     depth_map: Tensor
     depth_latents: Tensor
     K_pred: Tensor | None
+    ray_intrinsics: Tensor
+    ray_image_hw: tuple[int, int]
+    ray_downsample: int
     aux: dict[str, Tensor]
     losses: dict[str, Tensor]
 

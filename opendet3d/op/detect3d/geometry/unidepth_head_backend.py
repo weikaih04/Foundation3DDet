@@ -98,6 +98,9 @@ class UniDepthHeadBackend(GeometryBackendBase):
             depth_map=depth_preds.unsqueeze(1),  # [B, 1, H, W]
             depth_latents=depth_latent,  # [B, N, C]
             K_pred=None,  # UniDepthHead doesn't predict intrinsics
+            ray_intrinsics=intrinsics,  # Original intrinsics
+            ray_image_hw=image_hw,  # Original image size
+            ray_downsample=16,  # UniDepthHead uses 1/16 resolution
             aux={},
             losses=losses,
         )
@@ -139,6 +142,9 @@ class UniDepthHeadBackend(GeometryBackendBase):
             depth_map=depth_preds.unsqueeze(1),  # [B, 1, H, W]
             depth_latents=depth_latent,  # [B, N, C]
             K_pred=None,
+            ray_intrinsics=intrinsics,  # Original intrinsics
+            ray_image_hw=image_hw,  # Original image size
+            ray_downsample=16,  # UniDepthHead uses 1/16 resolution
             aux={},
             losses={},
         )

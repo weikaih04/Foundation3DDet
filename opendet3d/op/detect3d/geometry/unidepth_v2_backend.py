@@ -525,10 +525,16 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         depth_latents, depth_latents_hw = self._extract_depth_latents(out_features)
         depth_latents = self._maybe_detach_latents(depth_latents)
 
+        # Compute downsample factor based on output_scales (1=1/8, 2=1/4, 3=1/2)
+        ray_downsample = 8 // (2 ** (self.output_scales - 1))
+
         return GeometryBackendOutput(
             depth_map=depth_map_resized,
             depth_latents=depth_latents,
             K_pred=pred_K,
+            ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
+            ray_image_hw=image_hw_adjusted,  # Adjusted image size
+            ray_downsample=ray_downsample,  # Based on output_scales
             aux={
                 "confidence": outputs.get("confidence"),
                 "rays": outputs.get("rays"),
@@ -595,10 +601,16 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         depth_latents, depth_latents_hw = self._extract_depth_latents(out_features)
         depth_latents = self._maybe_detach_latents(depth_latents)
 
+        # Compute downsample factor based on output_scales (1=1/8, 2=1/4, 3=1/2)
+        ray_downsample = 8 // (2 ** (self.output_scales - 1))
+
         return GeometryBackendOutput(
             depth_map=depth_map_resized,
             depth_latents=depth_latents,
             K_pred=pred_K,
+            ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
+            ray_image_hw=image_hw_adjusted,  # Adjusted image size
+            ray_downsample=ray_downsample,  # Based on output_scales
             aux={
                 "confidence": outputs.get("confidence"),
                 "rays": outputs.get("rays"),

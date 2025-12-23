@@ -431,6 +431,9 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
             depth_map=depth_map_resized,
             depth_latents=depth_latents,
             K_pred=pred_K,
+            ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
+            ray_image_hw=image_hw_adjusted,  # Adjusted image size
+            ray_downsample=8,  # DetAny3D uses 1/8 resolution for depth_latents
             aux={
                 "confidence": outputs.get("confidence"),
                 "rays": outputs.get("rays"),
@@ -575,6 +578,9 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
             depth_map=depth_map,
             depth_latents=depth_latents,
             K_pred=pred_K,
+            ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
+            ray_image_hw=image_hw_resized,  # Adjusted image size
+            ray_downsample=8,  # DetAny3D uses 1/8 resolution for depth_latents
             aux={
                 "confidence": outputs.get("confidence"),
                 "rays": outputs.get("rays"),

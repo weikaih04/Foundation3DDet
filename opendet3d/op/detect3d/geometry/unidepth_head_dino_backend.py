@@ -292,6 +292,9 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
             depth_map=depth_preds_resized.unsqueeze(1),  # [B, 1, H, W]
             depth_latents=depth_latent,  # [B, N, C]
             K_pred=None,  # UniDepthHead doesn't predict intrinsics
+            ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
+            ray_image_hw=image_hw_adjusted,  # Adjusted image size
+            ray_downsample=16,  # UniDepthHead uses 1/16 resolution
             aux={},
             losses=losses,
         )
@@ -351,6 +354,9 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
             depth_map=depth_preds_resized.unsqueeze(1),  # [B, 1, H, W]
             depth_latents=depth_latent,  # [B, N, C]
             K_pred=None,
+            ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
+            ray_image_hw=image_hw_adjusted,  # Adjusted image size
+            ray_downsample=16,  # UniDepthHead uses 1/16 resolution
             aux={},
             losses={},
         )

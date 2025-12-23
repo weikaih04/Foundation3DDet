@@ -94,16 +94,30 @@ class GroundingDINO3DHead(nn.Module):
             xavier_init(m, distribution="uniform")
 
     def get_camera_embeddings(
-        self, intrinsics: Tensor, image_shape: tuple[int, int]
+        self,
+        intrinsics: Tensor,
+        image_shape: tuple[int, int],
+        downsample: int = 16,
     ) -> Tensor:
-        """Get the camera embeddings."""
+        """Get the camera embeddings.
+
+        Args:
+            intrinsics: Camera intrinsics [B, 3, 3]. Should match the space
+                where depth_latents were computed (may be adjusted for DINOv2).
+            image_shape: Image (H, W) in the same space as intrinsics.
+            downsample: Downsample factor for ray grid (8 or 16).
+                Must match depth_latents resolution.
+
+        Returns:
+            ray_embeddings: [B, H//downsample * W//downsample, 81]
+        """
         rays, _ = generate_rays(intrinsics, image_shape)
 
         rays = F.normalize(
             flat_interpolate(
                 rays,
                 old=image_shape,
-                new=(image_shape[0] // 16, image_shape[1] // 16),
+                new=(image_shape[0] // downsample, image_shape[1] // downsample),
             ),
             dim=-1,
         )

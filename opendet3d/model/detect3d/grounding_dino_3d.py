@@ -1033,11 +1033,8 @@ class GroundingDINO3D(GroundingDINO):
             visual_feats, input_hw, batch_input_shape, padding=padding
         )
 
-        ray_embeddings = self.bbox3d_head.get_camera_embeddings(
-            intrinsics, batch_input_shape
-        )
-
         # Geometry Backend / Depth Head
+        # Run this first to get ray_intrinsics/ray_image_hw/ray_downsample
         geom_losses = {}
         if self.geometry_backend is not None:
             geom_out = self.geometry_backend(
@@ -1051,13 +1048,27 @@ class GroundingDINO3D(GroundingDINO):
             depth_preds = geom_out["depth_map"].squeeze(1)  # [B, H, W]
             depth_latents = geom_out["depth_latents"]
             geom_losses = geom_out.get("losses", {})
+
+            # Use backend's ray parameters for consistent space
+            ray_intrinsics = geom_out["ray_intrinsics"]
+            ray_image_hw = geom_out["ray_image_hw"]
+            ray_downsample = geom_out["ray_downsample"]
         elif self.depth_head is not None:
             # Fallback to direct depth_head call (backward compat)
             depth_preds, depth_latents = self.depth_head(
                 depth_feats, intrinsics, batch_input_shape
             )
+            # Legacy depth_head uses original space with 1/16 resolution
+            ray_intrinsics = intrinsics
+            ray_image_hw = batch_input_shape
+            ray_downsample = 16
         else:
             raise ValueError("Either geometry_backend or depth_head must be set")
+
+        # Generate ray embeddings using backend's space parameters
+        ray_embeddings = self.bbox3d_head.get_camera_embeddings(
+            ray_intrinsics, ray_image_hw, ray_downsample
+        )
 
         (
             memory_text,
@@ -1314,11 +1325,8 @@ class GroundingDINO3D(GroundingDINO):
                 valid_ratios,
             ) = self.pre_transformer(visual_feats, input_hw, batch_input_shape)
 
-            ray_embeddings = self.bbox3d_head.get_camera_embeddings(
-                intrinsics, batch_input_shape
-            )
-
             # Geometry Backend / Depth Head
+            # Run this first to get ray_intrinsics/ray_image_hw/ray_downsample
             if self.geometry_backend is not None:
                 geom_out = self.geometry_backend(
                     images=images,
@@ -1328,12 +1336,26 @@ class GroundingDINO3D(GroundingDINO):
                 )
                 depth_preds = geom_out["depth_map"].squeeze(1)  # [B, H, W]
                 depth_latents = geom_out["depth_latents"]
+
+                # Use backend's ray parameters for consistent space
+                ray_intrinsics = geom_out["ray_intrinsics"]
+                ray_image_hw = geom_out["ray_image_hw"]
+                ray_downsample = geom_out["ray_downsample"]
             elif self.depth_head is not None:
                 depth_preds, depth_latents = self.depth_head(
                     depth_feats, intrinsics, batch_input_shape
                 )
+                # Legacy depth_head uses original space with 1/16 resolution
+                ray_intrinsics = intrinsics
+                ray_image_hw = batch_input_shape
+                ray_downsample = 16
             else:
                 raise ValueError("Either geometry_backend or depth_head must be set")
+
+            # Generate ray embeddings using backend's space parameters
+            ray_embeddings = self.bbox3d_head.get_camera_embeddings(
+                ray_intrinsics, ray_image_hw, ray_downsample
+            )
 
             depth_maps = []
             for i, depth_pred in enumerate(depth_preds):
