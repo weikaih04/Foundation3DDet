@@ -148,9 +148,9 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
         decoder_dino_model: str | None = None,  # NEW: decoder's expected DINO model
         output_scales: int = 1,
         target_latent_dim: int = 128,
-        depth_loss_weight: float = 0.1,  # Reduced from 10.0 to match 3D-MOOD loss scale
-        phi_loss_weight: float = 0.025,  # Reduced from 2.5 to match 3D-MOOD loss scale
-        theta_loss_weight: float = 0.025,  # Reduced from 2.5 to match 3D-MOOD loss scale
+        depth_loss_weight: float = 10.0,  # Original DetAny3D default
+        phi_loss_weight: float = 2.5,  # Original DetAny3D default
+        theta_loss_weight: float = 2.5,  # Original DetAny3D default
         depth_coefficient: float = 0.15,
         phi_coefficient: float = 1.0,
         theta_coefficient: float = 1.0,

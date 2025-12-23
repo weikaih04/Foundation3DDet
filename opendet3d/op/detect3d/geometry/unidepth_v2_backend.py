@@ -66,7 +66,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         encoder_pretrained: str | None = None,
         decoder_pretrained: str | None = None,
         use_native_losses: bool = True,
-        depth_loss_weight: float = 1.0,
+        depth_loss_weight: float = 10.0,  # Scale to match 3D-MOOD SILog weight
         output_scales: int = 1,
         target_latent_dim: int = 128,
         freeze_encoder: bool = True,
