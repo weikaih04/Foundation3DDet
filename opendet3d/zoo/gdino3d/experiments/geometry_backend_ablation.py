@@ -429,7 +429,35 @@ def get_detany3d_mini_config(*args, **kwargs) -> ExperimentConfig:
 
 
 # Default config function for vis4d CLI
-def get_config(*args, **kwargs) -> ExperimentConfig:
-    """Default config: DetAny3D geometry backend."""
-    return get_detany3d_config(*args, **kwargs)
+def get_config(config_name: str = "detany3d", *args, **kwargs) -> ExperimentConfig:
+    """Get config by name.
+
+    Args:
+        config_name: Name of the config to load. Options:
+            - "unidepth_head": UniDepthHead (original 3D-MOOD baseline)
+            - "unidepth_head_dino": UniDepthHead + DINOv2
+            - "detany3d": DetAny3D (DINOv2 + DetAny3D decoder) [default]
+            - "unidepth_v2": UniDepthV2 (DINOv2 + UniDepthV2 decoder)
+
+    Returns:
+        ExperimentConfig for the specified geometry backend.
+    """
+    # Strip leading colon if present (vis4d adds it when using : syntax)
+    if config_name.startswith(":"):
+        config_name = config_name[1:]
+
+    config_map = {
+        "unidepth_head": get_unidepth_head_config,
+        "unidepth_head_dino": get_unidepth_head_dino_config,
+        "detany3d": get_detany3d_config,
+        "unidepth_v2": get_unidepth_v2_config,
+    }
+
+    if config_name not in config_map:
+        raise ValueError(
+            f"Unknown config name: {config_name}. "
+            f"Available options: {list(config_map.keys())}"
+        )
+
+    return config_map[config_name](*args, **kwargs)
 

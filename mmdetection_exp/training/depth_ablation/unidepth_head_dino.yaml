@@ -30,11 +30,12 @@ tasks:
     export WANDB_NAME=$EXP_NAME && \
     export WANDB_TAGS="geometry_ablation,unidepth_head,dinov2,12epochs,finetune" && \
     vis4d fit \
-        --config opendet3d/zoo/gdino3d/experiments/geometry_backend_ablation.py::get_unidepth_head_dino_config \
+        --config opendet3d/zoo/gdino3d/experiments/geometry_backend_ablation.py:unidepth_head_dino \
         --gpus 8 \
         --ckpt checkpoints/gdino3d_swin-t_120e_omni3d_699f69.pt \
-        --config.params.samples_per_gpu=4 \
-        --config.params.accumulate_grad_batches=4 \
+        --config.use_checkpoint=False \
+        --config.params.samples_per_gpu=2 \
+        --config.params.accumulate_grad_batches=8 \
         --config.params.lr=1e-4 \
         --config.params.num_epochs=12 \
         --config.params.step_1=8 \
@@ -57,7 +58,7 @@ tasks:
     priority: normal
     preemptible: true
   constraints:
-    cluster: [ai2/jupiter-cirrascale-2, ai2/saturn, ai2/ceres]
+    cluster: [ai2/jupiter, ai2/ceres]
   hostNetworking: true
   leaderSelection: true
 

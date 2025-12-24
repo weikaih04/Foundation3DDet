@@ -30,12 +30,12 @@ tasks:
     export WANDB_NAME=$EXP_NAME && \
     export WANDB_TAGS="geometry_ablation,unidepth_v2,dinov2,12epochs,finetune" && \
     vis4d fit \
-        --config opendet3d/zoo/gdino3d/experiments/geometry_backend_ablation.py::get_unidepth_v2_config \
+        --config opendet3d/zoo/gdino3d/experiments/geometry_backend_ablation.py:unidepth_v2 \
         --gpus 8 \
         --ckpt checkpoints/gdino3d_swin-t_120e_omni3d_699f69.pt \
         --config.use_checkpoint=False \
-        --config.params.samples_per_gpu=4 \
-        --config.params.accumulate_grad_batches=4 \
+        --config.params.samples_per_gpu=2 \
+        --config.params.accumulate_grad_batches=8 \
         --config.params.lr=1e-4 \
         --config.params.num_epochs=12 \
         --config.params.step_1=8 \
@@ -43,6 +43,7 @@ tasks:
         --config.experiment_name=$EXP_NAME \
         --config.work_dir=vis4d-workspace/$EXP_NAME \
         --config.pl_trainer.val_check_interval=0.5 \
+        --config.pl_trainer.strategy=ddp_find_unused_parameters_true \
         --wandb \
         --resume
   result:
@@ -58,7 +59,7 @@ tasks:
     priority: normal
     preemptible: true
   constraints:
-    cluster: [ai2/jupiter-cirrascale-2, ai2/saturn, ai2/ceres]
+    cluster: [ai2/jupiter, ai2/ceres]
   hostNetworking: true
   leaderSelection: true
 
