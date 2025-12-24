@@ -29,4 +29,8 @@ def get_pl_cfg(
     # NOTE: PLTrainer will create DDPStrategy with this parameter when devices > 1
     pl_trainer.find_unused_parameters = True
 
+    # Strategy for multi-GPU training (can be overridden via command line)
+    # Use "ddp_find_unused_parameters_true" for geometry backends with frozen encoders
+    pl_trainer.strategy = "ddp_find_unused_parameters_true"
+
     return pl_trainer
