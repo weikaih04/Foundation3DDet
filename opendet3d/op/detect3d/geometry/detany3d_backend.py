@@ -116,6 +116,10 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
     The depth_latents output is extracted from out_features at the selected
     resolution (1/8, 1/4, or 1/2) and projected to target_latent_dim.
 
+    The decoder internally fuses ray embeddings via project_rays + element-wise
+    addition at each upsampling stage, so depth_latents are already ray-aware.
+    The 3D head does NOT need a separate camera prompt.
+
     Args:
         dino_model: DINOv2 model variant ("vit_large", "vit_base", "vit_small").
         dino_pretrained: Path to pretrained DINO weights, or "" for default hub weights.
@@ -131,6 +135,9 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
         detach_depth_latents: Whether to detach depth_latents from graph.
             If True, gradients from 3D head won't flow back to depth head.
     """
+
+    # DetAny3D's decoder fuses rays via project_rays + latents += rays_embedding
+    is_ray_aware: bool = True
 
     # DINOv2 embedding dimensions
     DINO_EMBED_DIMS = {
@@ -408,29 +415,50 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
 
         depth_map = outputs["depth_maps"]  # [B, 1, H_new, W_new]
         depth_latents = outputs.get("depth_latents")  # [B, N, C] - already flattened
-        pred_K = outputs.get("pred_K")  # [B, 3, 3]
+        pred_K = outputs.get("pred_K")  # [B, 3, 3] - predicted at adjusted dimensions
 
         # Apply optional detach
         depth_latents = self._maybe_detach_latents(depth_latents)
 
+        # =====================================================================
+        # IMPORTANT: Resize predictions back to ORIGINAL dimensions for loss
+        # =====================================================================
+        # The model runs at adjusted dimensions (divisible by patch_size=14),
+        # but all losses are computed at the ORIGINAL input dimensions.
+        # This ensures consistency across all geometry backends.
+        # =====================================================================
+
         # 7. Resize depth_map back to original size
         depth_map_resized = self._resize_depth_to_original(depth_map, (orig_H, orig_W))
 
-        # 8. Compute losses using DetAny3D's SILogLoss
-        # Use original intrinsics and image_hw for loss computation
+        # 8. Scale pred_K back to original dimensions
+        # Intrinsic matrix scaling: fx, cx scale with width; fy, cy scale with height
+        # pred_K was predicted for adjusted dimensions, need to scale to original
+        pred_K_scaled = None
+        if pred_K is not None:
+            scale_x = orig_W / image_hw_adjusted[1]  # orig_W / adjusted_W
+            scale_y = orig_H / image_hw_adjusted[0]  # orig_H / adjusted_H
+            pred_K_scaled = pred_K.clone()
+            pred_K_scaled[:, 0, 0] = pred_K[:, 0, 0] * scale_x  # fx
+            pred_K_scaled[:, 1, 1] = pred_K[:, 1, 1] * scale_y  # fy
+            pred_K_scaled[:, 0, 2] = pred_K[:, 0, 2] * scale_x  # cx
+            pred_K_scaled[:, 1, 2] = pred_K[:, 1, 2] * scale_y  # cy
+
+        # 9. Compute losses at ORIGINAL dimensions using DetAny3D's SILogLoss
+        # Both depth and intrinsic losses are computed at original dimensions
         losses = self._compute_losses(
-            depth_map=depth_map_resized,
-            depth_gt=depth_gt,
-            depth_mask=depth_mask,
-            pred_K=pred_K,
-            gt_K=intrinsics,
-            image_hw=(orig_H, orig_W),
+            depth_map=depth_map_resized,  # resized to original
+            depth_gt=depth_gt,            # original dimensions
+            depth_mask=depth_mask,        # original dimensions
+            pred_K=pred_K_scaled,         # scaled to original dimensions
+            gt_K=intrinsics,              # original dimensions
+            image_hw=(orig_H, orig_W),    # original dimensions
         )
 
         return GeometryBackendOutput(
             depth_map=depth_map_resized,
             depth_latents=depth_latents,
-            K_pred=pred_K,
+            K_pred=pred_K_scaled,  # Return scaled K for consistency
             ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
             ray_image_hw=image_hw_adjusted,  # Adjusted image size
             ray_downsample=8,  # DetAny3D uses 1/8 resolution for depth_latents

@@ -32,11 +32,17 @@ class UniDepthHeadBackend(GeometryBackendBase):
     - Runs UniDepthHead to predict depth
     - Computes SILogLoss when depth_gt is provided
 
+    The decoder does NOT incorporate ray/camera info internally.
+    The 3D head NEEDS a separate camera prompt branch to provide ray info.
+
     Args:
         depth_head: The UniDepthHead module.
         depth_loss: The SILogLoss module (optional, created if not provided).
         depth_loss_weight: Weight for the depth loss.
     """
+
+    # UniDepthHead (v1) does not fuse rays in the decoder
+    is_ray_aware: bool = False
 
     def __init__(
         self,

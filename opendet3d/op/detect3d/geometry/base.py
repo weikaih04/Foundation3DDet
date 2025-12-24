@@ -64,6 +64,13 @@ class GeometryBackendBase(nn.Module, ABC):
             but still use its features for 3D detection.
     """
 
+    # Whether this backend's depth decoder already incorporates ray/camera info.
+    # If True, the 3D head does NOT need a separate camera prompt branch,
+    # because the depth_latents are already ray-aware.
+    # - UniDepthV2 / DetAny3D: True (decoder fuses rays internally)
+    # - UniDepthHead (v1): False (no ray info in decoder)
+    is_ray_aware: bool = False
+
     def __init__(self, detach_depth_latents: bool = False) -> None:
         """Initialize the geometry backend.
 

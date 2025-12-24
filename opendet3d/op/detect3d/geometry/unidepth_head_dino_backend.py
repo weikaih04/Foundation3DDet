@@ -40,6 +40,9 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
     - Feeds to UniDepthHead for depth prediction
     - Computes SILogLoss for depth supervision
 
+    The UniDepthHead decoder does NOT incorporate ray/camera info internally.
+    The 3D head NEEDS a separate camera prompt branch to provide ray info.
+
     Args:
         dino_model: DINOv2 model variant ("vit_large", "vit_base", "vit_small").
         dino_pretrained: Path to pretrained DINO weights, or "" for default hub weights.
@@ -49,6 +52,9 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
         detach_depth_latents: Whether to detach depth_latents from graph.
         stacking_mode: How to aggregate blocks ("mean", "max", "last").
     """
+
+    # UniDepthHead (v1) does not fuse rays in the decoder
+    is_ray_aware: bool = False
 
     # DINOv2 model configurations
     DINO_CONFIGS = {
@@ -274,7 +280,13 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
             depth_feats, intrinsics_adjusted, image_hw_adjusted
         )
 
-        # 5. Resize depth_preds back to original dimensions
+        # =====================================================================
+        # IMPORTANT: Resize predictions back to ORIGINAL dimensions for loss
+        # =====================================================================
+        # The model runs at adjusted dimensions (divisible by patch_size=14),
+        # but all losses are computed at the ORIGINAL input dimensions.
+        # This ensures consistency across all geometry backends.
+        # =====================================================================
         depth_preds_resized = self._resize_depth_to_original(
             depth_preds.unsqueeze(1), (orig_H, orig_W)
         ).squeeze(1)  # [B, H, W]
@@ -282,9 +294,10 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
         # Apply optional detach
         depth_latent = self._maybe_detach_latents(depth_latent)
 
-        # 6. Compute losses using original dimensions
+        # Compute losses at ORIGINAL dimensions (not adjusted dimensions)
         losses: dict[str, Tensor] = {}
         if depth_gt is not None:
+            # depth_preds_resized is at original (H, W), depth_gt is also at original (H, W)
             depth_loss = self.depth_loss(depth_preds_resized, depth_gt, mask=depth_mask)
             losses["depth_loss"] = depth_loss * self.depth_loss_weight
 

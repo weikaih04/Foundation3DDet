@@ -112,14 +112,11 @@ class GroundingDINO3D(GroundingDINO):
             weights=weights,
         )
 
-        self.bbox3d_head = bbox3d_head or GroundingDINO3DHead()
-        self.roi2det3d = roi2det3d or RoI2Det3D()
-
         # Depth Head / Geometry Backend
         self.fpn = fpn
         self.depth_head = depth_head
 
-        # Setup geometry backend
+        # Setup geometry backend FIRST (before bbox3d_head)
         # If geometry_backend is provided, use it directly
         # Otherwise, wrap depth_head in UniDepthHeadBackend for backward compat
         print(f"\n[DEBUG __init__] geometry_backend parameter: {type(geometry_backend) if geometry_backend is not None else None}")
@@ -138,6 +135,24 @@ class GroundingDINO3D(GroundingDINO):
         else:
             print(f"[DEBUG __init__] No geometry backend or depth_head provided")
             self.geometry_backend = None
+
+        # Determine use_camera_prompt based on geometry_backend.is_ray_aware
+        # If backend is ray-aware (UniDepthV2, DetAny3D), depth_latents already
+        # contain ray info, so we don't need the camera prompt branch.
+        # If backend is NOT ray-aware (UniDepthHead v1), we need camera prompt.
+        if self.geometry_backend is not None:
+            use_camera_prompt = not self.geometry_backend.is_ray_aware
+            print(f"[DEBUG __init__] geometry_backend.is_ray_aware={self.geometry_backend.is_ray_aware}, use_camera_prompt={use_camera_prompt}")
+        else:
+            use_camera_prompt = True  # Default to True for safety
+
+        # Create bbox3d_head with appropriate use_camera_prompt setting
+        if bbox3d_head is not None:
+            self.bbox3d_head = bbox3d_head
+        else:
+            self.bbox3d_head = GroundingDINO3DHead(use_camera_prompt=use_camera_prompt)
+
+        self.roi2det3d = roi2det3d or RoI2Det3D()
 
         # ========== CUT3R Fusion Setup ==========
         # DISABLED for geometry ablation experiments
@@ -1065,10 +1080,15 @@ class GroundingDINO3D(GroundingDINO):
         else:
             raise ValueError("Either geometry_backend or depth_head must be set")
 
-        # Generate ray embeddings using backend's space parameters
-        ray_embeddings = self.bbox3d_head.get_camera_embeddings(
-            ray_intrinsics, ray_image_hw, ray_downsample
-        )
+        # Generate ray embeddings only if camera prompt is enabled
+        # For ray-aware backends (UniDepthV2, DetAny3D), depth_latents already
+        # contain ray info, so we skip the camera prompt branch.
+        if self.bbox3d_head.use_camera_prompt:
+            ray_embeddings = self.bbox3d_head.get_camera_embeddings(
+                ray_intrinsics, ray_image_hw, ray_downsample
+            )
+        else:
+            ray_embeddings = None
 
         (
             memory_text,
@@ -1201,10 +1221,6 @@ class GroundingDINO3D(GroundingDINO):
                     copy.deepcopy(visual_feats), input_hw, batch_input_shape
                 )
 
-                ray_embeddings = self.bbox3d_head.get_camera_embeddings(
-                    intrinsics, batch_input_shape
-                )
-
                 # Geometry Backend / Depth Head
                 if self.geometry_backend is not None:
                     geom_out = self.geometry_backend(
@@ -1215,12 +1231,29 @@ class GroundingDINO3D(GroundingDINO):
                     )
                     depth_preds = geom_out["depth_map"].squeeze(1)  # [B, H, W]
                     depth_latents = geom_out["depth_latents"]
+
+                    # Use backend's ray parameters for consistent space
+                    ray_intrinsics = geom_out["ray_intrinsics"]
+                    ray_image_hw = geom_out["ray_image_hw"]
+                    ray_downsample = geom_out["ray_downsample"]
                 elif self.depth_head is not None:
                     depth_preds, depth_latents = self.depth_head(
                         depth_feats, intrinsics, batch_input_shape
                     )
+                    # Legacy depth_head uses original space with 1/16 resolution
+                    ray_intrinsics = intrinsics
+                    ray_image_hw = batch_input_shape
+                    ray_downsample = 16
                 else:
                     raise ValueError("Either geometry_backend or depth_head must be set")
+
+                # Generate ray embeddings only if camera prompt is enabled
+                if self.bbox3d_head.use_camera_prompt:
+                    ray_embeddings = self.bbox3d_head.get_camera_embeddings(
+                        ray_intrinsics, ray_image_hw, ray_downsample
+                    )
+                else:
+                    ray_embeddings = None
 
                 depth_maps = []
                 for i, depth_pred in enumerate(depth_preds):
@@ -1352,10 +1385,13 @@ class GroundingDINO3D(GroundingDINO):
             else:
                 raise ValueError("Either geometry_backend or depth_head must be set")
 
-            # Generate ray embeddings using backend's space parameters
-            ray_embeddings = self.bbox3d_head.get_camera_embeddings(
-                ray_intrinsics, ray_image_hw, ray_downsample
-            )
+            # Generate ray embeddings only if camera prompt is enabled
+            if self.bbox3d_head.use_camera_prompt:
+                ray_embeddings = self.bbox3d_head.get_camera_embeddings(
+                    ray_intrinsics, ray_image_hw, ray_downsample
+                )
+            else:
+                ray_embeddings = None
 
             depth_maps = []
             for i, depth_pred in enumerate(depth_preds):

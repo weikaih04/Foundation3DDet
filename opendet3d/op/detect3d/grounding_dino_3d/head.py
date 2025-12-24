@@ -22,7 +22,20 @@ from .coder import GroundingDINO3DCoder
 
 
 class GroundingDINO3DHead(nn.Module):
-    """3D Grounding DINO head."""
+    """3D Grounding DINO head.
+
+    Args:
+        embed_dims: Embedding dimension for the head.
+        num_decoder_layer: Number of decoder layers.
+        num_reg_fcs: Number of fully connected layers in regression branch.
+        as_two_stage: Whether to use two-stage detection.
+        box_coder: 3D box coder for encoding/decoding.
+        depth_output_scales: Scale factor for depth embedding dims.
+        use_camera_prompt: Whether to use camera/ray prompt branch.
+            Set to False when using ray-aware depth backends (UniDepthV2, DetAny3D)
+            since their depth_latents already incorporate ray information.
+            Set to True for non-ray-aware backends (UniDepthHead v1).
+    """
 
     def __init__(
         self,
@@ -32,10 +45,12 @@ class GroundingDINO3DHead(nn.Module):
         as_two_stage: bool = True,
         box_coder: GroundingDINO3DCoder | None = None,
         depth_output_scales: int = 1,
+        use_camera_prompt: bool = True,
     ) -> None:
         """Initialize the 3D Grounding DINO head."""
         super().__init__()
         self.embed_dims = embed_dims
+        self.use_camera_prompt = use_camera_prompt
 
         self.num_pred_layer = (
             num_decoder_layer + 1 if as_two_stage else num_decoder_layer
@@ -47,12 +62,17 @@ class GroundingDINO3DHead(nn.Module):
         reg_branch = self._get_reg_branch(num_reg_fcs, self.box_coder.reg_dims)
         self.reg_branches = get_clones(reg_branch, self.num_pred_layer)
 
-        project_rays, prompt_camera = self._get_condition_branch(
-            input_dims=81, expansion=4, embed_dims=embed_dims
-        )
-
-        self.project_rays = get_clones(project_rays, self.num_pred_layer)
-        self.prompt_camera = get_clones(prompt_camera, self.num_pred_layer)
+        # Camera prompt branch (only created if use_camera_prompt is True)
+        if self.use_camera_prompt:
+            project_rays, prompt_camera = self._get_condition_branch(
+                input_dims=81, expansion=4, embed_dims=embed_dims
+            )
+            self.project_rays = get_clones(project_rays, self.num_pred_layer)
+            self.prompt_camera = get_clones(prompt_camera, self.num_pred_layer)
+        else:
+            # Register as None so state_dict is consistent
+            self.project_rays = None
+            self.prompt_camera = None
 
         depth_embed_dims = embed_dims // 2**depth_output_scales
 
@@ -128,16 +148,26 @@ class GroundingDINO3DHead(nn.Module):
         self,
         layer_id: int,
         hidden_state: Tensor,
-        ray_embeddings: Tensor,
+        ray_embeddings: Tensor | None,
         depth_latents: Tensor | None = None,
     ) -> Tensor:
-        """Single layer forward pass of the 3D Grounding DINO head."""
-        # Camera-aware 3D queries
-        ray_embedding = self.project_rays[layer_id](ray_embeddings)
+        """Single layer forward pass of the 3D Grounding DINO head.
 
-        hidden_state = self.prompt_camera[layer_id](
-            hidden_state, ray_embedding, ray_embedding
-        )
+        Args:
+            layer_id: Index of the decoder layer.
+            hidden_state: Query hidden states [B, num_queries, embed_dims].
+            ray_embeddings: Ray embeddings [B, H*W, 81]. Only used if use_camera_prompt=True.
+            depth_latents: Depth latent features [B, H*W, depth_embed_dims].
+
+        Returns:
+            Regression output for 3D box prediction.
+        """
+        # Camera-aware 3D queries (only if use_camera_prompt is True)
+        if self.use_camera_prompt and ray_embeddings is not None:
+            ray_embedding = self.project_rays[layer_id](ray_embeddings)
+            hidden_state = self.prompt_camera[layer_id](
+                hidden_state, ray_embedding, ray_embedding
+            )
 
         # Depth-aware 3D queries
         proj_depth_latents = self.project_depth[layer_id](depth_latents)
@@ -153,10 +183,19 @@ class GroundingDINO3DHead(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
-        ray_embeddings: Tensor,
+        ray_embeddings: Tensor | None,
         depth_latents: Tensor | None = None,
     ) -> list[Tensor]:
-        """Forward pass of the 3D Grounding DINO head."""
+        """Forward pass of the 3D Grounding DINO head.
+
+        Args:
+            hidden_states: Query hidden states [num_layers, B, num_queries, embed_dims].
+            ray_embeddings: Ray embeddings [B, H*W, 81]. Can be None if use_camera_prompt=False.
+            depth_latents: Depth latent features [B, H*W, depth_embed_dims].
+
+        Returns:
+            Stacked regression outputs for all layers.
+        """
         all_layers_outputs_3d = []
 
         for layer_id in range(hidden_states.shape[0]):

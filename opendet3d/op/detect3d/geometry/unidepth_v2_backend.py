@@ -46,6 +46,9 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
     - output_scales=2: Return 1/4 resolution latents
     - output_scales=3: Return 1/2 resolution latents
 
+    The decoder internally fuses ray embeddings at each scale, so depth_latents
+    are already ray-aware. The 3D head does NOT need a separate camera prompt.
+
     Args:
         version: UniDepthV2 version string ("v2-vitl14", "v2-vitb14", "v2-vits14").
         pretrained_path: Path to local full checkpoint, or None to load from HuggingFace.
@@ -58,6 +61,9 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         freeze_encoder: Whether to freeze pixel encoder weights.
         detach_depth_latents: Whether to detach depth_latents from graph.
     """
+
+    # UniDepthV2's decoder fuses rays internally via embed_rays + multi-scale fusion
+    is_ray_aware: bool = True
 
     def __init__(
         self,
