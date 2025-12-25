@@ -158,7 +158,7 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
         depth_loss_weight: float = 10.0,  # Original DetAny3D default
         phi_loss_weight: float = 2.5,  # Original DetAny3D default
         theta_loss_weight: float = 2.5,  # Original DetAny3D default
-        depth_coefficient: float = 0.15,
+        depth_coefficient: float = 0.85,  # Scale term = 1-0.85=0.15, matching UniDepth
         phi_coefficient: float = 1.0,
         theta_coefficient: float = 1.0,
         freeze_dino: bool = True,
@@ -213,9 +213,13 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
         )
 
         # Add feature projector if encoder and decoder have different dimensions
+        # Use LayerNorm + Linear (BLIP-2 style) for stable training
         if dino_embed_dim != decoder_embed_dim:
-            print(f"Adding feature projector: {dino_embed_dim} → {decoder_embed_dim}")
-            self.feature_projector = nn.Linear(dino_embed_dim, decoder_embed_dim)
+            print(f"Adding feature projector: {dino_embed_dim} → {decoder_embed_dim} (LayerNorm + Linear)")
+            self.feature_projector = nn.Sequential(
+                nn.LayerNorm(dino_embed_dim),
+                nn.Linear(dino_embed_dim, decoder_embed_dim),
+            )
             self._has_projector = True
         else:
             self.feature_projector = nn.Identity()
@@ -444,6 +448,28 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
             pred_K_scaled[:, 0, 2] = pred_K[:, 0, 2] * scale_x  # cx
             pred_K_scaled[:, 1, 2] = pred_K[:, 1, 2] * scale_y  # cy
 
+            # DEBUG: Verify intrinsic scaling
+            print(f"[DEBUG DetAny3D Intrinsic Scaling]")
+            print(f"  original_hw: ({orig_H}, {orig_W})")
+            print(f"  adjusted_hw: {image_hw_adjusted}")
+            print(f"  scale_x: {scale_x:.4f}, scale_y: {scale_y:.4f}")
+            print(f"  intrinsics (original gt)[0]: fx={intrinsics[0, 0, 0].item():.2f}, fy={intrinsics[0, 1, 1].item():.2f}, cx={intrinsics[0, 0, 2].item():.2f}, cy={intrinsics[0, 1, 2].item():.2f}")
+            print(f"  intrinsics_adjusted[0]: fx={intrinsics_adjusted[0, 0, 0].item():.2f}, fy={intrinsics_adjusted[0, 1, 1].item():.2f}, cx={intrinsics_adjusted[0, 0, 2].item():.2f}, cy={intrinsics_adjusted[0, 1, 2].item():.2f}")
+            print(f"  pred_K (adjusted space)[0]: fx={pred_K[0, 0, 0].item():.2f}, fy={pred_K[0, 1, 1].item():.2f}, cx={pred_K[0, 0, 2].item():.2f}, cy={pred_K[0, 1, 2].item():.2f}")
+            print(f"  pred_K_scaled (original space)[0]: fx={pred_K_scaled[0, 0, 0].item():.2f}, fy={pred_K_scaled[0, 1, 1].item():.2f}, cx={pred_K_scaled[0, 0, 2].item():.2f}, cy={pred_K_scaled[0, 1, 2].item():.2f}")
+
+            # Verify scaling is consistent
+            gt_scale_x = intrinsics_adjusted[0, 0, 0].item() / intrinsics[0, 0, 0].item()
+            gt_scale_y = intrinsics_adjusted[0, 1, 1].item() / intrinsics[0, 1, 1].item()
+            expected_inv_scale_x = 1.0 / gt_scale_x
+            expected_inv_scale_y = 1.0 / gt_scale_y
+            print(f"  gt_K scaling (orig→adj): scale_x={gt_scale_x:.4f}, scale_y={gt_scale_y:.4f}")
+            print(f"  pred_K scaling (adj→orig): scale_x={scale_x:.4f}, scale_y={scale_y:.4f}")
+            if abs(scale_x - expected_inv_scale_x) > 0.01:
+                print(f"  [WARNING] scale_x mismatch! expected {expected_inv_scale_x:.4f}")
+            if abs(scale_y - expected_inv_scale_y) > 0.01:
+                print(f"  [WARNING] scale_y mismatch! expected {expected_inv_scale_y:.4f}")
+
         # 9. Compute losses at ORIGINAL dimensions using DetAny3D's SILogLoss
         # Both depth and intrinsic losses are computed at original dimensions
         losses = self._compute_losses(
@@ -496,6 +522,16 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
             depth_pred = depth_map.squeeze(1)  # [B, H, W]
             H, W = depth_gt.shape[-2:]
 
+            # DEBUG: Print shape information
+            print(f"[DEBUG DetAny3D _compute_losses]")
+            print(f"  image_hw (expected): {image_hw}")
+            print(f"  depth_pred shape: {depth_pred.shape}")
+            print(f"  depth_gt shape: {depth_gt.shape}")
+            if depth_pred.shape[-2:] != (H, W):
+                print(f"  [WARNING] depth_pred {depth_pred.shape[-2:]} != depth_gt {(H, W)}, will interpolate!")
+            if depth_gt.shape[-2:] != image_hw:
+                print(f"  [WARNING] depth_gt {depth_gt.shape[-2:]} != image_hw {image_hw}!")
+
             # Interpolate if sizes don't match
             if depth_pred.shape[-2:] != (H, W):
                 depth_pred = F.interpolate(
@@ -518,6 +554,18 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
 
         # Intrinsic loss (phi/theta angles)
         if pred_K is not None and gt_K is not None:
+            # DEBUG: Print intrinsic information
+            print(f"[DEBUG DetAny3D Intrinsics]")
+            print(f"  image_hw: {image_hw}")
+            print(f"  gt_K[0]: fx={gt_K[0, 0, 0].item():.2f}, fy={gt_K[0, 1, 1].item():.2f}, cx={gt_K[0, 0, 2].item():.2f}, cy={gt_K[0, 1, 2].item():.2f}")
+            print(f"  pred_K[0]: fx={pred_K[0, 0, 0].item():.2f}, fy={pred_K[0, 1, 1].item():.2f}, cx={pred_K[0, 0, 2].item():.2f}, cy={pred_K[0, 1, 2].item():.2f}")
+
+            # Validate intrinsics are in correct space
+            H, W = image_hw
+            cx_gt, cy_gt = gt_K[0, 0, 2].item(), gt_K[0, 1, 2].item()
+            if not (0 < cx_gt < W and 0 < cy_gt < H):
+                print(f"  [WARNING] gt_K principal point ({cx_gt:.1f}, {cy_gt:.1f}) outside image bounds ({W}, {H})!")
+
             _, gt_angles = generate_rays(gt_K, image_hw)
             _, pred_angles = generate_rays(pred_K, image_hw)
 
@@ -599,13 +647,26 @@ class DetAny3DGeometryBackend(GeometryBackendBase, DINOv2Mixin):
         # 7. Resize depth_map back to original dimensions
         depth_map = self._resize_depth_to_original(depth_map, (orig_H, orig_W))
 
+        # 8. Scale pred_K back to original dimensions
+        # pred_K was predicted for adjusted dimensions (e.g., 798x798),
+        # need to scale to original dimensions (e.g., 800x800)
+        pred_K_scaled = None
+        if pred_K is not None:
+            scale_x = orig_W / image_hw_resized[1]  # orig_W / adjusted_W
+            scale_y = orig_H / image_hw_resized[0]  # orig_H / adjusted_H
+            pred_K_scaled = pred_K.clone()
+            pred_K_scaled[:, 0, 0] = pred_K[:, 0, 0] * scale_x  # fx
+            pred_K_scaled[:, 1, 1] = pred_K[:, 1, 1] * scale_y  # fy
+            pred_K_scaled[:, 0, 2] = pred_K[:, 0, 2] * scale_x  # cx
+            pred_K_scaled[:, 1, 2] = pred_K[:, 1, 2] * scale_y  # cy
+
         # Apply optional detach
         depth_latents = self._maybe_detach_latents(depth_latents)
 
         return GeometryBackendOutput(
             depth_map=depth_map,
             depth_latents=depth_latents,
-            K_pred=pred_K,
+            K_pred=pred_K_scaled,  # Scaled to original image space
             ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
             ray_image_hw=image_hw_resized,  # Adjusted image size
             ray_downsample=8,  # DetAny3D uses 1/8 resolution for depth_latents

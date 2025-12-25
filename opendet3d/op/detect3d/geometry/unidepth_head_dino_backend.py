@@ -297,6 +297,21 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
         # Compute losses at ORIGINAL dimensions (not adjusted dimensions)
         losses: dict[str, Tensor] = {}
         if depth_gt is not None:
+            # DEBUG: Print shape information
+            print(f"[DEBUG UniDepthHeadDino _compute_losses]")
+            print(f"  image_hw (original): ({orig_H}, {orig_W})")
+            print(f"  image_hw_adjusted: {image_hw_adjusted}")
+            print(f"  depth_preds_resized shape: {depth_preds_resized.shape}")
+            print(f"  depth_gt shape: {depth_gt.shape}")
+            if depth_preds_resized.shape[-2:] != depth_gt.shape[-2:]:
+                print(f"  [WARNING] depth_preds_resized {depth_preds_resized.shape[-2:]} != depth_gt {depth_gt.shape[-2:]}!")
+            if depth_gt.shape[-2:] != (orig_H, orig_W):
+                print(f"  [WARNING] depth_gt {depth_gt.shape[-2:]} != image_hw {(orig_H, orig_W)}!")
+
+            # DEBUG: Print intrinsic information
+            print(f"  intrinsics (original)[0]: fx={intrinsics[0, 0, 0].item():.2f}, fy={intrinsics[0, 1, 1].item():.2f}, cx={intrinsics[0, 0, 2].item():.2f}, cy={intrinsics[0, 1, 2].item():.2f}")
+            print(f"  intrinsics_adjusted[0]: fx={intrinsics_adjusted[0, 0, 0].item():.2f}, fy={intrinsics_adjusted[0, 1, 1].item():.2f}, cx={intrinsics_adjusted[0, 0, 2].item():.2f}, cy={intrinsics_adjusted[0, 1, 2].item():.2f}")
+
             # depth_preds_resized is at original (H, W), depth_gt is also at original (H, W)
             depth_loss = self.depth_loss(depth_preds_resized, depth_gt, mask=depth_mask)
             losses["depth_loss"] = depth_loss * self.depth_loss_weight

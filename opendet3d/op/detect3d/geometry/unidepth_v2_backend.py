@@ -151,6 +151,15 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
                 }
                 self.unidepth_model.losses["confidence"] = Confidence.build(confidence_config)
 
+        # Disable invariance loss (SelfDistill) for 3D-MOOD training
+        # The invariance loss expects paired images (same scene with augmentations)
+        # but 3D-MOOD batches contain independent images from different scenes.
+        # SelfDistill.forward() does: chunks = batch_size // 2, then input.chunk(chunks)
+        # This causes errors when batch_size < 2 or when images aren't paired.
+        if "invariance" in self.unidepth_model.losses:
+            print(f"  [UniDepthV2] Disabling invariance loss (SelfDistill) - not compatible with 3D-MOOD data")
+            del self.unidepth_model.losses["invariance"]
+
         # Note: Freezing is now handled by optimizer's lr_mult=0.0 instead of requires_grad=False
         # This avoids DDP's find_unused_parameters overhead
         # if freeze_encoder:
@@ -430,6 +439,30 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
             depth_gt_resized = F.interpolate(
                 depth_gt, size=(new_H, new_W), mode='nearest'
             )
+
+            # DEBUG: Print shape information
+            print(f"[DEBUG UniDepthV2 forward_train]")
+            print(f"  image_hw (original): {image_hw}")
+            print(f"  image_hw_adjusted: {image_hw_adjusted}")
+            print(f"  depth_gt (original) shape: {depth_gt.shape}")
+            print(f"  depth_gt_resized shape: {depth_gt_resized.shape}")
+            if depth_gt.shape[-2:] != image_hw:
+                print(f"  [WARNING] depth_gt {depth_gt.shape[-2:]} != image_hw {image_hw}!")
+
+            # DEBUG: Print intrinsic information
+            print(f"  intrinsics (original)[0]: fx={intrinsics[0, 0, 0].item():.2f}, fy={intrinsics[0, 1, 1].item():.2f}, cx={intrinsics[0, 0, 2].item():.2f}, cy={intrinsics[0, 1, 2].item():.2f}")
+            print(f"  intrinsics_adjusted[0]: fx={intrinsics_adjusted[0, 0, 0].item():.2f}, fy={intrinsics_adjusted[0, 1, 1].item():.2f}, cx={intrinsics_adjusted[0, 0, 2].item():.2f}, cy={intrinsics_adjusted[0, 1, 2].item():.2f}")
+
+            # Validate intrinsic scaling is correct
+            scale_x_expected = new_W / orig_W
+            scale_y_expected = new_H / orig_H
+            fx_ratio = intrinsics_adjusted[0, 0, 0].item() / intrinsics[0, 0, 0].item()
+            fy_ratio = intrinsics_adjusted[0, 1, 1].item() / intrinsics[0, 1, 1].item()
+            if abs(fx_ratio - scale_x_expected) > 0.01:
+                print(f"  [WARNING] fx scaling {fx_ratio:.4f} != expected {scale_x_expected:.4f}!")
+            if abs(fy_ratio - scale_y_expected) > 0.01:
+                print(f"  [WARNING] fy scaling {fy_ratio:.4f} != expected {scale_y_expected:.4f}!")
+
         if depth_mask is not None:
             if depth_mask.ndim == 3:
                 depth_mask = depth_mask.unsqueeze(1)  # [B, 1, H, W]
@@ -527,7 +560,30 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         # 5. Resize depth_map back to original dimensions
         depth_map_resized = self._resize_depth_to_original(depth_map, (orig_H, orig_W))
 
-        # 6. Extract and project depth latents
+        # 6. Scale pred_K back to original dimensions
+        # Intrinsic matrix scaling: fx, cx scale with width; fy, cy scale with height
+        # pred_K was predicted for adjusted dimensions, need to scale to original
+        pred_K_scaled = None
+        if pred_K is not None:
+            scale_x = orig_W / image_hw_adjusted[1]  # orig_W / adjusted_W
+            scale_y = orig_H / image_hw_adjusted[0]  # orig_H / adjusted_H
+            pred_K_scaled = pred_K.clone()
+            pred_K_scaled[:, 0, 0] = pred_K[:, 0, 0] * scale_x  # fx
+            pred_K_scaled[:, 1, 1] = pred_K[:, 1, 1] * scale_y  # fy
+            pred_K_scaled[:, 0, 2] = pred_K[:, 0, 2] * scale_x  # cx
+            pred_K_scaled[:, 1, 2] = pred_K[:, 1, 2] * scale_y  # cy
+
+            # DEBUG: Verify intrinsic scaling
+            print(f"[DEBUG UniDepthV2 Intrinsic Scaling]")
+            print(f"  original_hw: ({orig_H}, {orig_W})")
+            print(f"  adjusted_hw: {image_hw_adjusted}")
+            print(f"  scale_x: {scale_x:.4f}, scale_y: {scale_y:.4f}")
+            print(f"  intrinsics (original gt)[0]: fx={intrinsics[0, 0, 0].item():.2f}, fy={intrinsics[0, 1, 1].item():.2f}, cx={intrinsics[0, 0, 2].item():.2f}, cy={intrinsics[0, 1, 2].item():.2f}")
+            print(f"  intrinsics_adjusted[0]: fx={intrinsics_adjusted[0, 0, 0].item():.2f}, fy={intrinsics_adjusted[0, 1, 1].item():.2f}, cx={intrinsics_adjusted[0, 0, 2].item():.2f}, cy={intrinsics_adjusted[0, 1, 2].item():.2f}")
+            print(f"  pred_K (adjusted space)[0]: fx={pred_K[0, 0, 0].item():.2f}, fy={pred_K[0, 1, 1].item():.2f}, cx={pred_K[0, 0, 2].item():.2f}, cy={pred_K[0, 1, 2].item():.2f}")
+            print(f"  pred_K_scaled (original space)[0]: fx={pred_K_scaled[0, 0, 0].item():.2f}, fy={pred_K_scaled[0, 1, 1].item():.2f}, cx={pred_K_scaled[0, 0, 2].item():.2f}, cy={pred_K_scaled[0, 1, 2].item():.2f}")
+
+        # 7. Extract and project depth latents
         depth_latents, depth_latents_hw = self._extract_depth_latents(out_features)
         depth_latents = self._maybe_detach_latents(depth_latents)
 
@@ -537,7 +593,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         return GeometryBackendOutput(
             depth_map=depth_map_resized,
             depth_latents=depth_latents,
-            K_pred=pred_K,
+            K_pred=pred_K_scaled,  # Use scaled K_pred (in original image space)
             ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
             ray_image_hw=image_hw_adjusted,  # Adjusted image size
             ray_downsample=ray_downsample,  # Based on output_scales
@@ -603,7 +659,20 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         # 6. Resize depth_map back to original dimensions
         depth_map_resized = self._resize_depth_to_original(depth_map, (orig_H, orig_W))
 
-        # 7. Extract and project depth latents
+        # 7. Scale pred_K back to original dimensions
+        # pred_K was predicted for adjusted dimensions (e.g., 798x798),
+        # need to scale to original dimensions (e.g., 800x800)
+        pred_K_scaled = None
+        if pred_K is not None:
+            scale_x = orig_W / image_hw_adjusted[1]  # orig_W / adjusted_W
+            scale_y = orig_H / image_hw_adjusted[0]  # orig_H / adjusted_H
+            pred_K_scaled = pred_K.clone()
+            pred_K_scaled[:, 0, 0] = pred_K[:, 0, 0] * scale_x  # fx
+            pred_K_scaled[:, 1, 1] = pred_K[:, 1, 1] * scale_y  # fy
+            pred_K_scaled[:, 0, 2] = pred_K[:, 0, 2] * scale_x  # cx
+            pred_K_scaled[:, 1, 2] = pred_K[:, 1, 2] * scale_y  # cy
+
+        # 8. Extract and project depth latents
         depth_latents, depth_latents_hw = self._extract_depth_latents(out_features)
         depth_latents = self._maybe_detach_latents(depth_latents)
 
@@ -613,7 +682,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         return GeometryBackendOutput(
             depth_map=depth_map_resized,
             depth_latents=depth_latents,
-            K_pred=pred_K,
+            K_pred=pred_K_scaled,  # Scaled to original image space
             ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
             ray_image_hw=image_hw_adjusted,  # Adjusted image size
             ray_downsample=ray_downsample,  # Based on output_scales
