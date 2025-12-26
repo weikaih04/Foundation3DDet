@@ -301,6 +301,10 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         # Build camera object if intrinsics provided
         camera = None
         if intrinsics is not None:
+            # DEBUG: Check intrinsics shape
+            print(f"[DEBUG _prepare_inputs] intrinsics shape: {intrinsics.shape}")
+            print(f"[DEBUG _prepare_inputs] intrinsics[0]:\n{intrinsics[0]}")
+
             # Create individual Pinhole cameras for each batch element
             cameras = [Pinhole(K=intrinsics[i:i+1]) for i in range(B)]
             # Stack all camera parameters
@@ -316,6 +320,20 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
                 cameras=cameras
             )
             camera = camera.to(device)
+
+            # DEBUG: Check get_rays output
+            H, W = image_hw
+            rays_test = camera.get_rays(shapes=(B, H, W))
+            print(f"[DEBUG _prepare_inputs] BatchCamera.get_rays output shape: {rays_test.shape}")
+            print(f"[DEBUG _prepare_inputs] Expected shape: [{B}, 3, {H}, {W}]")
+            if rays_test.shape != (B, 3, H, W):
+                print(f"[ERROR] rays_test shape mismatch!")
+                print(f"[DEBUG] cameras[0] type: {type(cameras[0])}")
+                print(f"[DEBUG] cameras[0].K shape: {cameras[0].K.shape}")
+                # Test individual camera
+                test_uv = torch.randn(1, 2, H, W, device=device)
+                test_rays_0 = cameras[0].unproject(test_uv)
+                print(f"[DEBUG] cameras[0].unproject([1, 2, {H}, {W}]) shape: {test_rays_0.shape}")
 
         inputs = {
             "image": images,
