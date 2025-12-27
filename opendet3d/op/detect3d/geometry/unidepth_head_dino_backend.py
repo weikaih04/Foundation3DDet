@@ -268,8 +268,11 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
         _, _, new_H, new_W = images_resized.shape
         image_hw_adjusted = (new_H, new_W)
 
-        # 2. Normalize images for DINOv2
-        images_normalized = self._normalize_image_for_dinov2(images_resized)
+        # 2. Skip normalization - images are already normalized by 3D-MOOD's NormalizeImages
+        # The 3D-MOOD normalization (mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375])
+        # is mathematically equivalent to ImageNet normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # because 123.675/255 = 0.485, 58.395/255 = 0.229, etc.
+        images_normalized = images_resized
 
         # 3. Extract and group DINOv2 features
         depth_feats = self._extract_dino_features(images_normalized)
@@ -359,8 +362,8 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
         _, _, new_H, new_W = images_resized.shape
         image_hw_adjusted = (new_H, new_W)
 
-        # 2. Normalize images for DINOv2
-        images_normalized = self._normalize_image_for_dinov2(images_resized)
+        # 2. Skip normalization - images are already normalized by 3D-MOOD's NormalizeImages
+        images_normalized = images_resized
 
         # 3. Extract and group DINOv2 features
         depth_feats = self._extract_dino_features(images_normalized)

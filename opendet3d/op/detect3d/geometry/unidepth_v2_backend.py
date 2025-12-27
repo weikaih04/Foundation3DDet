@@ -11,22 +11,31 @@ The backend encapsulates the complete UniDepthV2 geometry pipeline.
 
 from __future__ import annotations
 
+import os
 import torch
 import torchvision.transforms.functional as TF
 from torch import Tensor, nn
 import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
 
 from .base import GeometryBackendBase, GeometryBackendOutput
 from .dinov2_mixin import DINOv2Mixin
 
+# Global counter for depth visualization
+_DEPTH_VIS_COUNTER = 0
+_DEPTH_VIS_SAVE_DIR = "/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet/mmdetection_exp/training/depth_ablation/unidepth_v2_depth_vis"
+_DEPTH_VIS_MAX_SAVE = 100  # Only save first 100 samples
+
 # Import UniDepthV2 model
 from unidepth.models import UniDepthV2
 
-# Map version string to HuggingFace model name
-VERSION_TO_HF_NAME = {
-    "v2-vitl14": "lpiccinelli/unidepth-v2-vitl14",
-    "v2-vitb14": "lpiccinelli/unidepth-v2-vitb14",
-    "v2-vits14": "lpiccinelli/unidepth-v2-vits14",
+# Map version string to local config file path (relative to repo root)
+VERSION_TO_LOCAL_CONFIG = {
+    "v2-vitl14": "UniDepth/configs/config_v2_vitl14.json",
+    "v2-vitb14": "UniDepth/configs/config_v2_vitb14.json",
+    "v2-vits14": "UniDepth/configs/config_v2_vits14.json",
 }
 
 
@@ -160,6 +169,39 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
             print(f"  [UniDepthV2] Disabling invariance loss (SelfDistill) - not compatible with 3D-MOOD data")
             del self.unidepth_model.losses["invariance"]
 
+        # ============================================================
+        # DEBUG: Disable losses one by one to find which causes NaN
+        # Uncomment each block to disable the corresponding loss
+        # Test order: 1) only depth, 2) +ssi, 3) +confidence, 4) +camera
+        # ============================================================
+
+        # [TEST 3] depth + camera + ssi loss
+        # if "camera" in self.unidepth_model.losses:
+        #     print(f"  [UniDepthV2] DEBUG: Disabling camera loss")
+        #     del self.unidepth_model.losses["camera"]
+        # if "ssi" in self.unidepth_model.losses:
+        #     print(f"  [UniDepthV2] DEBUG: Disabling ssi loss")
+        #     del self.unidepth_model.losses["ssi"]
+        if "confidence" in self.unidepth_model.losses:
+            print(f"  [UniDepthV2] DEBUG: Disabling confidence loss")
+            del self.unidepth_model.losses["confidence"]
+
+        # [TEST 2] Enable ssi loss (comment out the ssi deletion above)
+        # if "ssi" in self.unidepth_model.losses:
+        #     print(f"  [UniDepthV2] DEBUG: Disabling ssi loss")
+        #     del self.unidepth_model.losses["ssi"]
+
+        # [TEST 3] Enable confidence loss (comment out both ssi and confidence deletion)
+        # if "confidence" in self.unidepth_model.losses:
+        #     print(f"  [UniDepthV2] DEBUG: Disabling confidence loss")
+        #     del self.unidepth_model.losses["confidence"]
+
+        # [TEST 4] Enable camera loss (comment out all deletions above)
+        # This is the most suspicious one - it doesn't use depth_mask
+
+        # Print remaining losses
+        print(f"  [UniDepthV2] Active losses: {list(self.unidepth_model.losses.keys())}")
+
         # Note: Freezing is now handled by optimizer's lr_mult=0.0 instead of requires_grad=False
         # This avoids DDP's find_unused_parameters overhead
         # if freeze_encoder:
@@ -225,6 +267,15 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
                 if len(unexpected) <= 10:
                     for k in unexpected:
                         print(f"      - {k}")
+
+            # DEBUG: Check if loaded weights have NaN
+            has_nan = False
+            for name, param in self.unidepth_model.pixel_encoder.named_parameters():
+                if torch.isnan(param).any():
+                    print(f"    ❌ ENCODER WEIGHT HAS NaN: {name}")
+                    has_nan = True
+            if not has_nan:
+                print(f"    ✅ All encoder weights are clean (no NaN)")
 
             # Load decoder weights
             # The decoder checkpoint does NOT have 'pixel_decoder.' prefix, load directly
@@ -426,7 +477,8 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         """Forward pass for training.
 
         Args:
-            images: Input images [B, 3, H, W] in [0, 255] range
+            images: Input images [B, 3, H, W] already normalized by 3D-MOOD's NormalizeImages
+                    (mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375])
             depth_feats: Ignored (we use UniDepthV2's own encoder)
             intrinsics: Camera intrinsics [B, 3, 3]
             image_hw: Image height and width tuple
@@ -488,8 +540,11 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
                 depth_mask.float(), size=(new_H, new_W), mode='nearest'
             ).bool()
 
-        # 3. Normalize images for UniDepthV2 (ImageNet normalization)
-        images_normalized = self._normalize_image_for_dinov2(images_resized)
+        # 3. Skip normalization - images are already normalized by 3D-MOOD's NormalizeImages
+        # The 3D-MOOD normalization (mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375])
+        # is mathematically equivalent to ImageNet normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # because 123.675/255 = 0.485, 58.395/255 = 0.229, etc.
+        images_normalized = images_resized
 
         # 4. Prepare inputs with adjusted intrinsics and image_hw
         inputs, image_metas = self._prepare_inputs(
@@ -519,6 +574,13 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
                 if torch.isnan(rays).any() or torch.isinf(rays).any():
                     print(f"[DEBUG NaN/Inf] camera rays has nan={torch.isnan(rays).any().item()}, inf={torch.isinf(rays).any().item()}")
                     print(f"[DEBUG NaN/Inf] camera.K = {inputs['camera'].K}")
+
+            # DEBUG: Check encoder output before decoder
+            print(f"[DEBUG] About to call forward_train...")
+            print(f"[DEBUG] inputs keys: {inputs.keys()}")
+            print(f"[DEBUG] inputs['image'] shape: {inputs['image'].shape}, dtype: {inputs['image'].dtype}")
+            if torch.isnan(inputs['image']).any():
+                print(f"[DEBUG] WARNING: inputs['image'] has NaN!")
 
             outputs, losses_dict = self.unidepth_model.forward_train(
                 inputs, image_metas
@@ -578,6 +640,11 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         # 5. Resize depth_map back to original dimensions
         depth_map_resized = self._resize_depth_to_original(depth_map, (orig_H, orig_W))
 
+        # 5.5 Save depth visualization (first N samples only)
+        self._save_depth_visualization(
+            depth_map_resized, depth_gt, images, image_hw
+        )
+
         # 6. Scale pred_K back to original dimensions
         # Intrinsic matrix scaling: fx, cx scale with width; fy, cy scale with height
         # pred_K was predicted for adjusted dimensions, need to scale to original
@@ -636,7 +703,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         """Forward pass for inference.
 
         Args:
-            images: Input images [B, 3, H, W] in [0, 255] range
+            images: Input images [B, 3, H, W] already normalized by 3D-MOOD's NormalizeImages
             depth_feats: Ignored (we use UniDepthV2's own encoder)
             intrinsics: Camera intrinsics [B, 3, 3]
             image_hw: Image height and width tuple
@@ -656,8 +723,8 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         _, _, new_H, new_W = images_resized.shape
         image_hw_adjusted = (new_H, new_W)
 
-        # 2. Normalize images for UniDepthV2
-        images_normalized = self._normalize_image_for_dinov2(images_resized)
+        # 2. Skip normalization - images are already normalized by 3D-MOOD's NormalizeImages
+        images_normalized = images_resized
 
         # 3. Prepare inputs (no depth GT) with adjusted intrinsics and image_hw
         inputs, image_metas = self._prepare_inputs(
@@ -761,3 +828,106 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
             },
             losses={},
         )
+
+    def _save_depth_visualization(
+        self,
+        depth_pred: Tensor | None,
+        depth_gt: Tensor | None,
+        images: Tensor,
+        image_hw: tuple[int, int],
+    ) -> None:
+        """Save depth map visualization as PNG.
+
+        Args:
+            depth_pred: Predicted depth [B, 1, H, W] or [B, H, W]
+            depth_gt: Ground truth depth [B, 1, H, W] or [B, H, W]
+            images: Input images [B, 3, H, W]
+            image_hw: Original image size (H, W)
+        """
+        global _DEPTH_VIS_COUNTER
+
+        if _DEPTH_VIS_COUNTER >= _DEPTH_VIS_MAX_SAVE:
+            return
+
+        if depth_pred is None:
+            return
+
+        # Ensure save directory exists
+        os.makedirs(_DEPTH_VIS_SAVE_DIR, exist_ok=True)
+
+        # Process each sample in batch
+        batch_size = depth_pred.shape[0]
+        for i in range(batch_size):
+            if _DEPTH_VIS_COUNTER >= _DEPTH_VIS_MAX_SAVE:
+                break
+
+            try:
+                # Get depth prediction
+                d_pred = depth_pred[i]
+                if d_pred.dim() == 3:
+                    d_pred = d_pred.squeeze(0)  # [H, W]
+                d_pred_np = d_pred.detach().cpu().numpy()
+
+                # Get depth GT if available
+                d_gt_np = None
+                if depth_gt is not None:
+                    d_gt = depth_gt[i]
+                    if d_gt.dim() == 3:
+                        d_gt = d_gt.squeeze(0)  # [H, W]
+                    d_gt_np = d_gt.detach().cpu().numpy()
+
+                # Get input image (denormalize)
+                img = images[i].detach().cpu()
+                # Denormalize from ImageNet normalization
+                mean = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1)
+                std = torch.tensor([58.395, 57.12, 57.375]).view(3, 1, 1)
+                img = img * std + mean
+                img = img.permute(1, 2, 0).numpy().astype(np.uint8)
+                img = np.clip(img, 0, 255)
+
+                # Create visualization figure
+                if d_gt_np is not None:
+                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                else:
+                    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+                    axes = [axes[0], axes[1], None]
+
+                # Plot input image
+                axes[0].imshow(img)
+                axes[0].set_title("Input Image")
+                axes[0].axis("off")
+
+                # Plot predicted depth with colormap
+                vmin = np.percentile(d_pred_np[d_pred_np > 0], 5) if (d_pred_np > 0).any() else 0
+                vmax = np.percentile(d_pred_np[d_pred_np > 0], 95) if (d_pred_np > 0).any() else 1
+                im = axes[1].imshow(d_pred_np, cmap="magma", vmin=vmin, vmax=vmax)
+                axes[1].set_title(f"Pred Depth (min={d_pred_np.min():.2f}, max={d_pred_np.max():.2f})")
+                axes[1].axis("off")
+                plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+
+                # Plot GT depth if available
+                if d_gt_np is not None and axes[2] is not None:
+                    valid_mask = d_gt_np > 0
+                    if valid_mask.any():
+                        vmin_gt = np.percentile(d_gt_np[valid_mask], 5)
+                        vmax_gt = np.percentile(d_gt_np[valid_mask], 95)
+                    else:
+                        vmin_gt, vmax_gt = 0, 1
+                    im_gt = axes[2].imshow(d_gt_np, cmap="magma", vmin=vmin_gt, vmax=vmax_gt)
+                    axes[2].set_title(f"GT Depth (min={d_gt_np.min():.2f}, max={d_gt_np.max():.2f})")
+                    axes[2].axis("off")
+                    plt.colorbar(im_gt, ax=axes[2], fraction=0.046, pad=0.04)
+
+                plt.tight_layout()
+
+                # Save figure
+                save_path = os.path.join(_DEPTH_VIS_SAVE_DIR, f"depth_{_DEPTH_VIS_COUNTER:04d}.png")
+                plt.savefig(save_path, dpi=100, bbox_inches="tight")
+                plt.close(fig)
+
+                print(f"[Depth Vis] Saved {save_path}")
+                _DEPTH_VIS_COUNTER += 1
+
+            except Exception as e:
+                print(f"[Depth Vis] Error saving depth visualization: {e}")
+                continue

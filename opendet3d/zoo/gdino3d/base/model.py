@@ -251,10 +251,10 @@ def get_gdino3d_hyperparams_cfg() -> ExperimentParameters:
 
     # Geometry Backend Learning Rates (for ablation experiments)
     # These control the learning rate multipliers for geometry backend components
-    # Default: train all components at reduced lr
-    params.geom_encoder_lr_mult = 0.1   # Train encoder at 10% lr (DINOv2/pixel_encoder)
-    params.geom_decoder_lr_mult = 1.0   # Train decoder at full lr
-    params.geom_projector_lr_mult = 1.0 # Train projector at full lr (DetAny3D only)
+    # All components train at 10% of base lr (0.0004 * 0.1 = 0.00004)
+    params.geom_encoder_lr_mult = 0.1   # Train encoder at 10% lr
+    params.geom_decoder_lr_mult = 0.1   # Train decoder at 10% lr
+    params.geom_projector_lr_mult = 0.1 # Train projector at 10% lr
 
     return params
 
