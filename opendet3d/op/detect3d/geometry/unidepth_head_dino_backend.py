@@ -319,6 +319,15 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
             depth_loss = self.depth_loss(depth_preds_resized, depth_gt, mask=depth_mask)
             losses["depth_loss"] = depth_loss * self.depth_loss_weight
 
+        # Compute depth_latents_hw based on output_scales (in adjusted space)
+        # output_scales=1: latents at 1/8, output_scales=2: 1/4, output_scales=3: 1/2
+        output_scales = getattr(self.depth_head, 'output_scales', 1)
+        latent_downsample = 16 // (2 ** output_scales)  # 1->8, 2->4, 3->2
+        depth_latents_hw = (
+            image_hw_adjusted[0] // latent_downsample,
+            image_hw_adjusted[1] // latent_downsample
+        )
+
         return GeometryBackendOutput(
             depth_map=depth_preds_resized.unsqueeze(1),  # [B, 1, H, W]
             depth_latents=depth_latent,  # [B, N, C]
@@ -326,7 +335,7 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
             ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
             ray_image_hw=image_hw_adjusted,  # Adjusted image size
             ray_downsample=16,  # UniDepthHead uses 1/16 resolution
-            aux={},
+            aux={"depth_latents_hw": depth_latents_hw},
             losses=losses,
         )
 
@@ -381,6 +390,14 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
         # Apply optional detach
         depth_latent = self._maybe_detach_latents(depth_latent)
 
+        # Compute depth_latents_hw based on output_scales (in adjusted space)
+        output_scales = getattr(self.depth_head, 'output_scales', 1)
+        latent_downsample = 16 // (2 ** output_scales)
+        depth_latents_hw = (
+            image_hw_adjusted[0] // latent_downsample,
+            image_hw_adjusted[1] // latent_downsample
+        )
+
         return GeometryBackendOutput(
             depth_map=depth_preds_resized.unsqueeze(1),  # [B, 1, H, W]
             depth_latents=depth_latent,  # [B, N, C]
@@ -388,7 +405,7 @@ class UniDepthHeadDinoBackend(GeometryBackendBase, DINOv2Mixin):
             ray_intrinsics=intrinsics_adjusted,  # Adjusted intrinsics for DINOv2 space
             ray_image_hw=image_hw_adjusted,  # Adjusted image size
             ray_downsample=16,  # UniDepthHead uses 1/16 resolution
-            aux={},
+            aux={"depth_latents_hw": depth_latents_hw},
             losses={},
         )
 

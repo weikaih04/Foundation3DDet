@@ -53,6 +53,7 @@ from opendet3d.zoo.gdino3d.base.model import (
     get_gdino3d_hyperparams_cfg,
     get_gdino3d_with_geometry_backend_cfg,
     GeometryBackendType,
+    DepthMemoryFusionType,
 )
 from opendet3d.zoo.gdino3d.base.optim import get_optim_cfg
 from opendet3d.zoo.gdino3d.base.pl import get_pl_cfg
@@ -71,12 +72,21 @@ def _build_geometry_backend_experiment(
     unidepth_v2_pretrained: str | None = None,
     unidepth_v2_encoder_pretrained: str | None = None,
     unidepth_v2_decoder_pretrained: str | None = None,
+    unidepth_v2_silog_only: bool = False,
     use_mini_dataset: bool = False,
     mini_dataset_size: int = 100,
     # Geometry Backend Learning Rates (optional overrides)
     geom_encoder_lr_mult: float | None = None,
     geom_decoder_lr_mult: float | None = None,
     geom_projector_lr_mult: float | None = None,
+    # Depth-Memory Fusion
+    depth_memory_fusion_type: DepthMemoryFusionType | None = None,
+    # Ablation options
+    use_depth_prompt: bool = True,
+    loss_2d_scale: float = 1.0,
+    loss_3d_scale: float = 1.0,
+    # Custom param groups (for freeze training)
+    custom_param_groups: list[dict] | None = None,
 ) -> ExperimentConfig:
     """Build experiment config for geometry backend ablation.
 
@@ -84,7 +94,6 @@ def _build_geometry_backend_experiment(
         exp_name: Experiment name.
         geometry_backend_type: Type of geometry backend.
         use_geom_backend_loss: Whether to use geometry backend's internal losses.
-            Set True for detany3d and unidepth_v2 to use their native losses.
         detach_depth_latents: Whether to detach depth latents.
         dino_model: DINOv2 model variant for unidepth_head_dino and detany3d.
         dino_pretrained: Path to DINOv2 pretrained weights.
@@ -94,14 +103,16 @@ def _build_geometry_backend_experiment(
         unidepth_v2_pretrained: Path to full UniDepthV2 checkpoint.
         unidepth_v2_encoder_pretrained: Path to UniDepthV2 encoder-only weights.
         unidepth_v2_decoder_pretrained: Path to UniDepthV2 decoder-only weights.
-        use_mini_dataset: If True, use mini dataset (cache_omni3d50_miniN) for fast testing.
+        unidepth_v2_silog_only: If True, only use SILog loss for UniDepthV2.
+        use_mini_dataset: If True, use mini dataset for fast testing.
         mini_dataset_size: Size of mini dataset (default: 100).
         geom_encoder_lr_mult: Learning rate multiplier for geometry backend encoder.
-            If None, uses default from params (0.0 = freeze).
         geom_decoder_lr_mult: Learning rate multiplier for geometry backend decoder.
-            If None, uses default from params (1.0 = full lr).
         geom_projector_lr_mult: Learning rate multiplier for geometry backend projector.
-            If None, uses default from params (1.0 = full lr).
+        depth_memory_fusion_type: Type of depth-memory fusion.
+        use_depth_prompt: Whether to use depth prompt in bbox3d_head.
+        loss_2d_scale: Scale factor for 2D losses.
+        loss_3d_scale: Scale factor for 3D losses.
 
     Returns:
         ExperimentConfig.
@@ -199,31 +210,31 @@ def _build_geometry_backend_experiment(
     print(f"\n[DEBUG CONFIG] Building geometry backend experiment:")
     print(f"  exp_name: {exp_name}")
     print(f"  geometry_backend_type: {geometry_backend_type}")
+    print(f"  depth_memory_fusion_type: {depth_memory_fusion_type}")
     print(f"  backend_kwargs: {backend_kwargs}")
 
     config.model, box_coder = get_gdino3d_with_geometry_backend_cfg(
         params=params,
         geometry_backend_type=geometry_backend_type,
-        pretrained=None,  # Don't load pretrained weights - we'll load from checkpoint
+        pretrained=None,
         use_checkpoint=config.use_checkpoint,
         detach_depth_latents=detach_depth_latents,
+        depth_memory_fusion_type=depth_memory_fusion_type,
+        use_depth_prompt=use_depth_prompt,
         **backend_kwargs,
     )
 
     print(f"[DEBUG CONFIG] Model config created: {type(config.model)}")
 
     # Loss configuration
-    # - For unidepth_head (original): use aux_depth_loss=True (external SILog via LossConnector)
-    # - For all geometry backends: use use_geom_backend_loss=True (losses from backend.forward_train())
-    #   - unidepth_head_dino: returns {"depth_loss": SILog}
-    #   - detany3d: returns {"depth_loss": SILog, "loss_phi": SILog, "loss_theta": SILog}
-    #   - unidepth_v2: returns UniDepthV2's native losses
     aux_depth_loss = geometry_backend_type == "unidepth_head"
     config.loss = get_loss_cfg(
         params,
         box_coder,
         aux_depth_loss=aux_depth_loss,
         use_geom_backend_loss=use_geom_backend_loss,
+        loss_2d_scale=loss_2d_scale,
+        loss_3d_scale=loss_3d_scale,
     )
 
     ######################################################
@@ -233,42 +244,47 @@ def _build_geometry_backend_experiment(
     # Also train GroundingDINO head + Geometry backend
     #
     # Note: We use lr_mult to control learning rates for different components
-    param_groups = [
-        # Train language model and backbone at 10% lr
-        {"custom_keys": ["language_model"], "lr_mult": 0.1},
-        {"custom_keys": ["backbone"], "lr_mult": 0.1},
 
-        # Geometry Backend Encoder (DINOv2 / pixel_encoder)
-        # Default: freeze (lr_mult=0.0)
-        {
-            "custom_keys": [
-                "geometry_backend.dino_encoder",                    # UniDepthHeadDino, DetAny3D
-                "geometry_backend.unidepth_model.pixel_encoder",    # UniDepthV2
-            ],
-            "lr_mult": geom_encoder_lr,
-        },
+    # Use custom param groups if provided, otherwise use default
+    if custom_param_groups is not None:
+        param_groups = custom_param_groups
+    else:
+        param_groups = [
+            # Train language model and backbone at 10% lr
+            {"custom_keys": ["language_model"], "lr_mult": 0.1},
+            {"custom_keys": ["backbone"], "lr_mult": 0.1},
 
-        # Geometry Backend Decoder
-        # Default: train at full lr (lr_mult=1.0)
-        {
-            "custom_keys": [
-                "geometry_backend.depth_head",                      # UniDepthHeadDino
-                "geometry_backend.depth_decoder",                   # DetAny3D
-                "geometry_backend.unidepth_model.decoder",          # UniDepthV2
-            ],
-            "lr_mult": geom_decoder_lr,
-        },
+            # Geometry Backend Encoder (DINOv2 / pixel_encoder)
+            # Default: freeze (lr_mult=0.0)
+            {
+                "custom_keys": [
+                    "geometry_backend.dino_encoder",                    # UniDepthHeadDino, DetAny3D
+                    "geometry_backend.unidepth_model.pixel_encoder",    # UniDepthV2
+                ],
+                "lr_mult": geom_encoder_lr,
+            },
 
-        # Geometry Backend Projector (DetAny3D only, UniDepthV2 latent_proj)
-        # Default: train at full lr (lr_mult=1.0)
-        {
-            "custom_keys": [
-                "geometry_backend.feature_projector",               # DetAny3D
-                "geometry_backend.latent_proj",                     # UniDepthV2
-            ],
-            "lr_mult": geom_projector_lr,
-        },
-    ]
+            # Geometry Backend Decoder
+            # Default: train at full lr (lr_mult=1.0)
+            {
+                "custom_keys": [
+                    "geometry_backend.depth_head",                      # UniDepthHeadDino
+                    "geometry_backend.depth_decoder",                   # DetAny3D
+                    "geometry_backend.unidepth_model.pixel_decoder",    # UniDepthV2 (FIXED: was .decoder, should be .pixel_decoder)
+                ],
+                "lr_mult": geom_decoder_lr,
+            },
+
+            # Geometry Backend Projector (DetAny3D only, UniDepthV2 latent_proj)
+            # Default: train at full lr (lr_mult=1.0)
+            {
+                "custom_keys": [
+                    "geometry_backend.feature_projector",               # DetAny3D
+                    "geometry_backend.latent_proj",                     # UniDepthV2
+                ],
+                "lr_mult": geom_projector_lr,
+            },
+        ]
     config.optimizers = get_optim_cfg(params, param_groups=param_groups)
 
     ######################################################
@@ -401,6 +417,197 @@ def get_unidepth_v2_config(*args, **kwargs) -> ExperimentConfig:
     )
 
 
+def get_unidepth_v2_no_geom_loss_config(*args, **kwargs) -> ExperimentConfig:
+    """Get config for UniDepthV2 with NO geometry loss.
+
+    This configuration:
+    - Uses UniDepthV2 for feature extraction only
+    - NO depth/camera losses from UniDepthV2 (use_geom_backend_loss=False)
+    - Only trains GroundingDINO 3D detection head
+    - Useful for testing if NaN issues come from geometry loss backward
+
+    Usage:
+        vis4d fit --config .../geometry_backend_ablation.py:unidepth_v2_no_geom_loss
+    """
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_geom-ablation_unidepth-v2-vits_no-geom-loss",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=False,  # DISABLE geometry loss - only extract features
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_pretrained=None,
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        # Learning rate multipliers (at 10% of base lr)
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+    )
+
+
+# ============================================================================
+# Depth-Memory Fusion Configurations
+# ============================================================================
+
+
+def get_unidepth_v2_fusion_zero_add_config(*args, **kwargs) -> ExperimentConfig:
+    """UniDepthV2 with zero_add depth-memory fusion.
+
+    Zero_add fusion: depth_latents are projected and added with learnable zero-initialized scale.
+    This allows gradual learning of how much depth information to incorporate.
+
+    Usage:
+        vis4d fit --config .../geometry_backend_ablation.py:unidepth_v2_fusion_zero_add
+    """
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_fusion-zero-add",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="zero_add",
+    )
+
+
+def get_unidepth_v2_fusion_add_config(*args, **kwargs) -> ExperimentConfig:
+    """UniDepthV2 with add depth-memory fusion.
+
+    Add fusion: depth_latents are projected and directly added to encoder memory.
+
+    Usage:
+        vis4d fit --config .../geometry_backend_ablation.py:unidepth_v2_fusion_add
+    """
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_fusion-add",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="add",
+    )
+
+
+def get_unidepth_v2_fusion_concat_config(*args, **kwargs) -> ExperimentConfig:
+    """UniDepthV2 with concat depth-memory fusion."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_fusion-concat",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="concat",
+    )
+
+
+def get_unidepth_v2_fusion_gating_config(*args, **kwargs) -> ExperimentConfig:
+    """Exp D: UniDepthV2 with gating depth-memory fusion."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_fusion-gating",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="gating",
+    )
+
+
+def get_unidepth_v2_fusion_only_config(*args, **kwargs) -> ExperimentConfig:
+    """Exp A: Only use encoder fusion, disable bbox3d_head depth prompt."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_fusion-only",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="zero_add",
+        use_depth_prompt=False,
+    )
+
+
+def get_unidepth_v2_head_only_config(*args, **kwargs) -> ExperimentConfig:
+    """Exp B: Only use bbox3d_head depth, disable encoder fusion (control experiment)."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_head-only",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type=None,  # No fusion
+        use_depth_prompt=True,  # Only use head depth
+    )
+
+
+def get_unidepth_v2_fusion_freeze_config(*args, **kwargs) -> ExperimentConfig:
+    """Exp C: Freeze encoder+decoder, only train fusion + 3D head.
+
+    This forces the model to learn depth information through the fusion path
+    since the encoder/decoder weights are frozen.
+    """
+    from opendet3d.zoo.gdino3d.base.optim import get_freeze_encoder_decoder_param_groups
+
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_fusion-freeze",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,  # Still used for geometry backend
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="zero_add",
+        use_depth_prompt=False,  # Only use fusion, not head
+        custom_param_groups=get_freeze_encoder_decoder_param_groups(),
+    )
+
+
+def get_unidepth_v2_freeze_train_config(*args, **kwargs) -> ExperimentConfig:
+    """Exp B: Freeze encoder+decoder, only train fusion + 3D head."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_freeze-train",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.0,
+        geom_decoder_lr_mult=0.0,
+        depth_memory_fusion_type="zero_add",
+    )
+
+
+def get_unidepth_v2_3d_focus_config(*args, **kwargs) -> ExperimentConfig:
+    """Exp C: Lower 2D loss, higher 3D loss to focus on 3D prediction."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_3d-focus",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="zero_add",
+        loss_2d_scale=0.5,
+        loss_3d_scale=2.0,
+    )
+
+
 # ============================================================================
 # Mini Dataset Configurations (for fast testing)
 # ============================================================================
@@ -438,6 +645,14 @@ def get_config(config_name: str = "detany3d", *args, **kwargs) -> ExperimentConf
             - "unidepth_head_dino": UniDepthHead + DINOv2
             - "detany3d": DetAny3D (DINOv2 + DetAny3D decoder) [default]
             - "unidepth_v2": UniDepthV2 (DINOv2 + UniDepthV2 decoder)
+            - "unidepth_v2_no_geom_loss": UniDepthV2 without geometry loss
+            - "unidepth_v2_fusion_zero_add": UniDepthV2 with zero_add fusion
+            - "unidepth_v2_fusion_add": UniDepthV2 with add fusion
+            - "unidepth_v2_fusion_concat": UniDepthV2 with concat fusion
+            - "unidepth_v2_fusion_gating": UniDepthV2 with gating fusion
+            - "unidepth_v2_fusion_only": Fusion only (no bbox3d_head depth)
+            - "unidepth_v2_head_only": Head only (no fusion)
+            - "unidepth_v2_fusion_freeze": Freeze enc+dec, train fusion+head
 
     Returns:
         ExperimentConfig for the specified geometry backend.
@@ -451,6 +666,15 @@ def get_config(config_name: str = "detany3d", *args, **kwargs) -> ExperimentConf
         "unidepth_head_dino": get_unidepth_head_dino_config,
         "detany3d": get_detany3d_config,
         "unidepth_v2": get_unidepth_v2_config,
+        "unidepth_v2_no_geom_loss": get_unidepth_v2_no_geom_loss_config,
+        # Depth-Memory Fusion experiments
+        "unidepth_v2_fusion_zero_add": get_unidepth_v2_fusion_zero_add_config,
+        "unidepth_v2_fusion_add": get_unidepth_v2_fusion_add_config,
+        "unidepth_v2_fusion_concat": get_unidepth_v2_fusion_concat_config,
+        "unidepth_v2_fusion_gating": get_unidepth_v2_fusion_gating_config,
+        "unidepth_v2_fusion_only": get_unidepth_v2_fusion_only_config,
+        "unidepth_v2_head_only": get_unidepth_v2_head_only_config,
+        "unidepth_v2_fusion_freeze": get_unidepth_v2_fusion_freeze_config,
     }
 
     if config_name not in config_map:

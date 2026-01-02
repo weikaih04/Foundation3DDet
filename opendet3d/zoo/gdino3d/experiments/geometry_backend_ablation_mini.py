@@ -19,6 +19,7 @@ from opendet3d.zoo.gdino3d.experiments.geometry_backend_ablation import (
     get_unidepth_v2_config as _get_unidepth_v2_config_full,
     _build_geometry_backend_experiment,
 )
+from opendet3d.zoo.gdino3d.base.model import DepthMemoryFusionType
 from vis4d.config.typing import ExperimentConfig
 
 
@@ -71,12 +72,89 @@ def get_unidepth_v2_config(*args, **kwargs) -> ExperimentConfig:
     return _build_geometry_backend_experiment(
         exp_name="gdino3d_geom-ablation_unidepth-v2-vits_mini100",
         geometry_backend_type="unidepth_v2",
-        use_geom_backend_loss=True,
+        use_geom_backend_loss=True,  # Use UniDepthV2's internal losses
         unidepth_v2_version="v2-vits14",
-        # Don't use separate decoder weights - use HuggingFace model directly
-        # unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        # Use local pretrained weights (extracted from HuggingFace model)
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
         use_mini_dataset=True,
         mini_dataset_size=100,
+        # UniDepthV2 learning rate multipliers (at 10% of base lr)
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+    )
+
+
+def get_unidepth_v2_no_geom_loss_config(*args, **kwargs) -> ExperimentConfig:
+    """UniDepthV2 with NO geometry loss - only extract features for GroundingDINO."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_geom-ablation_unidepth-v2-vits_no-geom-loss_mini100",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=False,  # DISABLE geometry loss - only extract features
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        use_mini_dataset=True,
+        mini_dataset_size=100,
+        # UniDepthV2 learning rate multipliers (at 10% of base lr)
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+    )
+
+
+# ============================================================================
+# Depth-Memory Fusion Configurations
+# ============================================================================
+
+
+def get_unidepth_v2_fusion_zero_add_config(*args, **kwargs) -> ExperimentConfig:
+    """UniDepthV2 with zero_add depth-memory fusion."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_fusion-zero-add_mini100",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        use_mini_dataset=True,
+        mini_dataset_size=100,
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="zero_add",
+    )
+
+
+def get_unidepth_v2_fusion_add_config(*args, **kwargs) -> ExperimentConfig:
+    """UniDepthV2 with add depth-memory fusion."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_fusion-add_mini100",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        use_mini_dataset=True,
+        mini_dataset_size=100,
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="add",
+    )
+
+
+def get_unidepth_v2_fusion_concat_config(*args, **kwargs) -> ExperimentConfig:
+    """UniDepthV2 with concat depth-memory fusion."""
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_unidepth-v2-vits_fusion-concat_mini100",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        use_mini_dataset=True,
+        mini_dataset_size=100,
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="concat",
     )
 
 
@@ -90,6 +168,10 @@ def get_config(config_name: str = "unidepth_head_dino", *args, **kwargs) -> Expe
             - "unidepth_head_dino": UniDepthHead + DINOv2 (default)
             - "detany3d": DetAny3D (DINOv2 + UnidepthDecoderDinoOnly)
             - "unidepth_v2": UniDepthV2 (DINOv2 + UniDepthV2 Decoder)
+            - "unidepth_v2_no_geom_loss": UniDepthV2 without geometry loss
+            - "unidepth_v2_fusion_zero_add": UniDepthV2 with zero_add fusion
+            - "unidepth_v2_fusion_add": UniDepthV2 with add fusion
+            - "unidepth_v2_fusion_concat": UniDepthV2 with concat fusion
 
     Returns:
         ExperimentConfig for the specified geometry backend.
@@ -103,6 +185,11 @@ def get_config(config_name: str = "unidepth_head_dino", *args, **kwargs) -> Expe
         "unidepth_head_dino": get_unidepth_head_dino_config,
         "detany3d": get_detany3d_config,
         "unidepth_v2": get_unidepth_v2_config,
+        "unidepth_v2_no_geom_loss": get_unidepth_v2_no_geom_loss_config,
+        # Depth-Memory Fusion experiments
+        "unidepth_v2_fusion_zero_add": get_unidepth_v2_fusion_zero_add_config,
+        "unidepth_v2_fusion_add": get_unidepth_v2_fusion_add_config,
+        "unidepth_v2_fusion_concat": get_unidepth_v2_fusion_concat_config,
     }
 
     if config_name not in config_map:

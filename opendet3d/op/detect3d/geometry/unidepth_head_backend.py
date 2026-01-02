@@ -94,6 +94,12 @@ class UniDepthHeadBackend(GeometryBackendBase):
         # Apply optional detach
         depth_latent = self._maybe_detach_latents(depth_latent)
 
+        # Compute depth_latents_hw based on output_scales
+        # output_scales=1: latents at 1/8, output_scales=2: 1/4, output_scales=3: 1/2
+        output_scales = getattr(self.depth_head, 'output_scales', 1)
+        latent_downsample = 16 // (2 ** output_scales)  # 1->8, 2->4, 3->2
+        depth_latents_hw = (image_hw[0] // latent_downsample, image_hw[1] // latent_downsample)
+
         # Compute losses
         losses: dict[str, Tensor] = {}
         if depth_gt is not None:
@@ -107,7 +113,7 @@ class UniDepthHeadBackend(GeometryBackendBase):
             ray_intrinsics=intrinsics,  # Original intrinsics
             ray_image_hw=image_hw,  # Original image size
             ray_downsample=16,  # UniDepthHead uses 1/16 resolution
-            aux={},
+            aux={"depth_latents_hw": depth_latents_hw},
             losses=losses,
         )
 
@@ -144,6 +150,12 @@ class UniDepthHeadBackend(GeometryBackendBase):
         # Apply optional detach
         depth_latent = self._maybe_detach_latents(depth_latent)
 
+        # Compute depth_latents_hw based on output_scales
+        # output_scales=1: latents at 1/8, output_scales=2: 1/4, output_scales=3: 1/2
+        output_scales = getattr(self.depth_head, 'output_scales', 1)
+        latent_downsample = 16 // (2 ** output_scales)  # 1->8, 2->4, 3->2
+        depth_latents_hw = (image_hw[0] // latent_downsample, image_hw[1] // latent_downsample)
+
         return GeometryBackendOutput(
             depth_map=depth_preds.unsqueeze(1),  # [B, 1, H, W]
             depth_latents=depth_latent,  # [B, N, C]
@@ -151,7 +163,7 @@ class UniDepthHeadBackend(GeometryBackendBase):
             ray_intrinsics=intrinsics,  # Original intrinsics
             ray_image_hw=image_hw,  # Original image size
             ray_downsample=16,  # UniDepthHead uses 1/16 resolution
-            aux={},
+            aux={"depth_latents_hw": depth_latents_hw},
             losses={},
         )
 

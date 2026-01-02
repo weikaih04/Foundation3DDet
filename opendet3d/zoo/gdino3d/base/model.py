@@ -22,6 +22,7 @@ from opendet3d.op.detect3d.geometry import (
     DetAny3DGeometryBackend,
     UniDepthV2GeometryBackend,
 )
+from opendet3d.op.detect3d.depth_memory_fusion import DepthMemoryFusion
 from opendet3d.op.fpp.channel_mapper import ChannelMapper
 from opendet3d.zoo.gdino.base.model import GDINO_MODEL_WEIGHTS
 
@@ -31,6 +32,7 @@ from opendet3d.zoo.gdino.base.model import GDINO_MODEL_WEIGHTS
 # ============================================================================
 
 GeometryBackendType = Literal["unidepth_head", "unidepth_head_dino", "detany3d", "unidepth_v2"]
+DepthMemoryFusionType = Literal["add", "zero_add", "concat", "gating"]
 
 
 def get_unidepth_head_backend_cfg(
@@ -259,7 +261,10 @@ def get_gdino3d_hyperparams_cfg() -> ExperimentParameters:
     return params
 
 
-def get_gdino3d_head_cfg(params: ExperimentParameters) -> ConfigDict:
+def get_gdino3d_head_cfg(
+    params: ExperimentParameters,
+    use_depth_prompt: bool = True,
+) -> ConfigDict:
     """Get the G-DINO 3D head config."""
     box_coder = class_config(
         GroundingDINO3DCoder,
@@ -273,6 +278,7 @@ def get_gdino3d_head_cfg(params: ExperimentParameters) -> ConfigDict:
         GroundingDINO3DHead,
         box_coder=box_coder,
         depth_output_scales=params.depth_output_scales,
+        use_depth_prompt=use_depth_prompt,
     )
 
     roi2det3d = class_config(
@@ -454,8 +460,8 @@ def get_gdino3d_with_geometry_backend_cfg(
     use_checkpoint: bool | FieldReference = False,
     # Geometry backend options
     detach_depth_latents: bool = True,
-    freeze_dino: bool = False,  # Changed to False - freezing now handled by optimizer lr_mult=0.0
-    freeze_encoder: bool = False,  # Changed to False - freezing now handled by optimizer lr_mult=0.0
+    freeze_dino: bool = False,
+    freeze_encoder: bool = False,
     target_latent_dim: int = 128,
     depth_loss_weight: float = 10.0,
     dino_model: str = "vit_small",
@@ -466,6 +472,10 @@ def get_gdino3d_with_geometry_backend_cfg(
     unidepth_v2_pretrained: str | None = None,
     unidepth_v2_encoder_pretrained: str | None = None,
     unidepth_v2_decoder_pretrained: str | None = None,
+    # Depth-Memory Fusion options
+    depth_memory_fusion_type: DepthMemoryFusionType | None = None,
+    # Ablation options
+    use_depth_prompt: bool = True,
 ) -> tuple[ConfigDict, ConfigDict]:
     """Get 3D-MOOD config with specified geometry backend.
 
@@ -494,6 +504,7 @@ def get_gdino3d_with_geometry_backend_cfg(
         unidepth_v2_pretrained: Path to UniDepthV2 full checkpoint (for unidepth_v2).
         unidepth_v2_encoder_pretrained: Path to UniDepthV2 encoder-only weights (for unidepth_v2).
         unidepth_v2_decoder_pretrained: Path to UniDepthV2 decoder-only weights (for unidepth_v2).
+        depth_memory_fusion_type: Type of depth-memory fusion ("add", "zero_add", "concat", or None).
 
     Returns:
         Tuple of (model_config, box_coder_config).
@@ -575,12 +586,26 @@ def get_gdino3d_with_geometry_backend_cfg(
         raise ValueError(f"Unknown geometry backend type: {geometry_backend_type}")
 
     # 3D detection head
-    bbox3d_head, roi2det3d, box_coder = get_gdino3d_head_cfg(params=params)
+    bbox3d_head, roi2det3d, box_coder = get_gdino3d_head_cfg(
+        params=params,
+        use_depth_prompt=use_depth_prompt,
+    )
 
     if pretrained is not None:
         weights = GDINO_MODEL_WEIGHTS[pretrained]
     else:
         weights = None
+
+    # Depth-Memory Fusion module (optional)
+    if depth_memory_fusion_type is not None:
+        depth_memory_fusion = class_config(
+            DepthMemoryFusion,
+            depth_dim=target_latent_dim,
+            memory_dim=256,  # GroundingDINO hidden_dim
+            fusion_type=depth_memory_fusion_type,
+        )
+    else:
+        depth_memory_fusion = None
 
     model = class_config(
         GroundingDINO3D,
@@ -592,6 +617,7 @@ def get_gdino3d_with_geometry_backend_cfg(
         fpn=fpn,
         depth_head=None,  # Use geometry_backend instead
         geometry_backend=geometry_backend,
+        depth_memory_fusion=depth_memory_fusion,
         use_checkpoint=use_checkpoint,
         weights=weights,
         chunked_size=chunked_size,

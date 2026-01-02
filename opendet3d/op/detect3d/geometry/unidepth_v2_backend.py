@@ -69,6 +69,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         target_latent_dim: Target dimension for depth_latents (for 3D head).
         freeze_encoder: Whether to freeze pixel encoder weights.
         detach_depth_latents: Whether to detach depth_latents from graph.
+        silog_only: If True, only use SILog loss (disable camera, ssi, confidence losses).
     """
 
     # UniDepthV2's decoder fuses rays internally via embed_rays + multi-scale fusion
@@ -86,6 +87,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         target_latent_dim: int = 128,
         freeze_encoder: bool = True,
         detach_depth_latents: bool = False,
+        silog_only: bool = False,  # If True, only use SILog loss (disable camera, ssi, confidence)
     ) -> None:
         """Initialize the UniDepthV2GeometryBackend."""
         super().__init__(detach_depth_latents=detach_depth_latents)
@@ -99,37 +101,30 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         self._version = version
 
         # Build UniDepthV2 model architecture (without loading pretrained weights yet)
-        # Get HuggingFace model name
-        hf_name = VERSION_TO_HF_NAME.get(version)
-        if hf_name is None:
+        # Get local config file path
+        import json
+        import os
+
+        config_path = VERSION_TO_LOCAL_CONFIG.get(version)
+        if config_path is None:
             raise ValueError(
                 f"Unknown version: {version}. "
-                f"Available versions: {list(VERSION_TO_HF_NAME.keys())}"
+                f"Available versions: {list(VERSION_TO_LOCAL_CONFIG.keys())}"
             )
 
-        # Download config from HuggingFace
-        print(f"[UniDepthV2] Loading config from HuggingFace: {hf_name}")
-        from huggingface_hub import hf_hub_download
-        import json
+        # Find the config file relative to this file's location
+        # unidepth_v2_backend.py is in opendet3d/op/detect3d/geometry/
+        # UniDepth/configs/ is at repo root
+        backend_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(backend_dir))))
+        config_file = os.path.join(repo_root, config_path)
 
-        config_file = hf_hub_download(
-            repo_id=hf_name,
-            filename="config.json"
-        )
+        print(f"[UniDepthV2] Loading config from local file: {config_file}")
         with open(config_file, "r") as f:
             config = json.load(f)
 
-        # IMPORTANT: Ensure pretrained is None to avoid auto-downloading weights
-        # The HuggingFace config should have "pretrained": null, but we verify here
-        if "model" in config and "pixel_encoder" in config["model"]:
-            encoder_pretrained = config["model"]["pixel_encoder"].get("pretrained")
-            if encoder_pretrained is not None and encoder_pretrained != "":
-                print(f"  WARNING: Config has pretrained={encoder_pretrained}, setting to None")
-                config["model"]["pixel_encoder"]["pretrained"] = None
-            else:
-                print(f"  ✅ Config pretrained={encoder_pretrained} (no auto-download)")
-
         # Create model from config (without loading pretrained weights)
+        # Note: Local config already has "pretrained": null, no need to override
         print(f"[UniDepthV2] Creating model architecture (no pretrained weights yet)")
         self.unidepth_model = UniDepthV2(config=config)
 
@@ -140,26 +135,6 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
 
         assert output_scales >= 1 and output_scales <= 3, "output_scales must be 1, 2, or 3"
 
-        # Fix HuggingFace config bug: confidence loss is incorrectly set to Regression
-        # The HuggingFace config has "name": "Regression" for confidence loss,
-        # but UniDepthV2.compute_losses() calls it with Confidence signature:
-        #   loss(input, target_gt=..., target_pred=..., mask=...)
-        # Regression only accepts: loss(input, target, mask)
-        # This causes runtime errors, so we replace with the correct Confidence class.
-        if "confidence" in self.unidepth_model.losses:
-            loss_obj = self.unidepth_model.losses["confidence"]
-            if loss_obj.name == "Regression":
-                print(f"  [UniDepthV2] Fixing HuggingFace config bug: replacing Regression with Confidence")
-                from unidepth.ops.losses.confidence import Confidence
-                # Use the same config as in official UniDepthV2 training
-                confidence_config = {
-                    "weight": 0.1,
-                    "output_fn": "sqrt",
-                    "input_fn": "linear",
-                    "rescale": True,
-                }
-                self.unidepth_model.losses["confidence"] = Confidence.build(confidence_config)
-
         # Disable invariance loss (SelfDistill) for 3D-MOOD training
         # The invariance loss expects paired images (same scene with augmentations)
         # but 3D-MOOD batches contain independent images from different scenes.
@@ -169,35 +144,18 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
             print(f"  [UniDepthV2] Disabling invariance loss (SelfDistill) - not compatible with 3D-MOOD data")
             del self.unidepth_model.losses["invariance"]
 
-        # ============================================================
-        # DEBUG: Disable losses one by one to find which causes NaN
-        # Uncomment each block to disable the corresponding loss
-        # Test order: 1) only depth, 2) +ssi, 3) +confidence, 4) +camera
-        # ============================================================
+        # If silog_only, disable all losses except depth (SILog)
+        if silog_only:
+            print(f"  [UniDepthV2] silog_only=True: Keeping only SILog loss")
+            losses_to_remove = [k for k in self.unidepth_model.losses.keys() if k != "depth"]
+            for loss_name in losses_to_remove:
+                print(f"    - Disabling {loss_name} loss")
+                del self.unidepth_model.losses[loss_name]
 
-        # [TEST 3] depth + camera + ssi loss
-        # if "camera" in self.unidepth_model.losses:
-        #     print(f"  [UniDepthV2] DEBUG: Disabling camera loss")
-        #     del self.unidepth_model.losses["camera"]
-        # if "ssi" in self.unidepth_model.losses:
-        #     print(f"  [UniDepthV2] DEBUG: Disabling ssi loss")
-        #     del self.unidepth_model.losses["ssi"]
+        # Temporarily disable confidence loss
         if "confidence" in self.unidepth_model.losses:
             print(f"  [UniDepthV2] DEBUG: Disabling confidence loss")
             del self.unidepth_model.losses["confidence"]
-
-        # [TEST 2] Enable ssi loss (comment out the ssi deletion above)
-        # if "ssi" in self.unidepth_model.losses:
-        #     print(f"  [UniDepthV2] DEBUG: Disabling ssi loss")
-        #     del self.unidepth_model.losses["ssi"]
-
-        # [TEST 3] Enable confidence loss (comment out both ssi and confidence deletion)
-        # if "confidence" in self.unidepth_model.losses:
-        #     print(f"  [UniDepthV2] DEBUG: Disabling confidence loss")
-        #     del self.unidepth_model.losses["confidence"]
-
-        # [TEST 4] Enable camera loss (comment out all deletions above)
-        # This is the most suspicious one - it doesn't use depth_mask
 
         # Print remaining losses
         print(f"  [UniDepthV2] Active losses: {list(self.unidepth_model.losses.keys())}")

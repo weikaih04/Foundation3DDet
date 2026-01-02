@@ -35,6 +35,8 @@ class GroundingDINO3DHead(nn.Module):
             Set to False when using ray-aware depth backends (UniDepthV2, DetAny3D)
             since their depth_latents already incorporate ray information.
             Set to True for non-ray-aware backends (UniDepthHead v1).
+        use_depth_prompt: Whether to use depth prompt branch.
+            Set to False for ablation: only use depth via encoder fusion.
     """
 
     def __init__(
@@ -46,11 +48,13 @@ class GroundingDINO3DHead(nn.Module):
         box_coder: GroundingDINO3DCoder | None = None,
         depth_output_scales: int = 1,
         use_camera_prompt: bool = True,
+        use_depth_prompt: bool = True,
     ) -> None:
         """Initialize the 3D Grounding DINO head."""
         super().__init__()
         self.embed_dims = embed_dims
         self.use_camera_prompt = use_camera_prompt
+        self.use_depth_prompt = use_depth_prompt
 
         self.num_pred_layer = (
             num_decoder_layer + 1 if as_two_stage else num_decoder_layer
@@ -70,18 +74,20 @@ class GroundingDINO3DHead(nn.Module):
             self.project_rays = get_clones(project_rays, self.num_pred_layer)
             self.prompt_camera = get_clones(prompt_camera, self.num_pred_layer)
         else:
-            # Register as None so state_dict is consistent
             self.project_rays = None
             self.prompt_camera = None
 
-        depth_embed_dims = embed_dims // 2**depth_output_scales
-
-        project_depth, prompt_depth = self._get_condition_branch(
-            depth_embed_dims, expansion=4, embed_dims=embed_dims
-        )
-
-        self.project_depth = get_clones(project_depth, self.num_pred_layer)
-        self.prompt_depth = get_clones(prompt_depth, self.num_pred_layer)
+        # Depth prompt branch (only created if use_depth_prompt is True)
+        if self.use_depth_prompt:
+            depth_embed_dims = embed_dims // 2**depth_output_scales
+            project_depth, prompt_depth = self._get_condition_branch(
+                depth_embed_dims, expansion=4, embed_dims=embed_dims
+            )
+            self.project_depth = get_clones(project_depth, self.num_pred_layer)
+            self.prompt_depth = get_clones(prompt_depth, self.num_pred_layer)
+        else:
+            self.project_depth = None
+            self.prompt_depth = None
 
         self._init_weights()
 
@@ -169,12 +175,12 @@ class GroundingDINO3DHead(nn.Module):
                 hidden_state, ray_embedding, ray_embedding
             )
 
-        # Depth-aware 3D queries
-        proj_depth_latents = self.project_depth[layer_id](depth_latents)
-
-        hidden_state = self.prompt_depth[layer_id](
-            hidden_state, proj_depth_latents, proj_depth_latents
-        )
+        # Depth-aware 3D queries (only if use_depth_prompt is True)
+        if self.use_depth_prompt and depth_latents is not None:
+            proj_depth_latents = self.project_depth[layer_id](depth_latents)
+            hidden_state = self.prompt_depth[layer_id](
+                hidden_state, proj_depth_latents, proj_depth_latents
+            )
 
         reg_output = self.reg_branches[layer_id](hidden_state)
 

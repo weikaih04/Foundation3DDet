@@ -21,6 +21,7 @@ from opendet3d.op.detect3d.grounding_dino_3d import (
 from opendet3d.op.detect.grounding_dino import GroundingDINOHead, RoI2Det
 from opendet3d.op.fpp.channel_mapper import ChannelMapper
 from opendet3d.op.detect3d.geometry import GeometryBackendBase, UniDepthHeadBackend
+from opendet3d.op.detect3d.depth_memory_fusion import DepthMemoryFusion
 
 # CUT3R Fusion imports - DISABLED for geometry ablation experiments
 # from opendet3d.model.cut3r_tower import CUT3RTower
@@ -86,6 +87,8 @@ class GroundingDINO3D(GroundingDINO):
         # Geometry Backend (new unified interface)
         geometry_backend: GeometryBackendBase | None = None,
         depth_loss_weight: float = 10.0,
+        # Depth-Memory Fusion (fuses depth latents into encoder memory)
+        depth_memory_fusion: DepthMemoryFusion | None = None,
         # CUT3R Fusion parameters
         cut3r_checkpoint: str | None = None,
         cut3r_freeze: bool = True,
@@ -153,6 +156,9 @@ class GroundingDINO3D(GroundingDINO):
             self.bbox3d_head = GroundingDINO3DHead(use_camera_prompt=use_camera_prompt)
 
         self.roi2det3d = roi2det3d or RoI2Det3D()
+
+        # ========== Depth-Memory Fusion Setup ==========
+        self.depth_memory_fusion = depth_memory_fusion
 
         # ========== CUT3R Fusion Setup ==========
         # DISABLED for geometry ablation experiments
@@ -338,7 +344,7 @@ class GroundingDINO3D(GroundingDINO):
 
     def _freeze_cut3r(self):
         """Freeze CUT3R tower."""
-        if self.cut3r_tower is None:
+        if not hasattr(self, 'cut3r_tower') or self.cut3r_tower is None:
             return
 
         print("[INFO] Freezing CUT3R tower")
@@ -745,6 +751,7 @@ class GroundingDINO3D(GroundingDINO):
         input_hw: list[tuple[int, int]] | None = None,
         ray_embeddings: Tensor | None = None,
         depth_latents: Tensor | None = None,
+        depth_latents_hw: tuple[int, int] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, list[Tensor]]:
         """Forward function for the transformer."""
         text_token_mask = text_dict["text_token_mask"]
@@ -761,6 +768,21 @@ class GroundingDINO3D(GroundingDINO):
             position_ids=text_dict["position_ids"],
             text_self_attention_masks=text_dict["masks"],
         )
+
+        # ========== Depth-Memory Fusion ==========
+        # Fuse depth latents into encoder memory before decoder
+        if (
+            self.depth_memory_fusion is not None
+            and depth_latents is not None
+            and depth_latents_hw is not None
+        ):
+            memory = self.depth_memory_fusion(
+                depth_latents=depth_latents,
+                depth_latents_hw=depth_latents_hw,
+                memory=memory,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+            )
 
         bs = memory.shape[0]
 
@@ -891,7 +913,7 @@ class GroundingDINO3D(GroundingDINO):
         # - Level 3: [B, 768, 25, 41]
 
         # ========== Step 2: CUT3R Fusion ==========
-        if self.cut3r_tower is not None and self.cut3r_fusion is not None:
+        if hasattr(self, 'cut3r_tower') and self.cut3r_tower is not None and hasattr(self, 'cut3r_fusion') and self.cut3r_fusion is not None:
             # Extract CUT3R features
             camera_tokens, patch_tokens = self.cut3r_tower(images)
             # camera_tokens: [B, 1, 768]
@@ -1051,6 +1073,7 @@ class GroundingDINO3D(GroundingDINO):
         # Geometry Backend / Depth Head
         # Run this first to get ray_intrinsics/ray_image_hw/ray_downsample
         geom_losses = {}
+        depth_latents_hw = None  # For depth-memory fusion
         if self.geometry_backend is not None:
             geom_out = self.geometry_backend(
                 images=images,
@@ -1068,6 +1091,11 @@ class GroundingDINO3D(GroundingDINO):
             ray_intrinsics = geom_out["ray_intrinsics"]
             ray_image_hw = geom_out["ray_image_hw"]
             ray_downsample = geom_out["ray_downsample"]
+
+            # Get depth_latents_hw for depth-memory fusion (from aux dict)
+            aux = geom_out.get("aux", {})
+            if aux and "depth_latents_hw" in aux:
+                depth_latents_hw = aux["depth_latents_hw"]
         elif self.depth_head is not None:
             # Fallback to direct depth_head call (backward compat)
             depth_preds, depth_latents = self.depth_head(
@@ -1112,6 +1140,7 @@ class GroundingDINO3D(GroundingDINO):
             input_hw,
             ray_embeddings,
             depth_latents,
+            depth_latents_hw,
         )
 
         all_layers_cls_scores, all_layers_bbox_preds = self.bbox_head(
@@ -1222,6 +1251,7 @@ class GroundingDINO3D(GroundingDINO):
                 )
 
                 # Geometry Backend / Depth Head
+                depth_latents_hw = None  # For depth-memory fusion
                 if self.geometry_backend is not None:
                     geom_out = self.geometry_backend(
                         images=images,
@@ -1236,6 +1266,11 @@ class GroundingDINO3D(GroundingDINO):
                     ray_intrinsics = geom_out["ray_intrinsics"]
                     ray_image_hw = geom_out["ray_image_hw"]
                     ray_downsample = geom_out["ray_downsample"]
+
+                    # Get depth_latents_hw for depth-memory fusion (from aux dict)
+                    aux = geom_out.get("aux", {})
+                    if aux and "depth_latents_hw" in aux:
+                        depth_latents_hw = aux["depth_latents_hw"]
                 elif self.depth_head is not None:
                     depth_preds, depth_latents = self.depth_head(
                         depth_feats, intrinsics, batch_input_shape
@@ -1292,6 +1327,7 @@ class GroundingDINO3D(GroundingDINO):
                     text_dict,
                     ray_embeddings=ray_embeddings,
                     depth_latents=depth_latents,
+                    depth_latents_hw=depth_latents_hw,
                 )
 
                 all_layers_cls_scores, all_layers_bbox_preds = self.bbox_head(
@@ -1360,6 +1396,7 @@ class GroundingDINO3D(GroundingDINO):
 
             # Geometry Backend / Depth Head
             # Run this first to get ray_intrinsics/ray_image_hw/ray_downsample
+            depth_latents_hw = None  # For depth-memory fusion
             if self.geometry_backend is not None:
                 geom_out = self.geometry_backend(
                     images=images,
@@ -1374,6 +1411,11 @@ class GroundingDINO3D(GroundingDINO):
                 ray_intrinsics = geom_out["ray_intrinsics"]
                 ray_image_hw = geom_out["ray_image_hw"]
                 ray_downsample = geom_out["ray_downsample"]
+
+                # Get depth_latents_hw for depth-memory fusion (from aux dict)
+                aux = geom_out.get("aux", {})
+                if aux and "depth_latents_hw" in aux:
+                    depth_latents_hw = aux["depth_latents_hw"]
             elif self.depth_head is not None:
                 depth_preds, depth_latents = self.depth_head(
                     depth_feats, intrinsics, batch_input_shape
@@ -1430,6 +1472,7 @@ class GroundingDINO3D(GroundingDINO):
                 text_dict,
                 ray_embeddings=ray_embeddings,
                 depth_latents=depth_latents,
+                depth_latents_hw=depth_latents_hw,
             )
 
             all_layers_cls_scores, all_layers_bbox_preds = self.bbox_head(

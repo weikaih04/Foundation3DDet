@@ -24,6 +24,8 @@ def get_loss_cfg(
     box_coder: ConfigDict,
     aux_depth_loss: bool = False,
     use_geom_backend_loss: bool = False,
+    loss_2d_scale: float = 1.0,
+    loss_3d_scale: float = 1.0,
 ) -> ConfigDict:
     """Returns the loss configuration.
 
@@ -32,8 +34,8 @@ def get_loss_cfg(
         box_coder: Box coder configuration.
         aux_depth_loss: Whether to use auxiliary SILog depth loss (external).
         use_geom_backend_loss: Whether to use geometry backend internal losses.
-            When True, losses from GeometryBackend (DetAny3D, UniDepthV2) are
-            aggregated. When False, only external SILog loss is used.
+        loss_2d_scale: Scale factor for 2D losses (cls, bbox, iou).
+        loss_3d_scale: Scale factor for 3D losses (center, depth, dim, rot).
     """
     # Box 3D loss
     box3d_loss = {
@@ -44,6 +46,8 @@ def get_loss_cfg(
             loss_depth_weight=params.loss_depth_weight,
             loss_dim_weight=params.loss_dim_weight,
             loss_rot_weight=params.loss_rot_weight,
+            loss_2d_scale=loss_2d_scale,
+            loss_3d_scale=loss_3d_scale,
         ),
         "connector": class_config(
             LossConnector, key_mapping=CONN_GDINO3D_LOSS

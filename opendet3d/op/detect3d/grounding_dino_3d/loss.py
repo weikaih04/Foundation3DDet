@@ -30,6 +30,8 @@ class GroundingDINO3DLoss(GroundingDINOLoss):
         loss_depth_weight: float = 1.0,
         loss_dim_weight: float = 1.0,
         loss_rot_weight: float = 1.0,
+        loss_2d_scale: float = 1.0,
+        loss_3d_scale: float = 1.0,
         **kwargs: ArgsType,
     ):
         """Init."""
@@ -42,6 +44,8 @@ class GroundingDINO3DLoss(GroundingDINOLoss):
         self.loss_depth_weight = loss_depth_weight
         self.loss_dim_weight = loss_dim_weight
         self.loss_rot_weight = loss_rot_weight
+        self.loss_2d_scale = loss_2d_scale
+        self.loss_3d_scale = loss_3d_scale
 
     def get_targets_3d(
         self,
@@ -229,7 +233,7 @@ class GroundingDINO3DLoss(GroundingDINOLoss):
             )
         cls_avg_factor = max(cls_avg_factor, 1)
 
-        loss_cls = self.cls_loss_weight * self.loss_cls(
+        loss_cls = self.loss_2d_scale * self.cls_loss_weight * self.loss_cls(
             cls_scores,
             labels,
             reducer=SumWeightedLoss(
@@ -261,8 +265,8 @@ class GroundingDINO3DLoss(GroundingDINOLoss):
         bboxes = bbox_cxcywh_to_xyxy(bbox_preds) * factors
         bboxes_gt = bbox_cxcywh_to_xyxy(bbox_targets) * factors
 
-        # regression L1 loss
-        loss_bbox = self.bbox_loss_weight * self.loss_bbox(
+        # regression L1 loss (2D)
+        loss_bbox = self.loss_2d_scale * self.bbox_loss_weight * self.loss_bbox(
             bbox_preds,
             bbox_targets,
             reducer=SumWeightedLoss(
@@ -270,8 +274,8 @@ class GroundingDINO3DLoss(GroundingDINOLoss):
             ),
         )
 
-        # regression IoU loss, defaultly GIoU loss
-        loss_iou = self.iou_loss_weight * self.loss_iou(
+        # regression IoU loss (2D)
+        loss_iou = self.loss_2d_scale * self.iou_loss_weight * self.loss_iou(
             bboxes,
             bboxes_gt,
             reducer=SumWeightedLoss(
@@ -282,8 +286,8 @@ class GroundingDINO3DLoss(GroundingDINOLoss):
         # 3D Loss
         bbox_3d_preds = bbox_3d_preds.reshape(-1, self.reg_dims)
 
-        # Delta 2D center Loss
-        loss_cen = self.loss_center_weight * l1_loss(
+        # Delta 2D center Loss (3D)
+        loss_cen = self.loss_3d_scale * self.loss_center_weight * l1_loss(
             bbox_3d_preds[:, :2],
             bbox_targets_3d[:, :2],
             reducer=SumWeightedLoss(
@@ -291,8 +295,8 @@ class GroundingDINO3DLoss(GroundingDINOLoss):
             ),
         )
 
-        # Depth Loss
-        loss_depth = self.loss_depth_weight * l1_loss(
+        # Depth Loss (3D)
+        loss_depth = self.loss_3d_scale * self.loss_depth_weight * l1_loss(
             bbox_3d_preds[:, 2],
             bbox_targets_3d[:, 2],
             reducer=SumWeightedLoss(
@@ -300,8 +304,8 @@ class GroundingDINO3DLoss(GroundingDINOLoss):
             ),
         )
 
-        # Dimension Loss
-        loss_dim = self.loss_dim_weight * l1_loss(
+        # Dimension Loss (3D)
+        loss_dim = self.loss_3d_scale * self.loss_dim_weight * l1_loss(
             bbox_3d_preds[:, 3:6],
             bbox_targets_3d[:, 3:6],
             reducer=SumWeightedLoss(
@@ -309,8 +313,8 @@ class GroundingDINO3DLoss(GroundingDINOLoss):
             ),
         )
 
-        # Rotation Loss
-        loss_rot = self.loss_rot_weight * l1_loss(
+        # Rotation Loss (3D)
+        loss_rot = self.loss_3d_scale * self.loss_rot_weight * l1_loss(
             bbox_3d_preds[:, 6:],
             bbox_targets_3d[:, 6:],
             reducer=SumWeightedLoss(
