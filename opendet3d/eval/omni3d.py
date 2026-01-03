@@ -192,7 +192,19 @@ class Omni3DEvaluator(Evaluator):
                 dataset_name
             ].evaluate(metric)
 
-            log_dict[f"AP_{dataset_name}"] = per_dataset_log_dict["AP"]
+            # Get the main metric key (APRel3D/APRel in APRel mode, AP otherwise)
+            # Priority: APRel3D > APRel > AP
+            if "APRel3D" in per_dataset_log_dict:
+                main_metric_key = "APRel3D"
+            elif "APRel" in per_dataset_log_dict:
+                main_metric_key = "APRel"
+            elif "AP" in per_dataset_log_dict:
+                main_metric_key = "AP"
+            else:
+                # Fallback: use the first key that starts with "AP"
+                main_metric_key = next((k for k in per_dataset_log_dict.keys() if k.startswith("AP")), "AP")
+
+            log_dict[f"AP_{dataset_name}"] = per_dataset_log_dict[main_metric_key]
 
             rank_zero_info(dataset_log_str + "\n")
 
