@@ -26,11 +26,8 @@ from vis4d.common.typing import (
     NDArrayF32,
     NDArrayI64,
 )
-from vis4d.data.const import AxisMode
 from vis4d.eval.base import Evaluator
 from vis4d.eval.coco.detect import xyxy_to_xywh
-from vis4d.op.box.box3d import boxes3d_to_corners
-from vis4d.op.geometry.rotation import quaternion_to_matrix
 
 from opendet3d.data.datasets.coco3d import COCO3D
 from opendet3d.op.box.box3d import box3d_overlap
@@ -149,30 +146,21 @@ class Detect3DEvaluator(Evaluator):
                     d * scale for d in pred["dimensions"]
                 ]
 
-            # Regenerate bbox3D from scaled center and dimensions
-            # This ensures vertices remain coplanar after scaling
-            if "bbox3D" in pred and "center_cam" in pred and "dimensions" in pred and "R_cam" in pred:
-                # Use cached quaternion if available
-                if "_quat_cache" not in pred:
-                    from vis4d.op.geometry.rotation import matrix_to_quaternion
-                    R_cam = torch.tensor(pred["R_cam"], dtype=torch.float32).reshape(3, 3)
-                    quat = matrix_to_quaternion(R_cam.unsqueeze(0))[0]
-                    pred["_quat_cache"] = [quat[0].item(), quat[1].item(), quat[2].item(), quat[3].item()]
+            # Scale bbox3D corners relative to their center
+            # This preserves corner ordering and coplanarity
+            if "bbox3D" in pred and "center_cam" in pred:
+                orig_center = pred["center_cam"]
+                new_center = scaled_pred["center_cam"]
 
-                center = scaled_pred["center_cam"]
-                dims = scaled_pred["dimensions"]
-                quat = pred["_quat_cache"]
-
-                boxes3d = torch.tensor(
-                    [[center[0], center[1], center[2],
-                      dims[0], dims[1], dims[2],
-                      quat[0], quat[1], quat[2], quat[3]]],
-                    dtype=torch.float32
-                )
-
-                # Regenerate corners
-                corners = boxes3d_to_corners(boxes3d, AxisMode.OPENCV)
-                scaled_pred["bbox3D"] = corners[0].numpy().tolist()
+                # Scale each corner's offset from center, then translate to new center
+                scaled_corners = []
+                for corner in pred["bbox3D"]:
+                    # offset from original center
+                    offset = [corner[i] - orig_center[i] for i in range(3)]
+                    # scale offset and add to new center
+                    new_corner = [new_center[i] + offset[i] * scale for i in range(3)]
+                    scaled_corners.append(new_corner)
+                scaled_pred["bbox3D"] = scaled_corners
             elif "bbox3D" in pred:
                 # Fallback: scale corners directly (old behavior)
                 scaled_pred["bbox3D"] = [
@@ -201,27 +189,42 @@ class Detect3DEvaluator(Evaluator):
             gts: List of ground truth dictionaries
 
         Returns:
-            Average maximum IoU across predictions
+            Average maximum IoU across predictions (weighted by score)
         """
         if len(preds) == 0 or len(gts) == 0:
             return 0.0
 
+        # Filter to top predictions by score to avoid noise from low-confidence detections
+        # This is important because AP evaluation primarily considers high-score predictions
+        preds_sorted = sorted(preds, key=lambda x: x.get("score", 0), reverse=True)
+        # Keep top-k predictions, where k = min(num_gts * 3, num_preds)
+        # This ensures we focus on the most relevant predictions
+        max_preds = min(len(gts) * 3, len(preds))
+        preds_filtered = preds_sorted[:max_preds] if max_preds > 0 else preds_sorted
+
         # Extract bbox3D
         pred_boxes = torch.tensor(
-            [p["bbox3D"] for p in preds], dtype=torch.float32
+            [p["bbox3D"] for p in preds_filtered], dtype=torch.float32
         )
         gt_boxes = torch.tensor(
             [g["bbox3D"] for g in gts], dtype=torch.float32
         )
 
         # Compute 3D IoU matrix [N_pred, N_gt]
+        # box3d_overlap from opendet3d.op.box.box3d returns only IoU tensor
         ious = box3d_overlap(pred_boxes, gt_boxes)
 
         # For each pred, take max IoU
         max_ious = ious.max(dim=1)[0]
 
-        # Average
-        avg_iou = max_ious.mean().item()
+        # Score-weighted average to prioritize high-confidence predictions
+        scores = torch.tensor(
+            [p.get("score", 1.0) for p in preds_filtered], dtype=torch.float32
+        )
+        if scores.sum() > 0:
+            avg_iou = (max_ious * scores).sum().item() / scores.sum().item()
+        else:
+            avg_iou = max_ious.mean().item()
 
         return avg_iou
 
@@ -348,30 +351,22 @@ class Detect3DEvaluator(Evaluator):
                     d * scale for d in pred["dimensions"]
                 ]
 
-            # Regenerate bbox3D from scaled center and dimensions
-            # This ensures vertices remain coplanar after scaling
-            if "bbox3D" in pred and "center_cam" in pred and "dimensions" in pred and "R_cam" in pred:
-                # Use cached quaternion if available
-                if "_quat_cache" not in pred:
-                    from vis4d.op.geometry.rotation import matrix_to_quaternion
-                    R_cam = torch.tensor(pred["R_cam"], dtype=torch.float32).reshape(3, 3)
-                    quat = matrix_to_quaternion(R_cam.unsqueeze(0))[0]
-                    pred["_quat_cache"] = [quat[0].item(), quat[1].item(), quat[2].item(), quat[3].item()]
+            # Scale bbox3D corners relative to their center
+            # This preserves corner ordering and coplanarity
+            # Must match the method used in _scale_predictions for consistency
+            if "bbox3D" in pred and "center_cam" in pred:
+                orig_center = pred["center_cam"]
+                new_center = scaled_pred["center_cam"]
 
-                center = scaled_pred["center_cam"]
-                dims = scaled_pred["dimensions"]
-                quat = pred["_quat_cache"]
-
-                boxes3d = torch.tensor(
-                    [[center[0], center[1], center[2],
-                      dims[0], dims[1], dims[2],
-                      quat[0], quat[1], quat[2], quat[3]]],
-                    dtype=torch.float32
-                )
-
-                # Regenerate corners
-                corners = boxes3d_to_corners(boxes3d, AxisMode.OPENCV)
-                scaled_pred["bbox3D"] = corners[0].numpy().tolist()
+                # Scale each corner's offset from center, then translate to new center
+                scaled_corners = []
+                for corner in pred["bbox3D"]:
+                    # offset from original center
+                    offset = [corner[i] - orig_center[i] for i in range(3)]
+                    # scale offset and add to new center
+                    new_corner = [new_center[i] + offset[i] * scale for i in range(3)]
+                    scaled_corners.append(new_corner)
+                scaled_pred["bbox3D"] = scaled_corners
                 regenerated_count += 1
             elif "bbox3D" in pred:
                 # Fallback: scale corners directly (old behavior)
@@ -563,13 +558,11 @@ class Detect3DEvaluator(Evaluator):
 
                 score_dict = dict(zip(metrics, evaluator.stats))
 
-                # Compute mATE, mASE, mAOE for bbox mode (same as dist mode)
-                trans_tp_errors = evaluator.eval["trans_tp_errors"]
+                # Compute mASE, mAOE for bbox mode
+                # Note: ATE is not returned in bbox mode because the normalization
+                # by IoU threshold makes it unreliable (can be > 1)
                 rot_tp_errors = evaluator.eval["rot_tp_errors"]
                 scale_tp_errors = evaluator.eval["scale_tp_errors"]
-
-                trans_tp = trans_tp_errors[:, :, :, 0, -1]
-                trans_tp = trans_tp[trans_tp > -1]
 
                 rot_tp = rot_tp_errors[:, :, :, 0, -1]
                 rot_tp = rot_tp[rot_tp > -1]
@@ -577,22 +570,18 @@ class Detect3DEvaluator(Evaluator):
                 scale_tp = scale_tp_errors[:, :, :, 0, -1]
                 scale_tp = scale_tp[scale_tp > -1]
 
-                if trans_tp.size:
-                    mATE = np.mean(trans_tp).item()
+                if rot_tp.size:
                     mAOE = np.mean(rot_tp).item()
                     mASE = np.mean(scale_tp).item()
                 else:
-                    mATE = float("nan")
                     mAOE = float("nan")
                     mASE = float("nan")
 
-                # Add error metrics to output
+                # Add error metrics to output (no ATE in bbox mode)
                 if self.enable_aprel3d:
-                    score_dict["ATERel"] = mATE
                     score_dict["ASERel"] = mASE
                     score_dict["AOERel"] = mAOE
                 else:
-                    score_dict["ATE"] = mATE
                     score_dict["ASE"] = mASE
                     score_dict["AOE"] = mAOE
 

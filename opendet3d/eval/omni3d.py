@@ -90,12 +90,18 @@ class Omni3DEvaluator(Evaluator):
             "Objectron_test",
         ),
         per_class_eval: bool = True,
+        # APRel3D parameters
+        enable_aprel3d: bool = False,
+        scale_search_min: float | None = None,
+        scale_search_max: float | None = None,
+        scale_search_steps: int | None = None,
     ) -> None:
         """Initialize the evaluator."""
         super().__init__()
         self.id_to_name = {v: k for k, v in omni3d_class_map.items()}
         self.dataset_names = datasets
         self.per_class_eval = per_class_eval
+        self.enable_aprel3d = enable_aprel3d
 
         # Each dataset evaluator is stored here
         self.evaluators: dict[str, Detect3DEvaluator] = {}
@@ -126,6 +132,10 @@ class Omni3DEvaluator(Evaluator):
                 eval_prox=(
                     "Objectron" in dataset_name or "SUNRGBD" in dataset_name
                 ),
+                enable_aprel3d=enable_aprel3d,
+                scale_search_min=scale_search_min,
+                scale_search_max=scale_search_max,
+                scale_search_steps=scale_search_steps,
             )
 
             self.overall_imgIds.update(
@@ -185,12 +195,15 @@ class Omni3DEvaluator(Evaluator):
         assert metric in self.metrics, f"Unsupported metric: {metric}"
 
         log_dict = {}
+        per_dataset_results = {}  # Store results for later aggregation
 
         for dataset_name in self.dataset_names:
             rank_zero_info(f"Evaluating {dataset_name}...")
             per_dataset_log_dict, dataset_log_str = self.evaluators[
                 dataset_name
             ].evaluate(metric)
+
+            per_dataset_results[dataset_name] = per_dataset_log_dict
 
             # Get the main metric key (APRel3D/APRel in APRel mode, AP otherwise)
             # Priority: APRel3D > APRel > AP
@@ -239,7 +252,10 @@ class Omni3DEvaluator(Evaluator):
             metrics = ["AP", "AP50", "AP75", "AP95", "APs", "APm", "APl"]
         else:
             evaluator.evals_per_cat_area = self.evals_per_cat_area3D
-            metrics = ["AP", "AP15", "AP25", "AP50", "APn", "APm", "APf"]
+            if self.enable_aprel3d:
+                metrics = ["APRel3D", "APRel15", "APRel25", "APRel50", "APReln", "APRelm", "APRelf"]
+            else:
+                metrics = ["AP", "AP15", "AP25", "AP50", "APn", "APm", "APf"]
 
         evaluator._paramsEval = copy.deepcopy(evaluator.params)
 
@@ -248,6 +264,30 @@ class Omni3DEvaluator(Evaluator):
             log_str = "\n" + evaluator.summarize()
 
         log_dict.update(dict(zip(metrics, evaluator.stats)))
+
+        # Add error metrics (aggregate from all datasets)
+        # Note: In bbox mode, only ASE and AOE are returned (no ATE)
+        # In dist mode, ATE, ASE, and AOE are all returned
+        if metric == "3D":
+            # Collect error metrics from all datasets
+            all_ase = []
+            all_aoe = []
+
+            # Determine which keys to look for based on mode
+            if self.enable_aprel3d:
+                ase_key, aoe_key = "ASERel", "AOERel"
+            else:
+                ase_key, aoe_key = "ASE", "AOE"
+
+            for dataset_name in self.dataset_names:
+                per_dataset_log_dict = per_dataset_results[dataset_name]
+                if ase_key in per_dataset_log_dict and not np.isnan(per_dataset_log_dict[ase_key]):
+                    all_ase.append(per_dataset_log_dict[ase_key])
+                if aoe_key in per_dataset_log_dict and not np.isnan(per_dataset_log_dict[aoe_key]):
+                    all_aoe.append(per_dataset_log_dict[aoe_key])
+
+            log_dict[ase_key] = np.mean(all_ase) if len(all_ase) > 0 else float("nan")
+            log_dict[aoe_key] = np.mean(all_aoe) if len(all_aoe) > 0 else float("nan")
 
         if self.per_class_eval:
             precisions = evaluator.eval["precision"]
