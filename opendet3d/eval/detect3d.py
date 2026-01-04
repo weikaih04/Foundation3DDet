@@ -53,6 +53,7 @@ class Detect3DEvaluator(Evaluator):
         scale_search_min: float = 0.1,
         scale_search_max: float = 10.0,
         scale_search_steps: int = 100,
+        scale_optimize_method: str = "A",  # "A" = score-weighted, "B" = match-first
     ) -> None:
         """Create an instance of the class."""
         if id2name is None:
@@ -72,6 +73,7 @@ class Detect3DEvaluator(Evaluator):
         self.scale_search_min = scale_search_min
         self.scale_search_max = scale_search_max
         self.scale_search_steps = scale_search_steps
+        self.scale_optimize_method = scale_optimize_method
 
         self.tp_errors = ["ATE", "AOE", "ASE"]
 
@@ -258,6 +260,81 @@ class Detect3DEvaluator(Evaluator):
 
         return avg_distance
 
+    def _match_predictions(
+        self, preds: list[DictStrAny], gts: list[DictStrAny], iou_thresh: float = 0.05
+    ) -> list[tuple[int, int]]:
+        """Match predictions to GTs using greedy matching by score.
+
+        Args:
+            preds: List of prediction dictionaries
+            gts: List of ground truth dictionaries
+            iou_thresh: Minimum IoU threshold for matching
+
+        Returns:
+            List of (pred_idx, gt_idx) tuples for matched pairs
+        """
+        if len(preds) == 0 or len(gts) == 0:
+            return []
+
+        # Sort by score (descending)
+        sorted_indices = sorted(
+            range(len(preds)), key=lambda i: preds[i].get("score", 0), reverse=True
+        )
+
+        # Compute IoU matrix
+        pred_boxes = torch.tensor([p["bbox3D"] for p in preds], dtype=torch.float32)
+        gt_boxes = torch.tensor([g["bbox3D"] for g in gts], dtype=torch.float32)
+        ious = box3d_overlap(pred_boxes, gt_boxes)
+
+        gt_matched = [False] * len(gts)
+        matches = []
+
+        for pred_idx in sorted_indices:
+            best_iou = iou_thresh
+            best_gt = -1
+            for gt_idx in range(len(gts)):
+                if gt_matched[gt_idx]:
+                    continue
+                # Check category match
+                if preds[pred_idx].get("category_id") != gts[gt_idx].get("category_id"):
+                    continue
+                if ious[pred_idx, gt_idx] > best_iou:
+                    best_iou = ious[pred_idx, gt_idx].item()
+                    best_gt = gt_idx
+
+            if best_gt >= 0:
+                matches.append((pred_idx, best_gt))
+                gt_matched[best_gt] = True
+
+        return matches
+
+    def _compute_matched_iou(
+        self, preds: list[DictStrAny], gts: list[DictStrAny], matches: list[tuple[int, int]]
+    ) -> float:
+        """Compute average IoU for matched pairs only.
+
+        Args:
+            preds: List of prediction dictionaries
+            gts: List of ground truth dictionaries
+            matches: List of (pred_idx, gt_idx) tuples
+
+        Returns:
+            Average IoU of matched pairs
+        """
+        if len(matches) == 0:
+            return 0.0
+
+        matched_preds = [preds[m[0]] for m in matches]
+        matched_gts = [gts[m[1]] for m in matches]
+
+        pred_boxes = torch.tensor([p["bbox3D"] for p in matched_preds], dtype=torch.float32)
+        gt_boxes = torch.tensor([g["bbox3D"] for g in matched_gts], dtype=torch.float32)
+        ious = box3d_overlap(pred_boxes, gt_boxes)
+
+        # Take diagonal (1-1 matching)
+        matched_ious = torch.diag(ious)
+        return matched_ious.mean().item()
+
     def _find_optimal_scale(
         self, preds: list[DictStrAny], gts: list[DictStrAny]
     ) -> float:
@@ -278,8 +355,28 @@ class Detect3DEvaluator(Evaluator):
 
         best_scale = 1.0
 
-        if self.iou_type == "bbox":
-            # bbox mode: maximize 3D IoU
+        if self.scale_optimize_method == "B":
+            # Method B: Match first, then optimize scale on matched pairs only
+            matches = self._match_predictions(preds, gts, iou_thresh=0.05)
+            if len(matches) == 0:
+                return 1.0
+
+            matched_preds = [preds[m[0]] for m in matches]
+            matched_gts = [gts[m[1]] for m in matches]
+
+            best_metric = -np.inf
+            for s in scales:
+                scaled_preds = self._scale_predictions(matched_preds, s)
+                avg_iou = self._compute_matched_iou(
+                    scaled_preds, matched_gts,
+                    [(i, i) for i in range(len(matches))]  # 1-1 mapping
+                )
+                if avg_iou > best_metric:
+                    best_metric = avg_iou
+                    best_scale = s
+
+        elif self.iou_type == "bbox":
+            # Method A (default): bbox mode, maximize 3D IoU with score-weighting
             best_metric = -np.inf
 
             for s in scales:

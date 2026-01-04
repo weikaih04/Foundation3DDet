@@ -95,6 +95,7 @@ class Omni3DEvaluator(Evaluator):
         scale_search_min: float | None = None,
         scale_search_max: float | None = None,
         scale_search_steps: int | None = None,
+        scale_optimize_method: str = "A",  # "A" = score-weighted, "B" = match-first
     ) -> None:
         """Initialize the evaluator."""
         super().__init__()
@@ -102,6 +103,7 @@ class Omni3DEvaluator(Evaluator):
         self.dataset_names = datasets
         self.per_class_eval = per_class_eval
         self.enable_aprel3d = enable_aprel3d
+        self.scale_optimize_method = scale_optimize_method
 
         # Each dataset evaluator is stored here
         self.evaluators: dict[str, Detect3DEvaluator] = {}
@@ -136,6 +138,7 @@ class Omni3DEvaluator(Evaluator):
                 scale_search_min=scale_search_min,
                 scale_search_max=scale_search_max,
                 scale_search_steps=scale_search_steps,
+                scale_optimize_method=scale_optimize_method,
             )
 
             self.overall_imgIds.update(
