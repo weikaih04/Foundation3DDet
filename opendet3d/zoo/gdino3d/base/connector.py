@@ -55,6 +55,22 @@ CONN_OMNI3D_DET3D_EVAL = {
     "dataset_names": data_key("dataset_name"),
 }
 
+CONN_POSTPROCESS_CACHE_EXPORT = {
+    # Identifiers
+    "coco_image_id": data_key(K.sample_names),
+    "dataset_names": data_key("dataset_name"),
+    # Raw detections (in original image space for boxes, model space for boxes3d)
+    "pred_boxes": pred_key("boxes"),
+    "pred_scores": pred_key("scores"),
+    "pred_classes": pred_key("class_ids"),
+    "pred_boxes3d": pred_key("boxes3d"),
+    "pred_categories": pred_key("categories"),
+    # Geometry needed for depth-based post-processing
+    "depth_maps": pred_key("depth_maps"),
+    "intrinsics": data_key("original_intrinsics"),
+    "original_hw": data_key(K.original_hw),
+}
+
 CONN_BBOX_3D_VIS = {
     "images": data_key(K.original_images),
     "image_names": data_key(K.sample_names),

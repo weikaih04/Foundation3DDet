@@ -57,9 +57,13 @@ class DepthMemoryFusion(nn.Module):
         # Each level has its own conv to allow level-specific learning
         self.depth_projs = nn.ModuleList()
 
-        # LayerNorm for add/zero_add fusion to stabilize training
+        # LayerNorm for add fusion to stabilize training
         # This normalizes depth_proj output to match memory feature distribution
-        self.depth_norms = nn.ModuleList() if fusion_type in ["add", "zero_add"] else None
+        # NOTE: zero_add should NOT use LayerNorm because:
+        #   - Zero-initialized weights produce near-zero outputs
+        #   - LayerNorm normalizes near-zero inputs to normal scale (mean=0, std=1)
+        #   - This creates noise that disrupts pretrained memory features
+        self.depth_norms = nn.ModuleList() if fusion_type == "add" else None
 
         if fusion_type == "concat":
             # Concat: depth + memory -> memory_dim

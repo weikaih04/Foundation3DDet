@@ -96,14 +96,30 @@ class Omni3DEvaluator(Evaluator):
         scale_search_max: float | None = None,
         scale_search_steps: int | None = None,
         scale_optimize_method: str = "A",  # "A" = score-weighted, "B" = match-first
+        # Mini dataset support
+        use_mini_dataset: bool = False,
     ) -> None:
-        """Initialize the evaluator."""
+        """Initialize the evaluator.
+
+        Args:
+            data_root: Root directory for Omni3D data.
+            omni3d50: Whether to use Omni3D-50 class mapping.
+            datasets: List of dataset names to evaluate.
+            per_class_eval: Whether to evaluate per-class metrics.
+            enable_aprel3d: Whether to enable APRel3D evaluation.
+            scale_search_min: Minimum scale for APRel3D search.
+            scale_search_max: Maximum scale for APRel3D search.
+            scale_search_steps: Number of scale steps for APRel3D search.
+            scale_optimize_method: Scale optimization method ("A" or "B").
+            use_mini_dataset: If True, use annotations_mini100/ for GT.
+        """
         super().__init__()
         self.id_to_name = {v: k for k, v in omni3d_class_map.items()}
         self.dataset_names = datasets
         self.per_class_eval = per_class_eval
         self.enable_aprel3d = enable_aprel3d
         self.scale_optimize_method = scale_optimize_method
+        self.use_mini_dataset = use_mini_dataset
 
         # Each dataset evaluator is stored here
         self.evaluators: dict[str, Detect3DEvaluator] = {}
@@ -117,9 +133,15 @@ class Omni3DEvaluator(Evaluator):
         self.overall_imgIds = set()
         self.overall_catIds = set()
 
+        # Determine annotation directory based on mini dataset flag
+        if use_mini_dataset:
+            annotation_dir = os.path.join(data_root, "annotations_mini100")
+        else:
+            annotation_dir = os.path.join(data_root, "annotations")
+
         for dataset_name in self.dataset_names:
             annotation = os.path.join(
-                data_root, "annotations", f"{dataset_name}.json"
+                annotation_dir, f"{dataset_name}.json"
             )
 
             det_map = get_dataset_det_map(

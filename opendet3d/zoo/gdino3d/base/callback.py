@@ -14,6 +14,10 @@ from vis4d.vis.image.canvas import PillowCanvasBackend
 from vis4d.zoo.base import get_default_callbacks_cfg
 
 from opendet3d.data.datasets.argoverse import av2_class_map, av2_det_map
+from opendet3d.data.datasets.labelany3d_coco import (
+    labelany3d_coco_class_map,
+    labelany3d_coco_det_map,
+)
 from opendet3d.data.datasets.scannet import (
     scannet200_class_map,
     scannet200_det_map,
@@ -23,12 +27,14 @@ from opendet3d.data.datasets.scannet import (
 from opendet3d.eval.detect3d import Detect3DEvaluator
 from opendet3d.eval.omni3d import Omni3DEvaluator
 from opendet3d.eval.open import OpenDetect3DEvaluator
+from opendet3d.eval.postprocess_cache_export import PostprocessCacheExporter
 from opendet3d.vis.image.depth_visualizer import DepthVisualizer
 from opendet3d.zoo.gdino3d.base.connector import (
     CONN_BBOX_3D_VIS,
     CONN_COCO_DET3D_EVAL,
     CONN_DEPTH_VIS,
     CONN_OMNI3D_DET3D_EVAL,
+    CONN_POSTPROCESS_CACHE_EXPORT,
 )
 
 
@@ -37,6 +43,8 @@ def get_callback_cfg(
     open_test_datasets: list[str] | None,
     omni3d_evaluator: ConfigDict | None = None,
     visualize_depth: bool = True,
+    export_postprocess_cache: bool = False,
+    postprocess_cache_root: str | None = None,
 ) -> list[ConfigDict]:
     """Get callbacks for 3D-MOOD."""
     # Logger
@@ -68,6 +76,8 @@ def get_callback_cfg(
                 evaluators.append(get_av2_evaluator_cfg())
             elif dataset == "ScanNet_val":
                 evaluators.append(get_scannet_evaluator_cfg())
+            elif dataset == "LabelAny3D_COCO_val":
+                evaluators.append(get_labelany3d_coco_evaluator_cfg())
             else:
                 raise ValueError(
                     f"Unknown dataset {dataset} for open evaluation."
@@ -114,6 +124,38 @@ def get_callback_cfg(
         )
     )
 
+    # Optional: export per-image cache for depth-based post-processing
+    if export_postprocess_cache:
+        # output_dir may be a FieldReference; resolve it to avoid creating
+        # directories like "<FieldReference object at ...>/postprocess_cache".
+        resolved_output_dir = (
+            output_dir.get() if hasattr(output_dir, "get") else str(output_dir)
+        )
+        cache_root = (
+            postprocess_cache_root
+            if postprocess_cache_root is not None
+            else os.path.join(str(resolved_output_dir), "postprocess_cache")
+        )
+        callbacks.append(
+            class_config(
+                EvaluatorCallback,
+                evaluator=class_config(
+                    PostprocessCacheExporter,
+                    cache_root=cache_root,
+                    compress=True,
+                    overwrite=False,
+                    depth_dtype="float32",
+                ),
+                metrics_to_eval=[],
+                save_predictions=False,
+                output_dir=output_dir,
+                save_prefix="postprocess_cache",
+                test_connector=class_config(
+                    CallbackConnector, key_mapping=CONN_POSTPROCESS_CACHE_EXPORT
+                ),
+            )
+        )
+
     return callbacks
 
 
@@ -121,13 +163,22 @@ def get_omni3d_evaluator_cfg(
     data_root: str,
     omni3d50: bool,
     test_datasets: list[str],
+    use_mini_dataset: bool = False,
 ) -> ConfigDict:
-    """Get Omni3D evaluator config."""
+    """Get Omni3D evaluator config.
+
+    Args:
+        data_root: Root directory for Omni3D data.
+        omni3d50: Whether to use Omni3D-50 class mapping.
+        test_datasets: List of test dataset names.
+        use_mini_dataset: If True, use mini100 annotations for evaluation.
+    """
     return class_config(
         Omni3DEvaluator,
         data_root=data_root,
         omni3d50=omni3d50,
         datasets=test_datasets,
+        use_mini_dataset=use_mini_dataset,
     )
 
 
@@ -195,6 +246,60 @@ def get_scannet_evaluator_cfg(
         iou_type="dist",
         num_columns=2,
         annotation=annotation,
+        base_classes=base_classes,
+    )
+
+
+def get_labelany3d_coco_evaluator_cfg(
+    data_root: str = "data/labelany3d_coco",
+) -> ConfigDict:
+    """Get LabelAny3D COCO evaluator config.
+
+    This evaluator is configured for the LabelAny3D COCO dataset which contains
+    COCO val2017 images with 3D bounding box annotations. Uses 3D IoU-based
+    evaluation metrics.
+
+    Args:
+        data_root: Root directory for the LabelAny3D COCO data.
+
+    Returns:
+        ConfigDict: Evaluator configuration.
+    """
+    # Select a subset of commonly-annotated COCO categories as base classes
+    # These are categories that typically have reliable 3D annotations
+    base_classes = [
+        "person",
+        "car",
+        "truck",
+        "bus",
+        "motorcycle",
+        "bicycle",
+        "chair",
+        "couch",
+        "bed",
+        "dining table",
+        "toilet",
+        "tv",
+        "laptop",
+        "refrigerator",
+        "oven",
+        "sink",
+        "bottle",
+        "cup",
+        "bowl",
+        "potted plant",
+    ]
+
+    return class_config(
+        Detect3DEvaluator,
+        det_map=labelany3d_coco_det_map,
+        cat_map=labelany3d_coco_class_map,
+        eval_prox=False,  # Not a proximity-based dataset
+        iou_type="bbox",  # Use 3D bounding box IoU
+        num_columns=4,  # Display 4 columns in results table (80 categories)
+        annotation=os.path.join(
+            data_root, "annotations/LabelAny3D_COCO_val.json"
+        ),
         base_classes=base_classes,
     )
 

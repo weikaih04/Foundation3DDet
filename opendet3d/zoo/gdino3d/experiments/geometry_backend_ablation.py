@@ -46,8 +46,14 @@ from opendet3d.zoo.gdino3d.base.dataset.omni3d import (
 )
 from opendet3d.zoo.gdino3d.base.dataset.open import (
     get_av2_data_cfg,
+    get_labelany3d_coco_data_cfg,
     get_scannet_data_cfg,
 )
+
+# Literal type for eval benchmark selection
+from typing import Literal
+
+EvalBenchmark = Literal["omni3d", "labelany3d_coco"]
 from opendet3d.zoo.gdino3d.base.loss import get_loss_cfg
 from opendet3d.zoo.gdino3d.base.model import (
     get_gdino3d_hyperparams_cfg,
@@ -87,6 +93,11 @@ def _build_geometry_backend_experiment(
     loss_3d_scale: float = 1.0,
     # Custom param groups (for freeze training)
     custom_param_groups: list[dict] | None = None,
+    # Postprocess cache export (test-time)
+    export_postprocess_cache: bool = False,
+    postprocess_cache_root: str | None = None,
+    # Evaluation benchmark selection
+    eval_benchmark: EvalBenchmark = "omni3d",
 ) -> ExperimentConfig:
     """Build experiment config for geometry backend ablation.
 
@@ -149,7 +160,7 @@ def _build_geometry_backend_experiment(
 
     test_datasets_cfg = []
 
-    # Omni3D
+    # Omni3D configuration (used for training and optionally for testing)
     omni3d_data_root = "data/omni3d"
     omni3d_test_datasets = (
         "KITTI_test",
@@ -167,21 +178,32 @@ def _build_geometry_backend_experiment(
         mini_dataset_size=mini_dataset_size,
     )
 
-    omni3d_test_data_cfg = get_omni3d_test_cfg(
-        data_root=omni3d_data_root,
-        test_datasets=omni3d_test_datasets,
-        data_backend=data_backend,
-        use_mini_dataset=use_mini_dataset,
-        mini_dataset_size=mini_dataset_size,
-    )
+    # Test datasets depend on eval_benchmark
+    if eval_benchmark == "labelany3d_coco":
+        # LabelAny3D COCO benchmark: only evaluate on COCO val2017 with 3D annotations
+        # Use None for data_backend since COCO images are regular jpg files, not HDF5
+        test_datasets_cfg = [
+            get_labelany3d_coco_data_cfg(data_backend=None),
+        ]
+    else:
+        # Default: Omni3D benchmark + open datasets (Argoverse, ScanNet)
+        omni3d_test_data_cfg = get_omni3d_test_cfg(
+            data_root=omni3d_data_root,
+            test_datasets=omni3d_test_datasets,
+            data_backend=data_backend,
+            use_mini_dataset=use_mini_dataset,
+            mini_dataset_size=mini_dataset_size,
+        )
+        test_datasets_cfg.append(omni3d_test_data_cfg)
 
-    test_datasets_cfg.append(omni3d_test_data_cfg)
-
-    # Open Datasets
-    test_datasets_cfg += [
-        get_av2_data_cfg(data_backend=data_backend),
-        get_scannet_data_cfg(data_backend=data_backend),
-    ]
+        # Open Datasets
+        # In mini mode we intentionally disable open-dataset evaluation to keep
+        # test size consistent with the mini train/test intent (fast debug).
+        if not use_mini_dataset:
+            test_datasets_cfg += [
+                get_av2_data_cfg(data_backend=data_backend),
+                get_scannet_data_cfg(data_backend=data_backend),
+            ]
 
     config.data = get_data_cfg(
         train_datasets=omni3d_train_data_cfg,
@@ -297,19 +319,32 @@ def _build_geometry_backend_experiment(
     ######################################################
     ##                     CALLBACKS                    ##
     ######################################################
-    omni3d_evaluator_cfg = get_omni3d_evaluator_cfg(
-        data_root=omni3d_data_root,
-        omni3d50=True,
-        test_datasets=omni3d_test_datasets,
-    )
+    if eval_benchmark == "labelany3d_coco":
+        # LabelAny3D COCO benchmark: use open evaluation with LabelAny3D_COCO_val
+        callbacks = get_callback_cfg(
+            output_dir=config.output_dir,
+            omni3d_evaluator=None,
+            open_test_datasets=["LabelAny3D_COCO_val"],
+            export_postprocess_cache=export_postprocess_cache,
+            postprocess_cache_root=postprocess_cache_root,
+        )
+    else:
+        # Default: Omni3D benchmark + open datasets
+        omni3d_evaluator_cfg = get_omni3d_evaluator_cfg(
+            data_root=omni3d_data_root,
+            omni3d50=True,
+            test_datasets=omni3d_test_datasets,
+            use_mini_dataset=use_mini_dataset,
+        )
+        open_test_datasets = [] if use_mini_dataset else ["Argoverse_val", "ScanNet_val"]
 
-    open_test_datasets = ["Argoverse_val", "ScanNet_val"]
-
-    callbacks = get_callback_cfg(
-        output_dir=config.output_dir,
-        omni3d_evaluator=omni3d_evaluator_cfg,
-        open_test_datasets=open_test_datasets,
-    )
+        callbacks = get_callback_cfg(
+            output_dir=config.output_dir,
+            omni3d_evaluator=omni3d_evaluator_cfg,
+            open_test_datasets=open_test_datasets,
+            export_postprocess_cache=export_postprocess_cache,
+            postprocess_cache_root=postprocess_cache_root,
+        )
 
     config.callbacks = callbacks
 
@@ -675,6 +710,10 @@ def get_config(config_name: str = "detany3d", *args, **kwargs) -> ExperimentConf
         "unidepth_v2_fusion_only": get_unidepth_v2_fusion_only_config,
         "unidepth_v2_head_only": get_unidepth_v2_head_only_config,
         "unidepth_v2_fusion_freeze": get_unidepth_v2_fusion_freeze_config,
+        # LabelAny3D COCO evaluation configs
+        "labelany3d_coco_baseline": get_labelany3d_coco_baseline_config,
+        "labelany3d_coco_fusion_concat": get_labelany3d_coco_fusion_concat_config,
+        "labelany3d_coco_fusion_add": get_labelany3d_coco_fusion_add_config,
     }
 
     if config_name not in config_map:
@@ -684,4 +723,78 @@ def get_config(config_name: str = "detany3d", *args, **kwargs) -> ExperimentConf
         )
 
     return config_map[config_name](*args, **kwargs)
+
+
+# ============================================================================
+# LabelAny3D COCO Evaluation Configurations
+# ============================================================================
+
+
+def get_labelany3d_coco_baseline_config(*args, **kwargs) -> ExperimentConfig:
+    """Baseline (original 3D-MOOD) evaluated on LabelAny3D COCO.
+
+    This is the original 3D-MOOD baseline (Swin-T + FPN + UniDepthHead) without
+    depth-memory fusion, evaluated on COCO val2017 with 3D annotations from LabelAny3D.
+
+    This matches the checkpoint: checkpoints/gdino3d_swin-t_120e_omni3d_699f69.pt
+
+    Usage:
+        vis4d test --config .../geometry_backend_ablation.py:labelany3d_coco_baseline \\
+            --ckpt checkpoints/gdino3d_swin-t_120e_omni3d_699f69.pt
+    """
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_labelany3d-coco_baseline",
+        geometry_backend_type="unidepth_head",  # Original 3D-MOOD: Swin + FPN + UniDepthHead
+        use_geom_backend_loss=False,  # Use external SILog loss
+        eval_benchmark="labelany3d_coco",
+    )
+
+
+def get_labelany3d_coco_fusion_concat_config(*args, **kwargs) -> ExperimentConfig:
+    """UniDepthV2 with concat fusion evaluated on LabelAny3D COCO.
+
+    This is the fusion-concat model evaluated on COCO val2017 with 3D
+    annotations from LabelAny3D.
+
+    Usage:
+        vis4d test --config .../geometry_backend_ablation.py:labelany3d_coco_fusion_concat \\
+            --ckpt vis4d-workspace/.../last.ckpt
+    """
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_labelany3d-coco_fusion-concat",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="concat",  # Concat fusion
+        eval_benchmark="labelany3d_coco",
+    )
+
+
+def get_labelany3d_coco_fusion_add_config(*args, **kwargs) -> ExperimentConfig:
+    """UniDepthV2 with add fusion (+ LayerNorm) evaluated on LabelAny3D COCO.
+
+    This is the fusion-add model evaluated on COCO val2017 with 3D
+    annotations from LabelAny3D. Note: fusion_add uses LayerNorm for
+    stabilizing training.
+
+    Usage:
+        vis4d test --config .../geometry_backend_ablation.py:labelany3d_coco_fusion_add \\
+            --ckpt vis4d-workspace/.../last.ckpt
+    """
+    return _build_geometry_backend_experiment(
+        exp_name="gdino3d_labelany3d-coco_fusion-add",
+        geometry_backend_type="unidepth_v2",
+        use_geom_backend_loss=True,
+        unidepth_v2_version="v2-vits14",
+        unidepth_v2_encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+        unidepth_v2_decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+        geom_encoder_lr_mult=0.1,
+        geom_decoder_lr_mult=0.1,
+        depth_memory_fusion_type="add",  # Add fusion with LayerNorm
+        eval_benchmark="labelany3d_coco",
+    )
 

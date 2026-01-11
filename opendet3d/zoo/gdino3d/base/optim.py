@@ -59,6 +59,35 @@ def get_optim_cfg(
     return optimizers
 
 
+def get_freeze_encoder_decoder_param_groups() -> list[dict]:
+    """Returns parameter groups that freeze encoder and decoder.
+
+    Only trains:
+    - depth_memory_fusion
+    - bbox3d_head
+    - geometry_backend (depth head)
+
+    Freezes (lr_mult=0.0):
+    - encoder
+    - decoder
+    - backbone
+    - neck
+    - language_model
+    """
+    return [
+        # Freeze these components
+        {"custom_keys": ["encoder"], "lr_mult": 0.0},
+        {"custom_keys": ["decoder"], "lr_mult": 0.0},
+        {"custom_keys": ["backbone"], "lr_mult": 0.0},
+        {"custom_keys": ["neck"], "lr_mult": 0.0},
+        {"custom_keys": ["language_model"], "lr_mult": 0.0},
+        # Train these components (default lr)
+        {"custom_keys": ["depth_memory_fusion"], "lr_mult": 1.0},
+        {"custom_keys": ["bbox3d_head"], "lr_mult": 1.0},
+        {"custom_keys": ["geometry_backend"], "lr_mult": 0.1},  # Lower lr for pretrained depth
+    ]
+
+
 def get_convnext_param_groups(
     language_scale: float = 0.1, backbone_scale: float = 0.1
 ) -> list[dict[str : [list[str], float]]]:

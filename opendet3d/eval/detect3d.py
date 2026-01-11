@@ -29,6 +29,10 @@ from vis4d.common.typing import (
 from vis4d.eval.base import Evaluator
 from vis4d.eval.coco.detect import xyxy_to_xywh
 
+from vis4d.data.const import AxisMode
+from vis4d.op.box.box3d import boxes3d_to_corners
+from vis4d.op.geometry.rotation import quaternion_to_matrix
+
 from opendet3d.data.datasets.coco3d import COCO3D
 from opendet3d.op.box.box3d import box3d_overlap
 from opendet3d.op.geometric.rotation import so3_relative_angle
@@ -1398,15 +1402,31 @@ class Detect3Deval(COCOeval):
                         ) / (dist_thres_bbox + 1e-6)
 
                     # Orientation Error (same for both modes)
-                    oem[tind, dind] = (
-                        so3_relative_angle(
-                            torch.tensor(d["R_cam"])[None],
-                            torch.tensor(gt[m]["R_cam"])[None],
-                            cos_bound=1e-2,
-                            eps=1e-2,
-                        ).item()
-                        / np.pi
-                    )
+                    try:
+                        oem[tind, dind] = (
+                            so3_relative_angle(
+                                torch.tensor(d["R_cam"])[None],
+                                torch.tensor(gt[m]["R_cam"])[None],
+                                cos_bound=1e-2,
+                                eps=1e-3,
+                            ).item()
+                            / np.pi
+                        )
+                    except ValueError as e:
+                        # Skip invalid rotation matrix pairs
+                        # This can happen when GT or prediction has numerical precision issues
+                        import warnings
+                        R_pred = np.array(d["R_cam"])
+                        R_gt = np.array(gt[m]["R_cam"])
+                        R_rel = R_pred @ R_gt.T
+                        warnings.warn(
+                            f"Skipping rotation error for img={imgId}, cat={catId}: {e}\n"
+                            f"  det(R_pred)={np.linalg.det(R_pred):.6f}, "
+                            f"det(R_gt)={np.linalg.det(R_gt):.6f}, "
+                            f"trace(R_rel)={np.trace(R_rel):.6f}"
+                        )
+                        # Set to maximum error (180 degrees = 1.0 in normalized units)
+                        oem[tind, dind] = 1.0
 
                     # Scale Error (same for both modes)
                     min_whl = np.minimum(

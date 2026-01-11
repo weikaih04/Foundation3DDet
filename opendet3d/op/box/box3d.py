@@ -9,7 +9,7 @@ from opendet3d.op.box.iou_box3d import check_coplanar, check_nonzero
 def box3d_overlap(
     boxes_dt: Tensor,
     boxes_gt: Tensor,
-    eps_coplanar: float = 1e-4,
+    eps_coplanar: float = 1e-3,
     eps_nonzero: float = 1e-8,
 ) -> Tensor:
     """

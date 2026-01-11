@@ -121,6 +121,8 @@ def get_unidepth_v2_fusion_zero_add_config(*args, **kwargs) -> ExperimentConfig:
         geom_encoder_lr_mult=0.1,
         geom_decoder_lr_mult=0.1,
         depth_memory_fusion_type="zero_add",
+        # Export per-image cache for postprocess (dataset_name/image_id.npz)
+        export_postprocess_cache=True,
     )
 
 
@@ -138,6 +140,8 @@ def get_unidepth_v2_fusion_add_config(*args, **kwargs) -> ExperimentConfig:
         geom_encoder_lr_mult=0.1,
         geom_decoder_lr_mult=0.1,
         depth_memory_fusion_type="add",
+        # Export per-image cache for postprocess (dataset_name/image_id.npz)
+        export_postprocess_cache=True,
     )
 
 

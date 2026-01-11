@@ -288,7 +288,7 @@ class GroundingDINO3D(GroundingDINO):
         It handles:
         1. Filtering out incompatible keys (e.g., depth_head when using geometry_backend)
         2. Loading checkpoint weights (Swin, BERT, GroundingDINO heads)
-        3. Loading geometry backend pretrained weights (DINOv2, decoder)
+        3. Loading geometry backend pretrained weights (DINOv2, decoder) ONLY if not in checkpoint
         """
         print(f"\n[DEBUG] load_state_dict called")
         print(f"[DEBUG] self.depth_head: {type(self.depth_head) if self.depth_head is not None else None}")
@@ -297,6 +297,10 @@ class GroundingDINO3D(GroundingDINO):
         # Mark that we're loading from checkpoint
         # This is used by the weight loading summary to show correct status
         self._checkpoint_loaded = True
+
+        # Check if checkpoint contains geometry_backend weights (resume training)
+        has_geometry_backend_weights = any('geometry_backend' in k for k in state_dict.keys())
+        print(f"[DEBUG] Checkpoint has geometry_backend weights: {has_geometry_backend_weights}")
 
         # Filter out depth_head keys if we're using a different geometry backend
         # This prevents checkpoint's depth_head/fpn from overwriting our geometry_backend
@@ -321,14 +325,21 @@ class GroundingDINO3D(GroundingDINO):
         # Call parent's load_state_dict to load checkpoint weights
         result = super().load_state_dict(state_dict, strict=False)
 
-        # Load geometry backend pretrained weights if available
+        # Load geometry backend pretrained weights ONLY if checkpoint doesn't have them
+        # This is important: if we're resuming training, we should use the trained weights
+        # from the checkpoint, not overwrite them with pretrained weights!
         print(f"\n[DEBUG] After loading checkpoint:")
         print(f"[DEBUG] geometry_backend type: {type(self.geometry_backend)}")
         print(f"[DEBUG] hasattr load_pretrained_weights: {hasattr(self.geometry_backend, 'load_pretrained_weights')}")
 
-        if hasattr(self.geometry_backend, 'load_pretrained_weights'):
+        if has_geometry_backend_weights:
             print("\n" + "="*80)
-            print("🔧 Loading Geometry Backend Pretrained Weights")
+            print("✅ Using geometry_backend weights from checkpoint (resume training)")
+            print("   NOT loading pretrained weights - using trained weights instead")
+            print("="*80 + "\n")
+        elif hasattr(self.geometry_backend, 'load_pretrained_weights'):
+            print("\n" + "="*80)
+            print("🔧 Loading Geometry Backend Pretrained Weights (first training)")
             print("="*80)
             self.geometry_backend.load_pretrained_weights()
             print("="*80 + "\n")
@@ -336,8 +347,19 @@ class GroundingDINO3D(GroundingDINO):
             print(f"[DEBUG] geometry_backend does not have load_pretrained_weights method")
             print(f"[DEBUG] Available methods: {[m for m in dir(self.geometry_backend) if not m.startswith('_')][:20]}")
 
+        # DEBUG: Check depth_memory_fusion weights after loading
+        if self.depth_memory_fusion is not None:
+            print("\n" + "="*80)
+            print("🔍 DEBUG: Checking depth_memory_fusion weights after loading")
+            print("="*80)
+            for name, param in self.depth_memory_fusion.named_parameters():
+                if 'weight' in name and len(param.shape) == 4:  # Conv weights
+                    is_zero = (param.abs().max().item() < 1e-6)
+                    print(f"  {name}: shape={tuple(param.shape)}, mean={param.mean().item():.6f}, std={param.std().item():.6f}, is_zero={is_zero}")
+            print("="*80 + "\n")
+
         # Print weight loading summary after loading is complete
-        is_resume = getattr(self, '_is_resume_training', False)
+        is_resume = has_geometry_backend_weights
         self._print_weight_loading_summary_after_load(is_resume)
 
         return result
