@@ -83,3 +83,20 @@ lightning_logs/
 xtreme1/point_cloud_lidar.zip
 
 */data
+
+
+checkpoints/
+
+*.md
+*.json
+
+mmdetection_exp/
+
+
+*.npz
+
+*/visualization_scripts
+*/analysis_scripts
+*/test_scripts
+*/augment_chat_history
+*/scripts
