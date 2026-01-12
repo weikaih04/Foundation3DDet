@@ -22,16 +22,22 @@ def get_sam3_3d_hyperparams_cfg(
     workers_per_gpu: int = 4,
     base_lr: float = 1e-4,
     weight_decay: float = 0.0001,
-    
+    accumulate_grad_batches: int = 1,
+    check_val_every_n_epoch: int = 1,
+
+    # Learning rate schedule (for MultiStepLR)
+    step_1: int | None = None,  # If None, defaults to 2/3 of num_epochs
+    step_2: int | None = None,  # If None, defaults to 5/6 of num_epochs
+
     # SAM3 specific
     num_queries: int = 100,
     hidden_dim: int = 256,
     num_decoder_layers: int = 6,
-    
+
     # 3D specific
     depth_scale: float = 100.0,
     depth_output_scales: tuple[int, ...] = (4, 8, 16, 32),
-    
+
     # Freeze settings
     freeze_sam3_backbone: bool = True,
     freeze_geometry_backend_encoder: bool = True,
@@ -56,27 +62,35 @@ def get_sam3_3d_hyperparams_cfg(
         ExperimentParameters with all hyperparameters.
     """
     params = ExperimentParameters()
-    
+
     # Training
     params.num_epochs = num_epochs
     params.samples_per_gpu = samples_per_gpu
     params.workers_per_gpu = workers_per_gpu
     params.base_lr = base_lr
+    params.lr = base_lr  # Alias for get_optim_cfg compatibility
     params.weight_decay = weight_decay
-    
+    params.accumulate_grad_batches = accumulate_grad_batches
+    params.check_val_every_n_epoch = check_val_every_n_epoch
+
+    # Learning rate schedule (for MultiStepLR)
+    # Default to 2/3 and 5/6 of num_epochs if not specified
+    params.step_1 = step_1 if step_1 is not None else int(num_epochs * 2 / 3)
+    params.step_2 = step_2 if step_2 is not None else int(num_epochs * 5 / 6)
+
     # SAM3 specific
     params.num_queries = num_queries
     params.hidden_dim = hidden_dim
     params.num_decoder_layers = num_decoder_layers
-    
+
     # 3D specific
     params.depth_scale = depth_scale
     params.depth_output_scales = depth_output_scales
-    
+
     # Freeze settings
     params.freeze_sam3_backbone = freeze_sam3_backbone
     params.freeze_geometry_backend_encoder = freeze_geometry_backend_encoder
-    
+
     return params
 
 
@@ -118,10 +132,11 @@ def get_sam3_3d_cfg(
     roi2det3d = class_config(RoI2Det3D, box_coder=box_coder)
     
     # SAM3_3D model
-    # Note: sam3_model will be built from checkpoint at runtime
+    # Note: sam3_model will be built from checkpoint in __init__
     model = class_config(
         SAM3_3D,
-        sam3_model=None,  # Will be set at runtime
+        sam3_model=None,  # Will be built in __init__
+        sam3_checkpoint=sam3_checkpoint,  # Pass checkpoint path
         bbox3d_head=bbox3d_head,
         box_coder=box_coder,
         geometry_backend=geometry_backend,
@@ -129,6 +144,6 @@ def get_sam3_3d_cfg(
         freeze_sam3_backbone=params.freeze_sam3_backbone,
         freeze_geometry_backend_encoder=params.freeze_geometry_backend_encoder,
     )
-    
+
     return model, box_coder
 
