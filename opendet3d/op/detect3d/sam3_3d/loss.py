@@ -182,10 +182,14 @@ class SAM3_3DLoss(nn.Module):
         # Targets
         targets: dict,
 
-        # Intrinsics for 3D encoding
+        # Additional info for pixel coordinate conversion
         intrinsics: Tensor | None = None,  # (B, 3, 3)
+        image_size: tuple[int, int] | None = None,  # (H, W) for pixel coordinate conversion
     ) -> dict[str, Tensor]:
         """Compute all losses.
+
+        Following GDino3D's design, we compute 2D box losses in pixel coordinate space
+        for better numerical stability and to allow direct copying of loss weights.
 
         Args:
             pred_logits: Predicted objectness logits
@@ -194,15 +198,20 @@ class SAM3_3DLoss(nn.Module):
             aux_outputs: Auxiliary outputs from decoder layers
             geom_losses: Geometry backend losses
             targets: Ground truth targets
-            intrinsics: Camera intrinsics
+            intrinsics: Camera intrinsics for 3D loss
+            image_size: (H, W) for converting normalized coords to pixel coords
 
         Returns:
             Dictionary of loss values
         """
         losses = {}
 
-        # Normalize targets to [0, 1] range
+        # Normalize targets to [0, 1] range (for matching and computation)
         normalized_targets = self._normalize_targets(targets)
+
+        # Store image_size for pixel coordinate conversion
+        if image_size is None and "image_size" in targets:
+            image_size = targets["image_size"]
 
         # Compute matching indices using BinaryHungarianMatcher
         outputs_dict = {
@@ -252,8 +261,9 @@ class SAM3_3DLoss(nn.Module):
             loss_presence = self._loss_presence(pred_logits, normalized_targets)
             losses["loss_presence"] = loss_presence * self.config.presence_loss_weight
 
+        # 2D box losses (in pixel coordinate space following GDino3D)
         loss_bbox, loss_giou = self._loss_boxes_2d(
-            pred_boxes_2d, indices, normalized_targets, num_boxes
+            pred_boxes_2d, indices, normalized_targets, num_boxes, image_size
         )
         losses["loss_bbox"] = loss_bbox * self.config.loss_bbox_weight
         losses["loss_giou"] = loss_giou * self.config.loss_giou_weight
@@ -279,10 +289,12 @@ class SAM3_3DLoss(nn.Module):
                 weight = getattr(self.config, f"loss_{key}_weight", 1.0)
                 losses[f"loss_{key}"] = value * weight
 
-        # ========== Auxiliary Losses ==========
+        # ========== Auxiliary Losses (Deep Supervision) ==========
         if aux_outputs is not None:
             for i, aux_out in enumerate(aux_outputs):
-                aux_losses = self._compute_aux_loss(aux_out, indices, normalized_targets, num_boxes)
+                aux_losses = self._compute_aux_loss(
+                    aux_out, indices, normalized_targets, num_boxes, intrinsics, image_size
+                )
                 for key, value in aux_losses.items():
                     losses[f"d{i}.{key}"] = value * self.config.aux_loss_weight
         
@@ -589,8 +601,23 @@ class SAM3_3DLoss(nn.Module):
         indices: tuple[Tensor, Tensor, Tensor | None],
         targets: dict,
         num_boxes: Tensor,
+        image_size: tuple[int, int] | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """Compute 2D box regression losses (L1 + GIoU)."""
+        """Compute 2D box regression losses (L1 + GIoU).
+
+        Following GDino3D's design, we compute losses in pixel coordinate space
+        for better numerical stability and to allow direct use of GDino3D loss weights.
+
+        Args:
+            pred_boxes_2d: Predicted boxes (normalized xyxy [0, 1])
+            indices: Matching indices
+            targets: Ground truth targets (normalized xyxy [0, 1])
+            num_boxes: Number of boxes for normalization
+            image_size: (H, W) for converting to pixel coordinates
+
+        Returns:
+            (loss_bbox, loss_giou) tuple
+        """
         batch_idx, src_idx, tgt_idx = indices
 
         src_boxes = pred_boxes_2d[(batch_idx, src_idx)]
@@ -599,12 +626,24 @@ class SAM3_3DLoss(nn.Module):
             else targets["boxes_xyxy"]
         )
 
-        # L1 loss
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+        # Convert normalized [0, 1] coordinates to pixel coordinates
+        # Following GDino3D: factors = [img_w, img_h, img_w, img_h]
+        if image_size is not None:
+            H, W = image_size
+            factors = src_boxes.new_tensor([W, H, W, H])
+            src_boxes_pixel = src_boxes * factors
+            target_boxes_pixel = target_boxes * factors
+        else:
+            # Fallback to normalized coordinates (original behavior)
+            src_boxes_pixel = src_boxes
+            target_boxes_pixel = target_boxes
+
+        # L1 loss in pixel coordinates
+        loss_bbox = F.l1_loss(src_boxes_pixel, target_boxes_pixel, reduction="none")
         loss_bbox = loss_bbox.sum() / num_boxes
 
-        # GIoU loss
-        loss_giou = 1 - fast_diag_generalized_box_iou(src_boxes, target_boxes)
+        # GIoU loss (GIoU is scale-invariant, but we compute on pixel coords for consistency)
+        loss_giou = 1 - fast_diag_generalized_box_iou(src_boxes_pixel, target_boxes_pixel)
         loss_giou = loss_giou.sum() / num_boxes
 
         return loss_bbox, loss_giou
@@ -690,8 +729,25 @@ class SAM3_3DLoss(nn.Module):
         indices: tuple[Tensor, Tensor, Tensor | None],
         targets: dict,
         num_boxes: Tensor,
+        intrinsics: Tensor | None = None,
+        image_size: tuple[int, int] | None = None,
     ) -> dict[str, Tensor]:
-        """Compute losses for auxiliary decoder outputs."""
+        """Compute losses for auxiliary decoder outputs.
+
+        Following GDino3D's design, we compute all losses (2D + 3D) for auxiliary outputs
+        to enable full deep supervision across all decoder layers.
+
+        Args:
+            aux_out: Auxiliary output dictionary containing pred_logits, pred_boxes_2d, pred_boxes_3d
+            indices: Matching indices from matcher
+            targets: Ground truth targets
+            num_boxes: Number of boxes for normalization
+            intrinsics: Camera intrinsics for 3D loss computation
+            image_size: (H, W) for pixel coordinate conversion
+
+        Returns:
+            Dictionary of auxiliary losses
+        """
         losses = {}
 
         # Classification loss
@@ -705,14 +761,27 @@ class SAM3_3DLoss(nn.Module):
             )
             losses["loss_cls"] = loss_cls * self.config.loss_cls_weight
 
-        # 2D box loss
+        # 2D box loss (in pixel coordinate space)
         if "pred_boxes_2d" in aux_out or "pred_boxes" in aux_out:
             pred_boxes = aux_out.get("pred_boxes_2d", aux_out.get("pred_boxes"))
             loss_bbox, loss_giou = self._loss_boxes_2d(
-                pred_boxes, indices, targets, num_boxes
+                pred_boxes, indices, targets, num_boxes, image_size
             )
             losses["loss_bbox"] = loss_bbox * self.config.loss_bbox_weight
             losses["loss_giou"] = loss_giou * self.config.loss_giou_weight
+
+        # 3D box loss (following GDino3D's deep supervision design)
+        if "pred_boxes_3d" in aux_out and intrinsics is not None:
+            pred_boxes_2d = aux_out.get("pred_boxes_2d", aux_out.get("pred_boxes"))
+            loss_3d = self._loss_boxes_3d(
+                pred_boxes_2d,
+                aux_out["pred_boxes_3d"],
+                indices,
+                targets,
+                intrinsics,
+                num_boxes,
+            )
+            losses.update(loss_3d)
 
         return losses
 
