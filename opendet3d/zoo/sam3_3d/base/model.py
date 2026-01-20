@@ -104,15 +104,18 @@ def get_sam3_3d_hyperparams_cfg(
 def get_sam3_3d_cfg(
     params: ExperimentParameters,
     sam3_checkpoint: str | None = None,
+    sam3_model: ConfigDict | None = None,
     geometry_backend_type: str = "unidepth_v2",
 ) -> tuple[ConfigDict, ConfigDict]:
     """Get SAM3_3D model configuration.
-    
+
     Args:
         params: Experiment parameters.
-        sam3_checkpoint: Path to SAM3 checkpoint.
+        sam3_checkpoint: Path to SAM3 checkpoint. Used if sam3_model is None.
+        sam3_model: Pre-built SAM3 model config (e.g., EfficientSAM3).
+            If provided, sam3_checkpoint is ignored.
         geometry_backend_type: Type of geometry backend.
-        
+
     Returns:
         Tuple of (model_cfg, box_coder_cfg).
     """
@@ -123,7 +126,7 @@ def get_sam3_3d_cfg(
     # based on geometry_backend.is_ray_aware to get the correct use_camera_prompt setting.
     # For ray-aware backends (UniDepthV2, DetAny3D), use_camera_prompt=False.
     # For non-ray-aware backends (UniDepthHead v1), use_camera_prompt=True.
-    
+
     # Geometry backend
     if geometry_backend_type == "unidepth_v2":
         # Use UniDepthV2-Small (v2-vits14) - memory efficient
@@ -156,14 +159,13 @@ def get_sam3_3d_cfg(
     roi2det3d = class_config(RoI2Det3D, box_coder=box_coder)
 
     # SAM3_3D model
-    # Note: sam3_model will be built from checkpoint in __init__
     # Learning rate control is handled by param_groups in optimizer config,
     # not by freezing parameters. See optim.py for SAM3_3D-specific param_groups.
+    # bbox3d_head=None - let SAM3_3D create it based on is_ray_aware and depth_latent_dim
     model = class_config(
         SAM3_3D,
-        sam3_model=None,  # Will be built in __init__
-        sam3_checkpoint=sam3_checkpoint,  # Pass checkpoint path
-        # bbox3d_head=None - let SAM3_3D create it based on is_ray_aware
+        sam3_model=sam3_model,  # Pre-built model (e.g., EfficientSAM3) or None
+        sam3_checkpoint=sam3_checkpoint if sam3_model is None else None,
         box_coder=box_coder,
         geometry_backend=geometry_backend,
         roi2det3d=roi2det3d,

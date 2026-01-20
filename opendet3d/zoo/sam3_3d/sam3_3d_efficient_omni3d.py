@@ -27,40 +27,32 @@ from vis4d.config.typing import ExperimentConfig
 from vis4d.data.io.hdf5 import HDF5Backend
 from vis4d.zoo.base import get_default_cfg
 
-# Reuse existing SAM3_3D configurations
 from opendet3d.zoo.gdino3d.base.callback import (
     get_callback_cfg,
     get_omni3d_evaluator_cfg,
 )
-from opendet3d.zoo.sam3_3d.base.data import get_sam3_3d_data_cfg
 from opendet3d.zoo.gdino3d.base.dataset.omni3d import (
     get_omni3d_test_cfg,
     get_omni3d_train_cfg,
 )
-from opendet3d.zoo.sam3_3d.base.optim import get_sam3_3d_optim_cfg
 from opendet3d.zoo.gdino3d.base.pl import get_pl_cfg
 
-from opendet3d.zoo.sam3_3d.base.model import get_sam3_3d_hyperparams_cfg
+from opendet3d.zoo.sam3_3d.base.optim import get_sam3_3d_optim_cfg
+
+from opendet3d.zoo.sam3_3d.base.model import (
+    get_sam3_3d_cfg,
+    get_sam3_3d_hyperparams_cfg,
+)
 from opendet3d.zoo.sam3_3d.base.loss import get_sam3_3d_loss_cfg
 from opendet3d.zoo.sam3_3d.base.connector import get_sam3_3d_data_connector_cfg
+from opendet3d.zoo.sam3_3d.base.data import get_sam3_3d_data_cfg
 from opendet3d.zoo.sam3_3d.base.efficient_sam3_builder import (
     build_efficientsam3_tiny_mobileclip_ft,
 )
 
-# SAM3_3D model and components
-from opendet3d.model.detect3d.sam3_3d import SAM3_3D
-from opendet3d.op.detect3d.grounding_dino_3d import (
-    GroundingDINO3DCoder,
-    GroundingDINO3DHead,
-    RoI2Det3D,
-)
-from opendet3d.op.detect3d.geometry import UniDepthV2GeometryBackend
-from opendet3d.op.detect3d.early_depth_fusion import EarlyDepthFusion
-
 
 def get_config() -> ExperimentConfig:
     """Returns the SAM3_3D with EfficientSAM3 on Omni3D configuration."""
-
     ######################################################
     ##                    General Config                ##
     ######################################################
@@ -72,15 +64,10 @@ def get_config() -> ExperimentConfig:
     # Same as sam3_3d_omni3d.py to ensure only backbone differs
     params = get_sam3_3d_hyperparams_cfg(
         num_epochs=12,
-        samples_per_gpu=4,  # Same as SAM3
+        samples_per_gpu=4,
         workers_per_gpu=4,
         base_lr=1e-4,
-        # freeze_backbone not set, defaults to False (0.1x lr for pretrained)
     )
-
-    # SAM3 expects 1008x1008 images (pre-trained with img_size=1008, patch_size=14)
-    # 1008 / 14 = 72 tokens per dimension, matching RoPE freqs_cis
-    sam3_image_shape = (1008, 1008)
 
     config.params = params
 
@@ -101,6 +88,10 @@ def get_config() -> ExperimentConfig:
         "ARKitScenes_test",
         "Objectron_test",
     )
+
+    # SAM3 expects 1008x1008 images (pre-trained with img_size=1008, patch_size=14)
+    # 1008 / 14 = 72 tokens per dimension, matching RoPE freqs_cis
+    sam3_image_shape = (1008, 1008)
 
     omni3d_train_data_cfg = get_omni3d_train_cfg(
         data_root=omni3d_data_root,
@@ -138,7 +129,6 @@ def get_config() -> ExperimentConfig:
     ######################################################
     ##                  MODEL & LOSS                    ##
     ######################################################
-
     # Build EfficientSAM3 model (TinyViT-11M + MobileCLIP-S1 + Geo FT)
     efficient_sam3_model = class_config(
         build_efficientsam3_tiny_mobileclip_ft,
@@ -146,50 +136,11 @@ def get_config() -> ExperimentConfig:
         device="cpu",  # Will be moved to GPU by PyTorch Lightning
     )
 
-    # Box coder
-    box_coder = class_config(GroundingDINO3DCoder)
-
-    # 3D Head (same params as get_sam3_3d_cfg)
-    bbox3d_head = class_config(
-        GroundingDINO3DHead,
-        embed_dims=params.hidden_dim,
-        num_decoder_layer=params.num_decoder_layers,
-    )
-
-    # Geometry backend (same as get_sam3_3d_cfg)
-    # Use UniDepthV2-Small (v2-vits14) - memory efficient
-    geometry_backend = class_config(
-        UniDepthV2GeometryBackend,
-        version="v2-vits14",
-        encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
-        decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
-    )
-
-    # EarlyDepthFusion (Concat + Zero-init Project + Residual)
-    # More expressive: delta = W_P * P + W_D * D, output = P + delta
-    early_depth_fusion = class_config(
-        EarlyDepthFusion,
-        visual_dim=params.hidden_dim,  # 256 for SAM3
-        depth_dim=256,  # UniDepthV2-S latent dim (no bottleneck)
-        fusion_type="concat_add",
-        zero_init=True,  # delta=0 at start, preserves pretrained features
-    )
-
-    # RoI2Det3D for inference
-    roi2det3d = class_config(RoI2Det3D, box_coder=box_coder)
-
-    # SAM3_3D model with EfficientSAM3 backbone
-    # Key: Pass sam3_model (not sam3_checkpoint) to use EfficientSAM3
-    # Note: Freezing is controlled by optimizer param_groups, not model params
-    config.model = class_config(
-        SAM3_3D,
-        sam3_model=efficient_sam3_model,  # EfficientSAM3 model
-        sam3_checkpoint=None,  # No checkpoint path needed (already in model)
-        bbox3d_head=bbox3d_head,
-        box_coder=box_coder,
-        geometry_backend=geometry_backend,
-        roi2det3d=roi2det3d,
-        early_depth_fusion=early_depth_fusion,
+    # Use get_sam3_3d_cfg with sam3_model parameter (same as sam3_3d_omni3d.py)
+    config.model, box_coder = get_sam3_3d_cfg(
+        params=params,
+        sam3_model=efficient_sam3_model,  # EfficientSAM3 instead of checkpoint
+        geometry_backend_type="unidepth_v2",
     )
 
     config.loss = get_sam3_3d_loss_cfg(params, box_coder)

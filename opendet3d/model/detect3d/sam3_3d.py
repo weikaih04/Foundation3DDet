@@ -324,6 +324,12 @@ class SAM3_3D(nn.Module):
             use_camera_prompt = True  # Default to True for safety
             print(f"[SAM3_3D] No geometry_backend or is_ray_aware attr, defaulting use_camera_prompt=True")
 
+        # Get depth_latent_dim from geometry_backend (for 3D head)
+        if self.geometry_backend is not None and hasattr(self.geometry_backend, 'target_latent_dim'):
+            depth_latent_dim = self.geometry_backend.target_latent_dim
+        else:
+            depth_latent_dim = 256  # Default
+
         # Create or validate bbox3d_head with correct use_camera_prompt setting
         if bbox3d_head is not None:
             self.bbox3d_head = bbox3d_head
@@ -336,8 +342,9 @@ class SAM3_3D(nn.Module):
                 embed_dims=self.hidden_dim,
                 box_coder=self.box_coder,
                 use_camera_prompt=use_camera_prompt,
+                depth_latent_dim=depth_latent_dim,
             )
-            print(f"[SAM3_3D] Created bbox3d_head with use_camera_prompt={use_camera_prompt}")
+            print(f"[SAM3_3D] Created bbox3d_head with use_camera_prompt={use_camera_prompt}, depth_latent_dim={depth_latent_dim}")
 
         # Load geometry backend pretrained weights
         # This is called during __init__ to ensure weights are loaded for first training
