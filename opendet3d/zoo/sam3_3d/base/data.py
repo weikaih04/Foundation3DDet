@@ -23,9 +23,47 @@ from vis4d.zoo.base import (
 from .connector import SAM3_3DCollator
 
 
+# Default collator instance (module-level for vis4d compatibility)
+_default_collator = None
+
+
+def sam3_3d_collate_fn(batch: List[dict], **kwargs):
+    """Default SAM3_3D collate function (module-level for vis4d).
+
+    This function is callable directly from the module for vis4d's class_config.
+    Uses default parameters: max_prompts_per_image=50, use_text_prompts=True,
+    text_query_prob=0.7 (SAM3 recommended: 70% text, 30% visual).
+
+    For custom parameters, use create_sam3_3d_collate_fn() instead.
+
+    Args:
+        batch: List of data samples
+        **kwargs: Additional arguments from vis4d (e.g., collate_keys)
+
+    Returns:
+        Collated batch data
+    """
+    global _default_collator
+    if _default_collator is None:
+        _default_collator = SAM3_3DCollator(
+            max_prompts_per_image=50,
+            use_text_prompts=True,
+            text_query_prob=0.7,  # SAM3 recommended: 70% text, 30% visual
+        )
+    # Ignore kwargs (like collate_keys) that vis4d passes but we don't use
+    return _default_collator(batch)
+
+
 def create_sam3_3d_collate_fn(
     max_prompts_per_image: int = 50,
     use_text_prompts: bool = True,
+    text_query_prob: float = 0.7,
+    keep_text_for_visual: bool = False,
+    # Geometry prompt options (NEW: text + geometry training)
+    use_geometry_prompts: bool = False,
+    geometric_query_str: str = "geometric",
+    box_noise_std: float = 0.0,
+    box_noise_max: float | None = 20.0,
 ):
     """Create a configured SAM3_3D collate function.
 
@@ -34,8 +72,21 @@ def create_sam3_3d_collate_fn(
     for vis4d's class_config to work correctly.
 
     Args:
-        max_prompts_per_image: Max prompts (GT boxes) per image
+        max_prompts_per_image: Max prompts (categories) per image
         use_text_prompts: Whether to include text with geometric prompts
+        text_query_prob: Probability of text-only queries (SAM3 recommended: 0.7)
+            1.0 = all text queries (pure text training)
+            0.7 = 70% text, 30% visual (SAM3 mixed training)
+            0.0 = all visual queries (DetAny3D style)
+        keep_text_for_visual: If True, visual queries keep category text
+            If False (default), visual queries use "visual" as text
+        use_geometry_prompts: If True, create geometry queries per category
+            This implements text + geometry training (SAM3 style):
+            - Each category gets 1 TEXT query (one-to-many targets)
+            - Each category gets 1 GEOMETRY query (one-to-one target)
+        geometric_query_str: Text for geometry queries (default "geometric")
+        box_noise_std: Noise std for box jittering (0 = no noise)
+        box_noise_max: Max noise in pixels
 
     Returns:
         Configured collate function
@@ -43,6 +94,12 @@ def create_sam3_3d_collate_fn(
     collator = SAM3_3DCollator(
         max_prompts_per_image=max_prompts_per_image,
         use_text_prompts=use_text_prompts,
+        text_query_prob=text_query_prob,
+        keep_text_for_visual=keep_text_for_visual,
+        use_geometry_prompts=use_geometry_prompts,
+        geometric_query_str=geometric_query_str,
+        box_noise_std=box_noise_std,
+        box_noise_max=box_noise_max,
     )
 
     def collate_fn(batch: List[dict]):
@@ -63,6 +120,16 @@ def get_sam3_3d_data_cfg(
     workers_per_gpu: int = 2,
     max_prompts_per_image: int = 50,
     use_text_prompts: bool = True,
+    # Text/Visual query ratio (SAM3 original design)
+    text_query_prob: float = 0.7,
+    keep_text_for_visual: bool = False,
+    # Geometry prompt options (NEW: text + geometry training)
+    use_geometry_prompts: bool = False,
+    geometric_query_str: str = "geometric",
+    box_noise_std: float = 0.0,
+    box_noise_max: float | None = 20.0,
+    # Dataloader options
+    shuffle: bool = True,
 ) -> DataConfig:
     """Get the data config for SAM3_3D with custom collator.
 
@@ -74,8 +141,23 @@ def get_sam3_3d_data_cfg(
         test_datasets: Test dataset configuration
         samples_per_gpu: Batch size (number of images per GPU)
         workers_per_gpu: Number of data loading workers per GPU
-        max_prompts_per_image: Max prompts (GT boxes) per image
+        max_prompts_per_image: Max prompts (categories) per image
         use_text_prompts: Whether to include text with geometric prompts
+        text_query_prob: Probability of text-only queries (SAM3 recommended: 0.7)
+            1.0 = all text queries (pure text training)
+            0.7 = 70% text, 30% visual (SAM3 mixed training)
+            0.0 = all visual queries (DetAny3D style)
+        keep_text_for_visual: If True, visual queries keep category text
+            If False (default), visual queries use "visual" as text
+        use_geometry_prompts: If True, create geometry queries per category
+            This implements text + geometry training (SAM3 style):
+            - Each category gets 1 TEXT query (one-to-many targets)
+            - Each category gets 1 GEOMETRY query (one-to-one target)
+        geometric_query_str: Text for geometry queries (default "geometric")
+        box_noise_std: Noise std for box jittering (0 = no noise)
+        box_noise_max: Max noise in pixels
+        shuffle: Whether to shuffle training data (default True)
+            Set to False for deterministic overfit tests
 
     Returns:
         DataConfig with train and test dataloaders
@@ -86,6 +168,12 @@ def get_sam3_3d_data_cfg(
     collate_fn = create_sam3_3d_collate_fn(
         max_prompts_per_image=max_prompts_per_image,
         use_text_prompts=use_text_prompts,
+        text_query_prob=text_query_prob,
+        keep_text_for_visual=keep_text_for_visual,
+        use_geometry_prompts=use_geometry_prompts,
+        geometric_query_str=geometric_query_str,
+        box_noise_std=box_noise_std,
+        box_noise_max=box_noise_max,
     )
 
     # Train dataloader
@@ -99,10 +187,12 @@ def get_sam3_3d_data_cfg(
         samples_per_gpu=samples_per_gpu,
         workers_per_gpu=workers_per_gpu,
         collate_fn=collate_fn,
+        shuffle=shuffle,
     )
 
     # Test dataloader
-    # For inference, we use default collation since we may not have GT boxes
+    # Use the same collator to convert GT boxes to prompts for evaluation
+    # This allows testing 2D detection with GT boxes as prompts
     test_batchprocess_cfg = class_config(
         compose, transforms=[class_config(ToTensor)]
     )
@@ -117,6 +207,7 @@ def get_sam3_3d_data_cfg(
         batchprocess_cfg=test_batchprocess_cfg,
         samples_per_gpu=1,  # Use batch size 1 for inference
         workers_per_gpu=workers_per_gpu,
+        collate_fn=collate_fn,  # Use same collator as training
     )
 
     return data
@@ -163,7 +254,7 @@ def get_sam3_3d_data_cfg_with_custom_collator(
         collate_fn=collate_fn,
     )
 
-    # Test dataloader (default collation)
+    # Test dataloader (use same collator as training)
     test_batchprocess_cfg = class_config(
         compose, transforms=[class_config(ToTensor)]
     )
@@ -178,6 +269,7 @@ def get_sam3_3d_data_cfg_with_custom_collator(
         batchprocess_cfg=test_batchprocess_cfg,
         samples_per_gpu=1,
         workers_per_gpu=workers_per_gpu,
+        collate_fn=collate_fn,
     )
 
     return data

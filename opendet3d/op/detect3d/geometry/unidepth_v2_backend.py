@@ -41,6 +41,13 @@ VERSION_TO_LOCAL_CONFIG = {
     "v2-vits14": "UniDepth/configs/config_v2_vits14.json",
 }
 
+# Map version string to HuggingFace repo name for pretrained weights
+VERSION_TO_HF_NAME = {
+    "v2-vitl14": "lpiccinelli/unidepth-v2-vitl14",
+    "v2-vitb14": "lpiccinelli/unidepth-v2-vitb14",
+    "v2-vits14": "lpiccinelli/unidepth-v2-vits14",
+}
+
 
 class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
     """Backend wrapping UniDepthV2's complete depth estimation system.
@@ -85,9 +92,9 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         encoder_pretrained: str | None = None,
         decoder_pretrained: str | None = None,
         use_native_losses: bool = True,
-        depth_loss_weight: float = 10.0,  # Scale to match 3D-MOOD SILog weight
+        depth_loss_weight: float = 1.0,  # Raw loss, scaling done in SAM3_3DLoss via loss_geom_scale
         output_scales: int = 1,
-        target_latent_dim: int = 128,
+        target_latent_dim: int = 256,
         freeze_encoder: bool = True,
         detach_depth_latents: bool = False,
         silog_only: bool = False,  # If True, only use SILog loss (disable camera, ssi, confidence)
@@ -170,11 +177,30 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         #         param.requires_grad = False
 
         # Projection layer to align latent dimension
-        # UniDepthV2 hidden_dim is typically 512
-        # out_features dimensions depend on the ups configuration
-        # We'll create the projection lazily in forward since we don't know dims yet
-        self.latent_proj = None
-        self._latent_proj_initialized = False
+        # Create at init time to ensure checkpoint loading works correctly
+        # DINOv2 encoder dimensions: vits=384, vitb=768, vitl=1024
+        # But out_features uses ups which reduces dims. For output_scales=1 (1/8 res):
+        # - v2-vits14: 256 (from ups config)
+        # - v2-vitb14: 512
+        # - v2-vitl14: 1024
+        version_to_latent_dim = {
+            "v2-vits14": 256,
+            "v2-vitb14": 512,
+            "v2-vitl14": 1024,
+        }
+        source_dim = version_to_latent_dim.get(version, 256)
+        if source_dim != target_latent_dim:
+            self.latent_proj = nn.Linear(source_dim, target_latent_dim)
+        else:
+            self.latent_proj = nn.Identity()
+        self._latent_proj_initialized = True
+
+        # Auto-load pretrained weights during initialization
+        # This ensures weights are loaded even for first training (no checkpoint)
+        if (self._pretrained_path is not None or
+            (self._encoder_pretrained_path is not None and self._decoder_pretrained_path is not None)):
+            print(f"[UniDepthV2] Auto-loading pretrained weights during __init__...")
+            self.load_pretrained_weights()
 
     def load_pretrained_weights(self) -> None:
         """Load pretrained weights for UniDepthV2 encoder and decoder.
@@ -473,28 +499,16 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
                 depth_gt, size=(new_H, new_W), mode='nearest'
             )
 
-            # DEBUG: Print shape information
-            print(f"[DEBUG UniDepthV2 forward_train]")
-            print(f"  image_hw (original): {image_hw}")
-            print(f"  image_hw_adjusted: {image_hw_adjusted}")
-            print(f"  depth_gt (original) shape: {depth_gt.shape}")
-            print(f"  depth_gt_resized shape: {depth_gt_resized.shape}")
-            if depth_gt.shape[-2:] != image_hw:
-                print(f"  [WARNING] depth_gt {depth_gt.shape[-2:]} != image_hw {image_hw}!")
-
-            # DEBUG: Print intrinsic information
-            print(f"  intrinsics (original)[0]: fx={intrinsics[0, 0, 0].item():.2f}, fy={intrinsics[0, 1, 1].item():.2f}, cx={intrinsics[0, 0, 2].item():.2f}, cy={intrinsics[0, 1, 2].item():.2f}")
-            print(f"  intrinsics_adjusted[0]: fx={intrinsics_adjusted[0, 0, 0].item():.2f}, fy={intrinsics_adjusted[0, 1, 1].item():.2f}, cx={intrinsics_adjusted[0, 0, 2].item():.2f}, cy={intrinsics_adjusted[0, 1, 2].item():.2f}")
-
-            # Validate intrinsic scaling is correct
-            scale_x_expected = new_W / orig_W
-            scale_y_expected = new_H / orig_H
-            fx_ratio = intrinsics_adjusted[0, 0, 0].item() / intrinsics[0, 0, 0].item()
-            fy_ratio = intrinsics_adjusted[0, 1, 1].item() / intrinsics[0, 1, 1].item()
-            if abs(fx_ratio - scale_x_expected) > 0.01:
-                print(f"  [WARNING] fx scaling {fx_ratio:.4f} != expected {scale_x_expected:.4f}!")
-            if abs(fy_ratio - scale_y_expected) > 0.01:
-                print(f"  [WARNING] fy scaling {fy_ratio:.4f} != expected {scale_y_expected:.4f}!")
+            # DEBUG: Shape and intrinsic information (commented out for production)
+            # print(f"[DEBUG UniDepthV2 forward_train]")
+            # print(f"  image_hw (original): {image_hw}")
+            # print(f"  image_hw_adjusted: {image_hw_adjusted}")
+            # print(f"  depth_gt (original) shape: {depth_gt.shape}")
+            # print(f"  depth_gt_resized shape: {depth_gt_resized.shape}")
+            # if depth_gt.shape[-2:] != image_hw:
+            #     print(f"  [WARNING] depth_gt {depth_gt.shape[-2:]} != image_hw {image_hw}!")
+            # print(f"  intrinsics (original)[0]: fx={intrinsics[0, 0, 0].item():.2f}, ...")
+            # print(f"  intrinsics_adjusted[0]: fx={intrinsics_adjusted[0, 0, 0].item():.2f}, ...")
 
         if depth_mask is not None:
             if depth_mask.ndim == 3:
@@ -518,48 +532,11 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
             depth_mask=depth_mask_resized,
         )
 
-        # DEBUG: Check inputs for nan/inf
-        if torch.isnan(inputs["image"]).any() or torch.isinf(inputs["image"]).any():
-            print(f"[DEBUG NaN/Inf] inputs['image'] has nan={torch.isnan(inputs['image']).any().item()}, inf={torch.isinf(inputs['image']).any().item()}")
-        if "camera" in inputs and inputs["camera"] is not None:
-            K = inputs["camera"].K
-            if torch.isnan(K).any() or torch.isinf(K).any():
-                print(f"[DEBUG NaN/Inf] camera.K has nan={torch.isnan(K).any().item()}, inf={torch.isinf(K).any().item()}")
-
         # 3. Run UniDepthV2 forward_train (uses native compute_losses)
         if self.use_native_losses and depth_gt is not None:
-            # DEBUG: Manually run encode_decode to check intermediate values
-            B, _, H, W = inputs["image"].shape
-
-            # Check if camera rays have nan
-            if inputs.get("camera", None) is not None:
-                rays = inputs["camera"].get_rays(shapes=(B, H, W))
-                if torch.isnan(rays).any() or torch.isinf(rays).any():
-                    print(f"[DEBUG NaN/Inf] camera rays has nan={torch.isnan(rays).any().item()}, inf={torch.isinf(rays).any().item()}")
-                    print(f"[DEBUG NaN/Inf] camera.K = {inputs['camera'].K}")
-
-            # DEBUG: Check encoder output before decoder
-            print(f"[DEBUG] About to call forward_train...")
-            print(f"[DEBUG] inputs keys: {inputs.keys()}")
-            print(f"[DEBUG] inputs['image'] shape: {inputs['image'].shape}, dtype: {inputs['image'].dtype}")
-            if torch.isnan(inputs['image']).any():
-                print(f"[DEBUG] WARNING: inputs['image'] has NaN!")
-
             outputs, losses_dict = self.unidepth_model.forward_train(
                 inputs, image_metas
             )
-
-            # DEBUG: Check decoder outputs
-            if "radius" in outputs:
-                radius = outputs["radius"]
-                if torch.isnan(radius).any() or torch.isinf(radius).any():
-                    print(f"[DEBUG NaN/Inf] decoder radius has nan={torch.isnan(radius).any().item()}, inf={torch.isinf(radius).any().item()}")
-                    print(f"[DEBUG NaN/Inf] radius stats: min={radius.min().item():.4f}, max={radius.max().item():.4f}, mean={radius.mean().item():.4f}")
-
-            if "rays" in outputs:
-                rays_out = outputs["rays"]
-                if torch.isnan(rays_out).any() or torch.isinf(rays_out).any():
-                    print(f"[DEBUG NaN/Inf] decoder rays has nan={torch.isnan(rays_out).any().item()}, inf={torch.isinf(rays_out).any().item()}")
 
             # Flatten losses from {"opt": {...}, "stat": {...}} format
             losses = {}
@@ -575,30 +552,6 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         depth_map = outputs.get("depth")  # [B, 1, H', W']
         out_features = outputs.get("out_features")  # [1/8, 1/4, 1/2] resolution latents
         pred_K = outputs.get("intrinsics")  # [B, 3, 3]
-
-        # DEBUG: Check for nan/inf in depth predictions
-        if depth_map is not None:
-            has_nan = torch.isnan(depth_map).any().item()
-            has_inf = torch.isinf(depth_map).any().item()
-            if has_nan or has_inf:
-                print(f"[DEBUG NaN/Inf] depth_map has nan={has_nan}, inf={has_inf}")
-                print(f"[DEBUG NaN/Inf] depth_map stats: min={depth_map.min().item():.4f}, max={depth_map.max().item():.4f}, mean={depth_map.mean().item():.4f}")
-                # Check which batch elements have nan/inf
-                for i in range(depth_map.shape[0]):
-                    batch_has_nan = torch.isnan(depth_map[i]).any().item()
-                    batch_has_inf = torch.isinf(depth_map[i]).any().item()
-                    if batch_has_nan or batch_has_inf:
-                        print(f"[DEBUG NaN/Inf] Batch {i}: nan={batch_has_nan}, inf={batch_has_inf}")
-
-        # DEBUG: Check for nan/inf in losses
-        if losses:
-            for loss_name, loss_value in losses.items():
-                if torch.isnan(loss_value).any().item() or torch.isinf(loss_value).any().item():
-                    print(f"[DEBUG NaN/Inf] Loss {loss_name} has nan/inf: {loss_value.item()}")
-                    # Print depth_gt stats to see if GT has issues
-                    if depth_gt_resized is not None:
-                        print(f"[DEBUG NaN/Inf] depth_gt_resized stats: min={depth_gt_resized.min().item():.4f}, max={depth_gt_resized.max().item():.4f}, mean={depth_gt_resized.mean().item():.4f}")
-                        print(f"[DEBUG NaN/Inf] depth_gt_resized has nan={torch.isnan(depth_gt_resized).any().item()}, inf={torch.isinf(depth_gt_resized).any().item()}")
 
         # 5. Resize depth_map back to original dimensions
         depth_map_resized = self._resize_depth_to_original(depth_map, (orig_H, orig_W))
@@ -621,15 +574,15 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
             pred_K_scaled[:, 0, 2] = pred_K[:, 0, 2] * scale_x  # cx
             pred_K_scaled[:, 1, 2] = pred_K[:, 1, 2] * scale_y  # cy
 
-            # DEBUG: Verify intrinsic scaling
-            print(f"[DEBUG UniDepthV2 Intrinsic Scaling]")
-            print(f"  original_hw: ({orig_H}, {orig_W})")
-            print(f"  adjusted_hw: {image_hw_adjusted}")
-            print(f"  scale_x: {scale_x:.4f}, scale_y: {scale_y:.4f}")
-            print(f"  intrinsics (original gt)[0]: fx={intrinsics[0, 0, 0].item():.2f}, fy={intrinsics[0, 1, 1].item():.2f}, cx={intrinsics[0, 0, 2].item():.2f}, cy={intrinsics[0, 1, 2].item():.2f}")
-            print(f"  intrinsics_adjusted[0]: fx={intrinsics_adjusted[0, 0, 0].item():.2f}, fy={intrinsics_adjusted[0, 1, 1].item():.2f}, cx={intrinsics_adjusted[0, 0, 2].item():.2f}, cy={intrinsics_adjusted[0, 1, 2].item():.2f}")
-            print(f"  pred_K (adjusted space)[0]: fx={pred_K[0, 0, 0].item():.2f}, fy={pred_K[0, 1, 1].item():.2f}, cx={pred_K[0, 0, 2].item():.2f}, cy={pred_K[0, 1, 2].item():.2f}")
-            print(f"  pred_K_scaled (original space)[0]: fx={pred_K_scaled[0, 0, 0].item():.2f}, fy={pred_K_scaled[0, 1, 1].item():.2f}, cx={pred_K_scaled[0, 0, 2].item():.2f}, cy={pred_K_scaled[0, 1, 2].item():.2f}")
+            # DEBUG: Verify intrinsic scaling (commented out for cleaner logs)
+            # print(f"[DEBUG UniDepthV2 Intrinsic Scaling]")
+            # print(f"  original_hw: ({orig_H}, {orig_W})")
+            # print(f"  adjusted_hw: {image_hw_adjusted}")
+            # print(f"  scale_x: {scale_x:.4f}, scale_y: {scale_y:.4f}")
+            # print(f"  intrinsics (original gt)[0]: fx={intrinsics[0, 0, 0].item():.2f}, fy={intrinsics[0, 1, 1].item():.2f}, cx={intrinsics[0, 0, 2].item():.2f}, cy={intrinsics[0, 1, 2].item():.2f}")
+            # print(f"  intrinsics_adjusted[0]: fx={intrinsics_adjusted[0, 0, 0].item():.2f}, fy={intrinsics_adjusted[0, 1, 1].item():.2f}, cx={intrinsics_adjusted[0, 0, 2].item():.2f}, cy={intrinsics_adjusted[0, 1, 2].item():.2f}")
+            # print(f"  pred_K (adjusted space)[0]: fx={pred_K[0, 0, 0].item():.2f}, fy={pred_K[0, 1, 1].item():.2f}, cx={pred_K[0, 0, 2].item():.2f}, cy={pred_K[0, 1, 2].item():.2f}")
+            # print(f"  pred_K_scaled (original space)[0]: fx={pred_K_scaled[0, 0, 0].item():.2f}, fy={pred_K_scaled[0, 1, 1].item():.2f}, cx={pred_K_scaled[0, 0, 2].item():.2f}, cy={pred_K_scaled[0, 1, 2].item():.2f}")
 
         # 7. Extract and project depth latents
         depth_latents, depth_latents_hw = self._extract_depth_latents(out_features)
@@ -888,7 +841,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
                 plt.savefig(save_path, dpi=100, bbox_inches="tight")
                 plt.close(fig)
 
-                print(f"[Depth Vis] Saved {save_path}")
+                # print(f"[Depth Vis] Saved {save_path}")
                 _DEPTH_VIS_COUNTER += 1
 
             except Exception as e:

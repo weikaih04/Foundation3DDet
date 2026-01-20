@@ -8,6 +8,8 @@ This module provides:
 
 from __future__ import annotations
 
+import random
+from collections import defaultdict
 from typing import List, Literal, Optional
 
 import numpy as np
@@ -254,26 +256,30 @@ def noise_box(
 class SAM3_3DCollator:
     """Collator that converts per-image data to SAM3_3DBatchedInputs.
 
-    Design:
+    Design (SAM3 original - per-category queries):
     - DataLoader produces per-image samples
-    - Collator expands to per-prompt batch (one prompt per GT box)
-    - Each prompt uses one GT box as geometric prompt
-    - Optionally samples point prompts from mask or box region
+    - Collator groups GT boxes by category
+    - Each category creates ONE query with multi-instance targets
+    - This aligns with SAM3's multi-instance detection design
 
     Per-prompt batch strategy:
-    - N_prompts = sum of all GT boxes across batch
+    - N_prompts = sum of unique categories across batch (NOT sum of boxes!)
     - img_ids[i] indicates which image prompt i belongs to
-    - Each prompt gets one box from the corresponding image
+    - Each prompt can have multiple GT boxes (multi-instance targets)
 
     Coordinate format:
     - Input boxes2d: pixel xyxy (from dataset)
     - geo_boxes: normalized cxcywh [0,1] (for SAM3)
     - geo_points: normalized xy [0,1] (for SAM3)
     - gt_boxes2d: normalized xyxy [0,1] (for loss)
+    - gt_boxes2d shape: (N_prompts, max_gts, 4) for multi-instance
+    - num_gts: (N_prompts,) number of GT boxes per query (can be > 1)
 
-    Point Sampling Strategy:
-    - If mask available: sample from mask (centered/random_mask mode)
-    - If no mask: use box as pseudo-mask (positive inside, negative outside)
+    Text/Visual Query:
+    - text_query_prob controls the ratio of text vs visual queries
+    - text_query_prob=1.0: all text queries (SAM3 default for training)
+    - text_query_prob=0.7: 70% text, 30% visual (recommended by SAM3)
+    - Visual queries use one randomly selected target box as geo_box
     """
 
     def __init__(
@@ -290,11 +296,17 @@ class SAM3_3DCollator:
         use_box_prompts: bool = True,
         box_noise_std: float = 0.0,
         box_noise_max: float | None = 20.0,
+        # Text/Visual query ratio (SAM3 original design)
+        text_query_prob: float = 0.7,  # 70% text, 30% visual (SAM3 recommended)
+        keep_text_for_visual: bool = False,  # If True, visual queries keep category text
+        # Geometry prompt options (NEW: text + geometry training)
+        use_geometry_prompts: bool = False,  # If True, create geometry queries per category
+        geometric_query_str: str = "geometric",  # Text for geometry queries (SAM3 convention)
     ):
         """Initialize collator.
 
         Args:
-            max_prompts_per_image: Max number of prompts per image
+            max_prompts_per_image: Max number of prompts (categories) per image
             use_text_prompts: Whether to include text with geometric prompts
             default_text: Default text when class name not available
             use_point_prompts: Whether to sample point prompts (for ablation)
@@ -309,6 +321,17 @@ class SAM3_3DCollator:
             use_box_prompts: Whether to use box prompts
             box_noise_std: Noise std for box jittering (0 = no noise)
             box_noise_max: Max noise in pixels
+            text_query_prob: Probability of text-only queries (SAM3 recommended: 0.7)
+                1.0 = all text queries (pure text training)
+                0.7 = 70% text, 30% visual (SAM3 mixed training)
+                0.0 = all visual queries (DetAny3D style)
+            keep_text_for_visual: If True, visual queries keep category text
+                If False (default), visual queries use "visual" as text
+            use_geometry_prompts: If True, create geometry queries per category
+                This implements text + geometry training (SAM3 style):
+                - Each category gets 1 TEXT query (one-to-many targets)
+                - Each category gets 1 GEOMETRY query (one-to-one target)
+            geometric_query_str: Text for geometry queries (default "geometric")
         """
         self.max_prompts_per_image = max_prompts_per_image
         self.use_text_prompts = use_text_prompts
@@ -324,6 +347,14 @@ class SAM3_3DCollator:
         self.use_box_prompts = use_box_prompts
         self.box_noise_std = box_noise_std
         self.box_noise_max = box_noise_max
+
+        # Text/Visual query ratio
+        self.text_query_prob = text_query_prob
+        self.keep_text_for_visual = keep_text_for_visual
+
+        # Geometry prompt options (SAM3 style text + geometry training)
+        self.use_geometry_prompts = use_geometry_prompts
+        self.geometric_query_str = geometric_query_str
 
     def _sample_num_points(self, num_spec: int | tuple[int, int]) -> int:
         """Sample number of points from spec."""
@@ -380,21 +411,154 @@ class SAM3_3DCollator:
         Returns:
             SAM3_3DBatchedInputs with per-prompt batch
         """
+        # Filter out images with no GT boxes to avoid empty prompts
+        # This reduces the probability of empty batches during training
+        original_batch_size = len(batch)
+        batch = [
+            item for item in batch
+            if item.get("boxes2d") is not None and len(item["boxes2d"]) > 0
+        ]
+
+        if len(batch) < original_batch_size:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            filtered_count = original_batch_size - len(batch)
+            print(
+                f"[SAM3_3DCollator] Filtered {filtered_count}/{original_batch_size} "
+                f"empty images on rank {rank}"
+            )
+
         B = len(batch)
+
+        # Handle completely empty batch (all images filtered out)
+        if B == 0:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(
+                f"[SAM3_3DCollator] WARNING: Entire batch empty after filtering "
+                f"({original_batch_size} images all had 0 GT boxes) on rank {rank}"
+            )
+            # Return minimal empty batch - model will handle this gracefully
+            return SAM3_3DBatchedInputs(
+                images=torch.zeros(0, 3, 1, 1),  # (0, 3, H, W)
+                intrinsics=torch.zeros(0, 3, 3),  # (0, 3, 3)
+                img_ids=torch.zeros(0, dtype=torch.long),
+                text_ids=torch.zeros(0, dtype=torch.long),
+                unique_texts=[self.default_text],
+                sample_names=None,
+                dataset_name=None,
+                original_hw=None,
+                original_images=None,
+                original_intrinsics=None,
+            )
+
         device = batch[0]["images"].device if batch[0]["images"].is_cuda else "cpu"
 
         # Collect image-level data
-        images = torch.stack([b["images"] for b in batch])  # (B, 3, H, W)
+        # Images might be (3, H, W) or (1, 3, H, W) depending on data pipeline
+        images_list = []
+        for b in batch:
+            img = b["images"]
+            # Handle case where img might have extra batch dim
+            if img.dim() == 4 and img.shape[0] == 1:
+                img = img.squeeze(0)  # (1, 3, H, W) -> (3, H, W)
+            images_list.append(img)
+        images = torch.stack(images_list)  # (B, 3, H, W)
         intrinsics = torch.stack([b["intrinsics"] for b in batch])  # (B, 3, 3)
-        H, W = images.shape[2:]
+        H, W = images.shape[-2:]  # Use -2: and -1 for H, W to be safe
 
-        # Build per-prompt data
+        # Collect metadata for evaluation/visualization
+        sample_names = []
+        dataset_name_list = []
+        original_hw_list = []
+        original_images_list = []
+        original_intrinsics_list = []
+        for b in batch:
+            # sample_names - image identifier for evaluation
+            if "sample_names" in b:
+                sample_names.append(b["sample_names"])
+            elif "image_id" in b:
+                sample_names.append(b["image_id"])
+            else:
+                sample_names.append(None)
+
+            # dataset_name - for evaluator to route to correct dataset
+            if "dataset_name" in b:
+                dataset_name_list.append(b["dataset_name"])
+            else:
+                dataset_name_list.append(None)
+
+            # original_hw - for coordinate scaling back
+            if "original_hw" in b:
+                original_hw_list.append(b["original_hw"])
+            else:
+                original_hw_list.append(None)
+
+            # original_images - unresized images for visualization
+            if "original_images" in b:
+                original_images_list.append(b["original_images"])
+            else:
+                original_images_list.append(None)
+
+            # original_intrinsics - intrinsics before resize
+            if "original_intrinsics" in b:
+                original_intrinsics_list.append(b["original_intrinsics"])
+            else:
+                original_intrinsics_list.append(None)
+
+        # Collect depth maps for geometry backend supervision
+        depth_maps_list = []
+        for b in batch:
+            # depth_maps - K.depth_maps key from dataset
+            if "depth_maps" in b and b["depth_maps"] is not None:
+                depth_maps_list.append(b["depth_maps"])
+            else:
+                depth_maps_list.append(None)
+
+        # Stack depth maps if available (all images must have depth)
+        depth_gt = None
+        if depth_maps_list and all(d is not None for d in depth_maps_list):
+            try:
+                depth_gt = torch.stack(depth_maps_list, dim=0)  # (B, H, W) or (B, 1, H, W)
+                if depth_gt.dim() == 3:
+                    depth_gt = depth_gt.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
+            except (RuntimeError, TypeError):
+                depth_gt = None
+
+        # Convert to proper format (None if all are None)
+        sample_names = sample_names if any(s is not None for s in sample_names) else None
+        dataset_name = dataset_name_list if any(d is not None for d in dataset_name_list) else None
+        original_hw = original_hw_list if any(h is not None for h in original_hw_list) else None
+        original_images = None
+        if any(img is not None for img in original_images_list):
+            # Stack only if all images have same shape
+            try:
+                original_images = torch.stack([img for img in original_images_list if img is not None])
+            except (RuntimeError, TypeError):
+                original_images = None
+        original_intrinsics = None
+        if any(intr is not None for intr in original_intrinsics_list):
+            try:
+                original_intrinsics = torch.stack([intr for intr in original_intrinsics_list if intr is not None])
+            except (RuntimeError, TypeError):
+                original_intrinsics = None
+
+        # Build per-prompt data (SAM3 original: per-category queries)
+        # If use_geometry_prompts=True: Each category creates TWO queries
+        #   - TEXT query (one-to-many targets)
+        #   - GEOMETRY query (one-to-one target)
+        # If use_geometry_prompts=False: Original behavior (text or visual per category)
         img_ids_list = []
         text_ids_list = []
-        geo_boxes_list = []  # normalized cxcywh
+        geo_boxes_list = []  # normalized cxcywh (for visual/geometry queries)
         geo_points_list = []  # normalized xy with labels
-        gt_boxes2d_list = []  # normalized xyxy
-        gt_boxes3d_list = []
+        is_visual_query_list = []  # Track which queries have visual prompts
+        query_types_list = []  # Track query types: 0=TEXT, 2=GEOMETRY
+
+        # Multi-instance targets: list of lists
+        # gt_boxes2d_per_query[i] = list of normalized xyxy boxes for query i
+        gt_boxes2d_per_query = []
+        gt_boxes3d_per_query = []
         gt_category_ids_list = []
 
         # Build unique text list
@@ -408,72 +572,160 @@ class SAM3_3DCollator:
             class_names = sample.get("boxes2d_names", None)  # List[str] or None
             masks2d = sample.get("masks2d", None)  # (N_i, H, W) or None
 
-            # Check if sample has query_types from SAM3DPromptSampler
-            query_types = sample.get("query_types", None)  # List[str] or None
-            text_prompts_from_sampler = sample.get("text_prompts", None)  # List[str] or None
-            geo_boxes_from_sampler = sample.get("geo_boxes", None)  # (N_i, K, 4) or None
-            geo_points_from_sampler = sample.get("geo_points", None)  # (N_i, P, 2) or None
-
             if boxes2d is None or len(boxes2d) == 0:
                 continue
 
-            n_boxes = min(len(boxes2d), self.max_prompts_per_image)
-
-            for box_idx in range(n_boxes):
-                # Image index for this prompt
-                img_ids_list.append(img_idx)
-
-                # Determine text prompt based on query type or batch-level setting
-                if query_types is not None and box_idx < len(query_types):
-                    # Per-sample query type from SAM3DPromptSampler
-                    query_type = query_types[box_idx]
-                    use_text_this_prompt = query_type in ["TEXT", "TEXT_GEOMETRIC"]
-                    use_geo_this_prompt = query_type in ["GEOMETRIC", "TEXT_GEOMETRIC"]
-
-                    if text_prompts_from_sampler is not None and box_idx < len(text_prompts_from_sampler):
-                        text = text_prompts_from_sampler[box_idx]
-                    else:
-                        text = self.default_text
+            # ========== SAM3 Original: Group boxes by category ==========
+            # This is the key difference from the old per-box design
+            cat_to_box_indices = defaultdict(list)
+            for box_idx in range(len(boxes2d)):
+                if class_ids is not None:
+                    cat_id = class_ids[box_idx]
+                    if isinstance(cat_id, torch.Tensor):
+                        cat_id = cat_id.item()
                 else:
-                    # Batch-level settings (original behavior)
-                    use_text_this_prompt = self.use_text_prompts
-                    use_geo_this_prompt = self.use_box_prompts or self.use_point_prompts
+                    cat_id = 0  # Default category if no class info
+                cat_to_box_indices[cat_id].append(box_idx)
 
-                    if use_text_this_prompt and class_names is not None:
-                        text = class_names[box_idx] if box_idx < len(class_names) else self.default_text
+            # Limit number of categories (queries) per image
+            categories = list(cat_to_box_indices.keys())
+            if len(categories) > self.max_prompts_per_image:
+                categories = categories[:self.max_prompts_per_image]
+
+            # ========== Create queries per category ==========
+            # If use_geometry_prompts=True: Create TWO queries per category
+            #   - TEXT query (one-to-many targets)
+            #   - GEOMETRY query (one-to-one target)
+            # If use_geometry_prompts=False: Original text/visual random selection
+            for cat_id in categories:
+                box_indices = cat_to_box_indices[cat_id]
+
+                # Get category name for text
+                if self.use_text_prompts and class_names is not None:
+                    cat_name = class_names[cat_id] if cat_id < len(class_names) else self.default_text
+                else:
+                    cat_name = self.default_text
+
+                # Helper function to normalize box to xyxy [0,1]
+                def normalize_box_xyxy(box_xyxy_raw):
+                    if isinstance(box_xyxy_raw, torch.Tensor):
+                        gt_box_norm = box_xyxy_raw.clone().float()
                     else:
-                        text = self.default_text
+                        gt_box_norm = torch.tensor(box_xyxy_raw, dtype=torch.float32)
+                    gt_box_norm[0::2] /= W
+                    gt_box_norm[1::2] /= H
+                    return gt_box_norm.to(device)
 
-                if text not in text_to_id:
-                    text_to_id[text] = len(unique_texts)
-                    unique_texts.append(text)
-                text_ids_list.append(text_to_id[text])
+                # Helper function to convert xyxy to cxcywh
+                def xyxy_to_cxcywh(box_norm_xyxy):
+                    cx = (box_norm_xyxy[0] + box_norm_xyxy[2]) / 2
+                    cy = (box_norm_xyxy[1] + box_norm_xyxy[3]) / 2
+                    w_box = box_norm_xyxy[2] - box_norm_xyxy[0]
+                    h_box = box_norm_xyxy[3] - box_norm_xyxy[1]
+                    return torch.tensor([cx, cy, w_box, h_box], device=device)
 
-                # Get box in pixel xyxy
-                box_xyxy = boxes2d[box_idx]  # (4,) pixel xyxy
-                box_xyxy_np = box_xyxy.cpu().numpy() if isinstance(box_xyxy, torch.Tensor) else box_xyxy
+                if self.use_geometry_prompts:
+                    # ========== NEW: Text + Geometry Training ==========
+                    # Create TWO queries per category
 
-                # Check if geometric prompts come from SAM3DPromptSampler
-                use_box_from_sampler = (
-                    geo_boxes_from_sampler is not None
-                    and box_idx < len(geo_boxes_from_sampler)
-                    and geo_boxes_from_sampler[box_idx].abs().sum() > 0
-                )
-                use_point_from_sampler = (
-                    geo_points_from_sampler is not None
-                    and box_idx < len(geo_points_from_sampler)
-                    and geo_points_from_sampler[box_idx].abs().sum() > 0
-                )
+                    # ----- Query 1: TEXT query (one-to-many) -----
+                    img_ids_list.append(img_idx)
+                    gt_category_ids_list.append(cat_id)
+                    query_types_list.append(0)  # TEXT
+                    is_visual_query_list.append(False)
 
-                # Box prompt handling
-                if query_types is not None and box_idx < len(query_types):
-                    # Per-sample decision from PromptSampler
-                    if use_geo_this_prompt and use_box_from_sampler:
-                        # Use box from SAM3DPromptSampler (already in normalized cxcywh)
-                        geo_box = geo_boxes_from_sampler[box_idx, 0]  # (4,) normalized cxcywh
-                        geo_boxes_list.append(geo_box.to(device))
-                    elif use_geo_this_prompt and not use_box_from_sampler and not use_point_from_sampler:
-                        # Fallback: generate box prompt from GT
+                    # Text = category name
+                    if cat_name not in text_to_id:
+                        text_to_id[cat_name] = len(unique_texts)
+                        unique_texts.append(cat_name)
+                    text_ids_list.append(text_to_id[cat_name])
+
+                    # No geometry prompt for text query
+                    geo_boxes_list.append(None)
+
+                    # Targets: ALL boxes of this category (one-to-many)
+                    query_gt_boxes2d = []
+                    query_gt_boxes3d = []
+                    for box_idx in box_indices:
+                        query_gt_boxes2d.append(normalize_box_xyxy(boxes2d[box_idx]))
+                        if boxes3d is not None and box_idx < len(boxes3d):
+                            query_gt_boxes3d.append(boxes3d[box_idx].to(device))
+                    gt_boxes2d_per_query.append(query_gt_boxes2d)
+                    gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+
+                    # ----- Query 2: GEOMETRY query (one-to-one) -----
+                    img_ids_list.append(img_idx)
+                    gt_category_ids_list.append(cat_id)
+                    query_types_list.append(2)  # GEOMETRY
+                    is_visual_query_list.append(True)
+
+                    # Text = "geometric" (SAM3 convention)
+                    if self.geometric_query_str not in text_to_id:
+                        text_to_id[self.geometric_query_str] = len(unique_texts)
+                        unique_texts.append(self.geometric_query_str)
+                    text_ids_list.append(text_to_id[self.geometric_query_str])
+
+                    # Randomly select ONE box as geometry prompt
+                    selected_idx = random.choice(box_indices)
+                    box_xyxy = boxes2d[selected_idx]
+                    box_xyxy_np = box_xyxy.cpu().numpy() if isinstance(box_xyxy, torch.Tensor) else box_xyxy
+
+                    # Optionally add noise (using SAM3's noise_box logic)
+                    if self.box_noise_std > 0:
+                        box_xyxy_np = noise_box(
+                            box_xyxy_np,
+                            im_size=(H, W),
+                            box_noise_std=self.box_noise_std,
+                            box_noise_max=self.box_noise_max,
+                        )
+
+                    # Convert to normalized cxcywh for geometry encoder
+                    box_norm_xyxy = torch.tensor([
+                        box_xyxy_np[0] / W,
+                        box_xyxy_np[1] / H,
+                        box_xyxy_np[2] / W,
+                        box_xyxy_np[3] / H,
+                    ], dtype=torch.float32, device=device)
+                    geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
+
+                    # Target: ONLY the selected box (one-to-one)
+                    query_gt_boxes2d = [normalize_box_xyxy(boxes2d[selected_idx])]
+                    query_gt_boxes3d = []
+                    if boxes3d is not None and selected_idx < len(boxes3d):
+                        query_gt_boxes3d.append(boxes3d[selected_idx].to(device))
+                    gt_boxes2d_per_query.append(query_gt_boxes2d)
+                    gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+
+                else:
+                    # ========== Original: Text/Visual random selection ==========
+                    img_ids_list.append(img_idx)
+                    gt_category_ids_list.append(cat_id)
+
+                    # Decide query type: text-only or visual
+                    is_text_query = random.random() < self.text_query_prob
+                    is_visual_query = not is_text_query
+
+                    # Track query type (0=TEXT for both text and visual in original mode)
+                    query_types_list.append(0 if is_text_query else 1)  # 1=VISUAL
+                    is_visual_query_list.append(is_visual_query)
+
+                    # Determine text for this query
+                    if is_visual_query and not self.keep_text_for_visual:
+                        text = "visual"
+                    else:
+                        text = cat_name
+
+                    if text not in text_to_id:
+                        text_to_id[text] = len(unique_texts)
+                        unique_texts.append(text)
+                    text_ids_list.append(text_to_id[text])
+
+                    # Visual query: pick one target as geo_box
+                    if is_visual_query and self.use_box_prompts:
+                        selected_idx = random.choice(box_indices)
+                        box_xyxy = boxes2d[selected_idx]
+                        box_xyxy_np = box_xyxy.cpu().numpy() if isinstance(box_xyxy, torch.Tensor) else box_xyxy
+
                         if self.box_noise_std > 0:
                             box_xyxy_np = noise_box(
                                 box_xyxy_np,
@@ -481,158 +733,132 @@ class SAM3_3DCollator:
                                 box_noise_std=self.box_noise_std,
                                 box_noise_max=self.box_noise_max,
                             )
+
                         box_norm_xyxy = torch.tensor([
                             box_xyxy_np[0] / W,
                             box_xyxy_np[1] / H,
                             box_xyxy_np[2] / W,
                             box_xyxy_np[3] / H,
                         ], dtype=torch.float32, device=device)
-                        cx = (box_norm_xyxy[0] + box_norm_xyxy[2]) / 2
-                        cy = (box_norm_xyxy[1] + box_norm_xyxy[3]) / 2
-                        w = box_norm_xyxy[2] - box_norm_xyxy[0]
-                        h = box_norm_xyxy[3] - box_norm_xyxy[1]
-                        geo_boxes_list.append(torch.tensor([cx, cy, w, h], device=device))
-                else:
-                    # Batch-level setting (original behavior)
-                    if self.use_box_prompts:
-                        if self.box_noise_std > 0:
-                            box_xyxy_np = noise_box(
-                                box_xyxy_np,
-                                im_size=(H, W),
-                                box_noise_std=self.box_noise_std,
-                                box_noise_max=self.box_noise_max,
-                            )
-                        box_norm_xyxy = torch.tensor([
-                            box_xyxy_np[0] / W,
-                            box_xyxy_np[1] / H,
-                            box_xyxy_np[2] / W,
-                            box_xyxy_np[3] / H,
-                        ], dtype=torch.float32, device=device)
-                        cx = (box_norm_xyxy[0] + box_norm_xyxy[2]) / 2
-                        cy = (box_norm_xyxy[1] + box_norm_xyxy[3]) / 2
-                        w = box_norm_xyxy[2] - box_norm_xyxy[0]
-                        h = box_norm_xyxy[3] - box_norm_xyxy[1]
-                        geo_boxes_list.append(torch.tensor([cx, cy, w, h], device=device))
+                        geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
+                    else:
+                        geo_boxes_list.append(None)
 
-                # Point prompt handling
-                if query_types is not None and box_idx < len(query_types):
-                    # Per-sample decision from PromptSampler
-                    if use_geo_this_prompt and use_point_from_sampler:
-                        # Use points from SAM3DPromptSampler (already normalized)
-                        geo_pts = geo_points_from_sampler[box_idx]  # (P, 2) normalized xy
-                        # Add labels (all positive)
-                        labels = torch.ones(geo_pts.shape[0], 1, dtype=torch.float32, device=device)
-                        pts_with_labels = torch.cat([geo_pts.to(device), labels], dim=1)  # (P, 3)
-                        geo_points_list.append(pts_with_labels)
-                else:
-                    # Batch-level setting (original behavior)
-                    if self.use_point_prompts:
-                        # Get mask for this box if available
-                        mask = None
-                        if masks2d is not None and box_idx < len(masks2d):
-                            mask = masks2d[box_idx]
-                            if isinstance(mask, torch.Tensor):
-                                mask = mask.cpu().numpy()
-
-                        # Sample points (in pixel coords)
-                        points = self._sample_points_for_box(
-                            boxes2d[box_idx].cpu().numpy() if isinstance(boxes2d[box_idx], torch.Tensor) else boxes2d[box_idx],
-                            mask, H, W
-                        )  # (N_pts, 3) with (x, y, label)
-
-                        # Normalize to [0, 1]
-                        points_normalized = points.copy()
-                        points_normalized[:, 0] /= W
-                        points_normalized[:, 1] /= H
-
-                        geo_points_list.append(torch.tensor(points_normalized, dtype=torch.float32, device=device))
-
-                # GT boxes for loss (use original GT, not jittered)
-                original_box_xyxy = boxes2d[box_idx]
-                if isinstance(original_box_xyxy, torch.Tensor):
-                    gt_box_norm = original_box_xyxy.clone().float()
-                else:
-                    gt_box_norm = torch.tensor(original_box_xyxy, dtype=torch.float32)
-                gt_box_norm[0::2] /= W
-                gt_box_norm[1::2] /= H
-                gt_boxes2d_list.append(gt_box_norm.to(device))
-
-                if boxes3d is not None and box_idx < len(boxes3d):
-                    gt_boxes3d_list.append(boxes3d[box_idx])
-                if class_ids is not None and box_idx < len(class_ids):
-                    gt_category_ids_list.append(class_ids[box_idx])
+                    # Multi-instance targets: ALL boxes of this category
+                    query_gt_boxes2d = []
+                    query_gt_boxes3d = []
+                    for box_idx in box_indices:
+                        query_gt_boxes2d.append(normalize_box_xyxy(boxes2d[box_idx]))
+                        if boxes3d is not None and box_idx < len(boxes3d):
+                            query_gt_boxes3d.append(boxes3d[box_idx].to(device))
+                    gt_boxes2d_per_query.append(query_gt_boxes2d)
+                    gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
 
         N_prompts = len(img_ids_list)
 
         if N_prompts == 0:
-            # Handle empty batch
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(
+                f"[SAM3_3DCollator] WARNING: Unexpected N_prompts=0 "
+                f"(B={B} images passed filter) on rank {rank}"
+            )
             return SAM3_3DBatchedInputs(
                 images=images,
                 intrinsics=intrinsics,
                 img_ids=torch.zeros(0, dtype=torch.long, device=device),
                 text_ids=torch.zeros(0, dtype=torch.long, device=device),
                 unique_texts=[self.default_text],
+                sample_names=sample_names,
+                dataset_name=dataset_name,
+                original_hw=original_hw,
+                original_images=original_images,
+                original_intrinsics=original_intrinsics,
             )
 
         # Stack tensors
         img_ids = torch.tensor(img_ids_list, dtype=torch.long, device=device)
         text_ids = torch.tensor(text_ids_list, dtype=torch.long, device=device)
 
-        # Box prompts: (N_prompts, 1, 4) - one box per prompt
+        # ========== Box prompts for visual queries ==========
+        # geo_boxes: (N_prompts, 1, 4) - None for text-only queries
         geo_boxes = None
         geo_boxes_mask = None
         geo_box_labels = None
-        if self.use_box_prompts and geo_boxes_list:
-            geo_boxes = torch.stack(geo_boxes_list).unsqueeze(1)  # (N, 1, 4)
-            geo_boxes_mask = torch.zeros(N_prompts, 1, dtype=torch.bool, device=device)
-            geo_box_labels = torch.ones(N_prompts, 1, dtype=torch.long, device=device)
 
-        # Point prompts: (N_prompts, max_P, 2) with labels
-        geo_points = None
-        geo_points_mask = None
-        geo_point_labels = None
-        if self.use_point_prompts and geo_points_list:
-            # Pad to same length
-            max_points = max(p.shape[0] for p in geo_points_list)
-            padded_points = []
-            padded_labels = []
-            padded_mask = []
-
-            for pts in geo_points_list:
-                n_pts = pts.shape[0]
-                # Points (x, y)
-                pts_xy = pts[:, :2]
-                pts_labels = pts[:, 2].long()
-
-                if n_pts < max_points:
-                    # Pad with zeros
-                    pad_size = max_points - n_pts
-                    pts_xy = torch.cat([pts_xy, torch.zeros(pad_size, 2, device=device)], dim=0)
-                    pts_labels = torch.cat([pts_labels, torch.zeros(pad_size, dtype=torch.long, device=device)], dim=0)
-                    mask = torch.cat([
-                        torch.zeros(n_pts, dtype=torch.bool, device=device),
-                        torch.ones(pad_size, dtype=torch.bool, device=device)
-                    ], dim=0)
+        # Check if any visual queries exist
+        has_visual = any(g is not None for g in geo_boxes_list)
+        if has_visual:
+            # Stack geo_boxes, use zeros for text-only queries
+            stacked_geo_boxes = []
+            for g in geo_boxes_list:
+                if g is not None:
+                    stacked_geo_boxes.append(g)
                 else:
-                    mask = torch.zeros(n_pts, dtype=torch.bool, device=device)
+                    stacked_geo_boxes.append(torch.zeros(4, device=device))
+            geo_boxes = torch.stack(stacked_geo_boxes).unsqueeze(1)  # (N, 1, 4)
 
-                padded_points.append(pts_xy)
-                padded_labels.append(pts_labels)
-                padded_mask.append(mask)
+            # Mask: True = padding (i.e., text-only queries have no valid box)
+            geo_boxes_mask = torch.tensor(
+                [[g is None] for g in geo_boxes_list],
+                dtype=torch.bool, device=device
+            )  # (N, 1)
 
-            geo_points = torch.stack(padded_points)  # (N, max_P, 2)
-            geo_point_labels = torch.stack(padded_labels)  # (N, max_P)
-            geo_points_mask = torch.stack(padded_mask)  # (N, max_P)
+            # Labels: 1 for positive (valid) boxes
+            geo_box_labels = torch.tensor(
+                [[1 if g is not None else 0] for g in geo_boxes_list],
+                dtype=torch.long, device=device
+            )  # (N, 1)
 
-        # GT for loss
-        gt_boxes2d = torch.stack(gt_boxes2d_list) if gt_boxes2d_list else None
-        gt_boxes3d = torch.stack(gt_boxes3d_list) if gt_boxes3d_list else None
-        gt_category_ids = torch.tensor(gt_category_ids_list, dtype=torch.long, device=device) if gt_category_ids_list else None
+        # ========== Multi-instance GT boxes: pad to (N_prompts, max_gt, 4) ==========
+        # Find max number of targets per query
+        max_gt = max(len(q) for q in gt_boxes2d_per_query) if gt_boxes2d_per_query else 1
+        num_gts_list = []
 
-        # Count GTs per image
-        num_gts = torch.zeros(B, dtype=torch.long, device=device)
-        for idx in img_ids_list:
-            num_gts[idx] += 1
+        gt_boxes2d_padded = []
+        for query_boxes in gt_boxes2d_per_query:
+            n_gt = len(query_boxes)
+            num_gts_list.append(n_gt)
+
+            if n_gt < max_gt:
+                # Pad with zeros
+                padded = query_boxes + [torch.zeros(4, device=device)] * (max_gt - n_gt)
+            else:
+                padded = query_boxes
+            gt_boxes2d_padded.append(torch.stack(padded))
+
+        gt_boxes2d = torch.stack(gt_boxes2d_padded)  # (N_prompts, max_gt, 4)
+        num_gts = torch.tensor(num_gts_list, dtype=torch.long, device=device)  # (N_prompts,)
+
+        # 3D boxes (if available)
+        gt_boxes3d = None
+        if any(q is not None for q in gt_boxes3d_per_query):
+            # Get 3D box dimension from first valid entry
+            box3d_dim = None
+            for q in gt_boxes3d_per_query:
+                if q is not None and len(q) > 0:
+                    box3d_dim = q[0].shape[-1]
+                    break
+
+            if box3d_dim is not None:
+                gt_boxes3d_padded = []
+                for query_boxes in gt_boxes3d_per_query:
+                    if query_boxes is None or len(query_boxes) == 0:
+                        # No 3D boxes for this query
+                        padded = [torch.zeros(box3d_dim, device=device)] * max_gt
+                    else:
+                        n_gt = len(query_boxes)
+                        if n_gt < max_gt:
+                            padded = query_boxes + [torch.zeros(box3d_dim, device=device)] * (max_gt - n_gt)
+                        else:
+                            padded = query_boxes
+                    gt_boxes3d_padded.append(torch.stack(padded))
+                gt_boxes3d = torch.stack(gt_boxes3d_padded)  # (N_prompts, max_gt, box3d_dim)
+
+        gt_category_ids = torch.tensor(gt_category_ids_list, dtype=torch.long, device=device)
+
+        # Query types: 0=TEXT, 1=VISUAL, 2=GEOMETRY
+        query_types = torch.tensor(query_types_list, dtype=torch.long, device=device)
 
         return SAM3_3DBatchedInputs(
             images=images,
@@ -643,13 +869,23 @@ class SAM3_3DCollator:
             geo_boxes=geo_boxes,
             geo_boxes_mask=geo_boxes_mask,
             geo_box_labels=geo_box_labels,
-            geo_points=geo_points,
-            geo_points_mask=geo_points_mask,
-            geo_point_labels=geo_point_labels,
+            geo_points=None,  # Point prompts not implemented in per-category design yet
+            geo_points_mask=None,
+            geo_point_labels=None,
             gt_boxes2d=gt_boxes2d,
             gt_boxes3d=gt_boxes3d,
             num_gts=num_gts,
             gt_category_ids=gt_category_ids,
+            query_types=query_types,
+            # Metadata for evaluation/visualization
+            sample_names=sample_names,
+            dataset_name=dataset_name,
+            original_hw=original_hw,
+            original_images=original_images,
+            original_intrinsics=original_intrinsics,
+            # Depth ground truth for geometry backend supervision
+            depth_gt=depth_gt,
+            depth_mask=None,  # Not yet implemented
         )
 
 
@@ -703,9 +939,12 @@ CONN_SAM3_3D_LOSS = {
         "boxes_xyxy": data_key(K.boxes2d),  # Will be converted
         "boxes_3d": data_key(K.boxes3d),
         "num_boxes": data_key("num_boxes"),
+        "image_size": data_key(K.input_hw),  # (H, W) for pixel coordinate conversion
     },
     # Camera
     "intrinsics": data_key(K.intrinsics),
+    # Image size for pixel coordinate conversion (following GDino3D)
+    "image_size": data_key(K.input_hw),
 }
 
 # Evaluation connector
@@ -728,19 +967,67 @@ CONN_SAM3_3D_VIS = {
 }
 
 
+class SAM3_3DPassthroughConnector:
+    """Data connector that passes SAM3_3DBatchedInputs directly to model.
+
+    Since SAM3_3DCollator already produces SAM3_3DBatchedInputs with all needed
+    data, we just pass it through as the 'batch' parameter to model.forward().
+
+    This bypasses the key_mapping approach used by vis4d's DataConnector,
+    which expects raw DataLoader output format.
+    """
+
+    def __call__(self, data: SAM3_3DBatchedInputs) -> dict:
+        """Pass batch directly to model.
+
+        Args:
+            data: SAM3_3DBatchedInputs from collator
+
+        Returns:
+            Dict with 'batch' key pointing to the input data
+        """
+        return {"batch": data}
+
+
+class SAM3_3DLossConnector:
+    """Loss connector that passes model output and batch directly to loss.
+
+    Similar to SAM3_3DPassthroughConnector, this bypasses vis4d's key_mapping
+    since SAM3_3DLoss expects structured objects (SAM3_3DOut, SAM3_3DBatchedInputs).
+
+    This connector is used with LossModule to enable proper wandb logging of
+    individual loss components (loss_cls, loss_bbox, loss_giou, etc.).
+    """
+
+    def __call__(self, predictions, batch: SAM3_3DBatchedInputs) -> dict:
+        """Map model output and batch to loss function inputs.
+
+        Args:
+            predictions: SAM3_3DOut from model.forward()
+            batch: SAM3_3DBatchedInputs from collator
+
+        Returns:
+            Dict with 'out' and 'batch' keys for SAM3_3DLoss.forward()
+        """
+        return {
+            "out": predictions,
+            "batch": batch,
+        }
+
+
 def get_sam3_3d_data_connector_cfg() -> tuple[ConfigDict, ConfigDict]:
     """Get SAM3_3D data connector configuration.
 
     Returns:
         Tuple of (train_connector, test_connector).
-    """
-    train_data_connector = class_config(
-        DataConnector, key_mapping=CONN_SAM3_3D_TRAIN
-    )
 
-    test_data_connector = class_config(
-        DataConnector, key_mapping=CONN_SAM3_3D_TEST
-    )
+    Note:
+        Uses SAM3_3DPassthroughConnector which passes the collated batch
+        directly to model.forward(batch=...), rather than mapping individual
+        keys like standard vis4d DataConnector.
+    """
+    train_data_connector = class_config(SAM3_3DPassthroughConnector)
+    test_data_connector = class_config(SAM3_3DPassthroughConnector)
 
     return train_data_connector, test_data_connector
 
@@ -757,13 +1044,17 @@ def get_sam3_3d_collator_cfg(
     use_box_prompts: bool = True,
     box_noise_std: float = 0.0,
     box_noise_max: float | None = 20.0,
+    # Text/Visual query ratio (SAM3 original design)
+    text_query_prob: float = 0.7,
+    keep_text_for_visual: bool = False,
 ) -> ConfigDict:
     """Get SAM3_3D collator configuration.
 
     The collator converts per-image DataLoader output to SAM3_3DBatchedInputs.
+    Following SAM3 original design: per-category queries with multi-instance targets.
 
     Args:
-        max_prompts_per_image: Max prompts (GT boxes) per image
+        max_prompts_per_image: Max prompts (categories) per image
         use_text_prompts: Whether to include text with geometric prompts
         use_point_prompts: Whether to sample point prompts (for ablation)
         num_positive_points: Number of positive points to sample
@@ -777,6 +1068,12 @@ def get_sam3_3d_collator_cfg(
         use_box_prompts: Whether to use box prompts
         box_noise_std: Noise std for box jittering (0 = no noise)
         box_noise_max: Max noise in pixels
+        text_query_prob: Probability of text-only queries (SAM3 recommended: 0.7)
+            1.0 = all text queries (pure text training)
+            0.7 = 70% text, 30% visual (SAM3 mixed training)
+            0.0 = all visual queries (DetAny3D style)
+        keep_text_for_visual: If True, visual queries keep category text
+            If False (default), visual queries use "visual" as text
 
     Returns:
         Collator configuration
@@ -792,4 +1089,6 @@ def get_sam3_3d_collator_cfg(
         use_box_prompts=use_box_prompts,
         box_noise_std=box_noise_std,
         box_noise_max=box_noise_max,
+        text_query_prob=text_query_prob,
+        keep_text_for_visual=keep_text_for_visual,
     )

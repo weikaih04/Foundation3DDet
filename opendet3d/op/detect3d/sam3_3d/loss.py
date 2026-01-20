@@ -74,6 +74,13 @@ class SAM3_3DLossConfig:
 
     Follows SAM3's loss configuration style with additional 3D loss weights.
     """
+    # ========== Global Scale Factors ==========
+    # These allow adjusting the balance between 2D, 3D, and geometry losses
+    # Default 1.0, can be adjusted in training config to tune 2D:3D:Geom ratio
+    loss_2d_scale: float = 1.0  # Scale for 2D losses (cls, bbox, giou)
+    loss_3d_scale: float = 1.0  # Scale for 3D losses (delta, depth, dim, rot)
+    loss_geom_scale: float = 10.0  # Scale for geometry backend losses (SILog, SSI, camera angles)
+
     # ========== Matcher Configuration ==========
     matcher_cost_class: float = 2.0
     matcher_cost_bbox: float = 5.0
@@ -88,9 +95,9 @@ class SAM3_3DLossConfig:
 
     # ========== 2D Loss Weights (SAM3 style) ==========
     # Classification loss (IABCEMdetr style)
-    loss_cls_weight: float = 20.0  # Fixed: was 2.0
-    pos_weight: float = 10.0  # Fixed: was 1.0
-    gamma: float = 0.0  # Focal loss gamma (0 = no focal)
+    loss_cls_weight: float = 20.0  # SAM3 original
+    pos_weight: float = 5.0  # SAM3 original (was incorrectly 10.0)
+    gamma: float = 2.0  # SAM3 original focal (was incorrectly 0.0)
     alpha: float = 0.25  # IoU-aware alpha
 
     # IABCEMdetr advanced features
@@ -113,6 +120,7 @@ class SAM3_3DLossConfig:
     loss_silog_weight: float = 1.0  # SILog depth loss
     loss_phi_weight: float = 0.1  # Phi angle loss
     loss_theta_weight: float = 0.1  # Theta angle loss
+    loss_opt_ssi_weight: float = 0.5  # SSI loss weight (UniDepthV2)
     
     # ========== Normalization ==========
     normalization: Literal["global", "local", "none"] = "global"
@@ -169,41 +177,138 @@ class SAM3_3DLoss(nn.Module):
             )
         else:
             self.o2m_matcher = None
-    
+
+    def _build_targets_from_batch(
+        self, batch: "SAM3_3DBatchedInputs"
+    ) -> dict[str, Tensor]:
+        """Build targets dict from SAM3_3DBatchedInputs.
+
+        SAM3_3D uses per-category queries with multi-instance targets.
+        The collator produces:
+        - gt_boxes2d: (N_prompts, max_gt, 4) - multiple GTs per query
+        - gt_boxes3d: (N_prompts, max_gt, 12) - multiple GTs per query (if available)
+        - num_gts: (N_prompts,) - number of valid GTs per query (can be > 1)
+
+        We convert this to the packed format expected by loss computation.
+
+        Args:
+            batch: SAM3_3DBatchedInputs containing GT boxes
+
+        Returns:
+            targets dict with:
+            - boxes_xyxy: (N_total, 4) GT boxes in xyxy format (packed)
+            - boxes_3d: (N_total, 12) 3D GT boxes (packed)
+            - num_boxes: (N_prompts,) number of GTs per query
+            - intrinsics: (N_prompts, 3, 3) camera intrinsics per prompt
+        """
+        device = batch.images.device
+        N_prompts = batch.img_ids.shape[0]
+
+        # Extract GT from batch
+        gt_boxes2d = batch.gt_boxes2d  # (N_prompts, max_gt, 4) or (N_prompts, 4)
+        gt_boxes3d = batch.gt_boxes3d  # (N_prompts, max_gt, 12) or None
+        num_gts = batch.num_gts  # (N_prompts,) number of valid GTs per query
+
+        if gt_boxes2d is None:
+            # No GT available
+            return {
+                "boxes_xyxy": torch.zeros(0, 4, device=device),
+                "boxes_3d": torch.zeros(0, 12, device=device),
+                "classes": torch.zeros(0, dtype=torch.long, device=device),
+                "num_boxes": torch.zeros(N_prompts, dtype=torch.long, device=device),
+                "intrinsics": batch.intrinsics[batch.img_ids],
+            }
+
+        # Handle both old (N_prompts, 4) and new (N_prompts, max_gt, 4) formats
+        if gt_boxes2d.dim() == 2:
+            # Old format: (N_prompts, 4) - single GT per prompt
+            boxes_xyxy = gt_boxes2d
+            if num_gts is None:
+                num_gts = torch.ones(N_prompts, dtype=torch.long, device=device)
+
+            if gt_boxes3d is not None and gt_boxes3d.dim() == 2:
+                boxes_3d = gt_boxes3d
+            else:
+                boxes_3d = torch.zeros(N_prompts, 12, device=device)
+        else:
+            # New format: (N_prompts, max_gt, 4) - multi-instance targets
+            # Pack valid boxes into a flat tensor
+            if num_gts is None:
+                # Fallback: assume all boxes are valid
+                num_gts = torch.tensor([gt_boxes2d.shape[1]] * N_prompts, dtype=torch.long, device=device)
+
+            # Pack boxes into (N_total, 4)
+            boxes_list = []
+            boxes_3d_list = []
+            for i in range(N_prompts):
+                n_gt = num_gts[i].item()
+                boxes_list.append(gt_boxes2d[i, :n_gt])  # (n_gt, 4)
+                if gt_boxes3d is not None:
+                    boxes_3d_list.append(gt_boxes3d[i, :n_gt])  # (n_gt, 12)
+
+            if boxes_list:
+                boxes_xyxy = torch.cat(boxes_list, dim=0)  # (N_total, 4)
+            else:
+                boxes_xyxy = torch.zeros(0, 4, device=device)
+
+            if boxes_3d_list:
+                boxes_3d = torch.cat(boxes_3d_list, dim=0)  # (N_total, 12)
+            else:
+                box3d_dim = gt_boxes3d.shape[-1] if gt_boxes3d is not None else 12
+                boxes_3d = torch.zeros(boxes_xyxy.shape[0], box3d_dim, device=device)
+
+        # SAM3 uses binary detection (all targets are class 1)
+        N_total = boxes_xyxy.shape[0]
+        classes = torch.ones(N_total, dtype=torch.long, device=device)
+
+        # Get per-prompt intrinsics
+        intrinsics = batch.intrinsics[batch.img_ids]  # (N_prompts, 3, 3)
+
+        return {
+            "boxes_xyxy": boxes_xyxy,
+            "boxes_3d": boxes_3d,
+            "classes": classes,
+            "num_boxes": num_gts,  # (N_prompts,) - can be > 1 for multi-instance
+            "intrinsics": intrinsics,
+        }
+
     def forward(
         self,
-        # Model outputs
-        pred_logits: Tensor,  # (B, S, 1)
-        pred_boxes_2d: Tensor,  # (B, S, 4) normalized xyxy
-        pred_boxes_3d: Tensor | None,  # (B, S, reg_dims)
-        aux_outputs: list[dict] | None,
-        geom_losses: dict[str, Tensor] | None,
-
-        # Targets
-        targets: dict,
-
-        # Additional info for pixel coordinate conversion
-        intrinsics: Tensor | None = None,  # (B, 3, 3)
-        image_size: tuple[int, int] | None = None,  # (H, W) for pixel coordinate conversion
+        out: "SAM3_3DOutput",
+        batch: "SAM3_3DBatchedInputs",
     ) -> dict[str, Tensor]:
         """Compute all losses.
 
-        Following GDino3D's design, we compute 2D box losses in pixel coordinate space
-        for better numerical stability and to allow direct copying of loss weights.
+        vis4d LossModule interface: expects either Tensor, dict, or namedtuple.
+        We return a dict of tensors, and LossModule will sum them automatically.
+
+        Following SAM3 and GDino3D's design, we compute 2D box L1 loss in normalized
+        cxcywh space and GIoU loss in pixel xyxy space for consistent loss weights.
 
         Args:
-            pred_logits: Predicted objectness logits
-            pred_boxes_2d: Predicted 2D boxes (normalized xyxy)
-            pred_boxes_3d: Predicted 3D box parameters
-            aux_outputs: Auxiliary outputs from decoder layers
-            geom_losses: Geometry backend losses
-            targets: Ground truth targets
-            intrinsics: Camera intrinsics for 3D loss
-            image_size: (H, W) for converting normalized coords to pixel coords
+            out: Model output (SAM3_3DOutput dataclass)
+            batch: Input batch (SAM3_3DBatchedInputs dataclass)
 
         Returns:
-            Dictionary of loss values
+            Dict of loss tensors (vis4d LossModule will sum them)
         """
+        # Unpack model outputs
+        pred_logits = out.pred_logits
+        pred_boxes_2d = out.pred_boxes_2d
+        pred_boxes_3d = out.pred_boxes_3d
+        aux_outputs = out.aux_outputs
+        geom_losses = out.geom_losses
+
+        # Build targets from batch
+        # Get per-prompt intrinsics by indexing into batch intrinsics
+        B_images = batch.images.shape[0]
+        N_prompts = batch.img_ids.shape[0]
+        intrinsics = batch.intrinsics[batch.img_ids]  # (N_prompts, 3, 3)
+
+        # Image size from batch
+        image_size = (batch.images.shape[2], batch.images.shape[3])  # (H, W)
+
+        targets = self._build_targets_from_batch(batch)
         losses = {}
 
         # Normalize targets to [0, 1] range (for matching and computation)
@@ -213,81 +318,107 @@ class SAM3_3DLoss(nn.Module):
         if image_size is None and "image_size" in targets:
             image_size = targets["image_size"]
 
-        # Compute matching indices using BinaryHungarianMatcher
-        outputs_dict = {
-            "pred_logits": pred_logits,  # (B, S, 1)
-            "pred_boxes": self._xyxy_to_cxcywh(pred_boxes_2d),  # (B, S, 4) cxcywh
-        }
+        # Get matching indices from SAM3's internal matching
+        # SAM3's forward_grounding computes indices via _compute_matching when find_target is provided
+        # Handle empty batch (N_prompts=0) case - return zero loss with grad
+        if out.indices is None:
+            device = pred_logits.device
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"[SAM3_3D Loss] Empty batch detected on rank {rank}, returning zero loss")
 
-        # Matcher expects concatenated boxes across all batches
-        targets_dict = {
-            "boxes": self._xyxy_to_cxcywh(normalized_targets["boxes_xyxy"]),  # (N_total, 4)
-            "labels": normalized_targets["classes"],  # (N_total,)
-            "num_boxes": normalized_targets.get("num_boxes", torch.tensor([normalized_targets["boxes_xyxy"].shape[0]], device=normalized_targets["boxes_xyxy"].device)),
-        }
+            # CRITICAL: Must still participate in all_reduce to prevent DDP deadlock
+            # Other ranks may have non-empty batches and will call all_reduce
+            if self.config.normalization == "global" and torch.distributed.is_initialized():
+                dummy_num_boxes = torch.tensor(0.0, device=device)
+                torch.distributed.all_reduce(dummy_num_boxes)
 
-        # Run matcher
-        indices_list = self.matcher(outputs_dict, targets_dict)
+            # Use pred_logits.sum() * 0 to maintain computation graph for DDP
+            zero_loss = pred_logits.sum() * 0
+            return {
+                "loss_cls": zero_loss,  # Keep grad for DDP
+                "loss_bbox": zero_loss.clone(),
+                "loss_giou": zero_loss.clone(),
+            }
 
-        # Convert list of tuples to flat tensors
-        batch_idx_list = []
-        src_idx_list = []
-        for i, (src, _) in enumerate(indices_list):
-            # Handle both 1-D and 0-D tensors
-            if src.ndim == 0:
-                # Single match, convert to list
-                src_list = [src.item()]
-            else:
-                src_list = src.tolist()
+        batch_idx, src_idx, tgt_idx = out.indices
 
-            batch_idx_list.extend([i] * len(src_list))
-            src_idx_list.extend(src_list)
+        # Move indices to the same device as predictions
+        batch_idx = batch_idx.to(pred_logits.device)
+        src_idx = src_idx.to(pred_logits.device)
+        tgt_idx = tgt_idx.to(pred_logits.device) if tgt_idx is not None else None
 
-        batch_idx = torch.tensor(batch_idx_list, dtype=torch.long, device=pred_logits.device) if batch_idx_list else torch.empty(0, dtype=torch.long, device=pred_logits.device)
-        src_idx = torch.tensor(src_idx_list, dtype=torch.long, device=pred_logits.device) if src_idx_list else torch.empty(0, dtype=torch.long, device=pred_logits.device)
-        indices = (batch_idx, src_idx, None)
+        indices = (batch_idx, src_idx, tgt_idx)
 
         # Get number of boxes for normalization
         num_boxes = self._get_num_boxes(normalized_targets)
         
-        # ========== 2D Losses ==========
+        # ========== 2D Losses (scaled by loss_2d_scale) ==========
         loss_cls = self._loss_classification(
             pred_logits, pred_boxes_2d, indices, normalized_targets, num_boxes
         )
-        losses["loss_cls"] = loss_cls * self.config.loss_cls_weight
+        losses["loss_cls"] = (
+            self.config.loss_2d_scale * loss_cls * self.config.loss_cls_weight
+        )
 
         # Presence loss (empty image detection)
         if self.config.use_presence:
             loss_presence = self._loss_presence(pred_logits, normalized_targets)
-            losses["loss_presence"] = loss_presence * self.config.presence_loss_weight
+            losses["loss_presence"] = (
+                self.config.loss_2d_scale * loss_presence * self.config.presence_loss_weight
+            )
 
-        # 2D box losses (in pixel coordinate space following GDino3D)
+        # 2D box losses (L1 in normalized cxcywh, GIoU in pixel xyxy - following SAM3/GDino3D)
         loss_bbox, loss_giou = self._loss_boxes_2d(
             pred_boxes_2d, indices, normalized_targets, num_boxes, image_size
         )
-        losses["loss_bbox"] = loss_bbox * self.config.loss_bbox_weight
-        losses["loss_giou"] = loss_giou * self.config.loss_giou_weight
+        losses["loss_bbox"] = (
+            self.config.loss_2d_scale * loss_bbox * self.config.loss_bbox_weight
+        )
+        losses["loss_giou"] = (
+            self.config.loss_2d_scale * loss_giou * self.config.loss_giou_weight
+        )
 
-        # ========== O2M Loss ==========
+        # ========== O2M Loss (2D scaled by loss_2d_scale, 3D scaled by loss_3d_scale) ==========
         if self.config.use_o2m and self.o2m_matcher is not None:
             o2m_losses = self._loss_o2m(
-                pred_logits, pred_boxes_2d, normalized_targets, num_boxes
+                pred_logits=pred_logits,
+                pred_boxes_2d=pred_boxes_2d,
+                pred_boxes_3d=pred_boxes_3d,
+                targets=normalized_targets,
+                num_boxes=num_boxes,
+                intrinsics=intrinsics,
+                image_size=image_size,
             )
+            # Apply appropriate scale based on loss type (2D vs 3D)
             for key, value in o2m_losses.items():
-                losses[f"o2m_{key}"] = value * self.config.o2m_loss_weight
+                if key in ("loss_delta_2d", "loss_depth", "loss_dim", "loss_rot"):
+                    # 3D losses use loss_3d_scale
+                    losses[f"o2m_{key}"] = (
+                        self.config.loss_3d_scale * value * self.config.o2m_loss_weight
+                    )
+                else:
+                    # 2D losses (loss_cls, loss_bbox, loss_giou) use loss_2d_scale
+                    losses[f"o2m_{key}"] = (
+                        self.config.loss_2d_scale * value * self.config.o2m_loss_weight
+                    )
 
-        # ========== 3D Losses ==========
+        # ========== 3D Losses (scaled by loss_3d_scale) ==========
         if pred_boxes_3d is not None and intrinsics is not None:
             loss_3d = self._loss_boxes_3d(
-                pred_boxes_2d, pred_boxes_3d, indices, normalized_targets, intrinsics, num_boxes
+                pred_boxes_2d, pred_boxes_3d, indices, normalized_targets,
+                intrinsics, num_boxes, image_size=image_size
             )
-            losses.update(loss_3d)
+            # Apply loss_3d_scale to all 3D losses
+            for key, value in loss_3d.items():
+                losses[key] = self.config.loss_3d_scale * value
 
-        # ========== Geometry Backend Losses ==========
+        # ========== Geometry Backend Losses (scaled by loss_geom_scale) ==========
         if geom_losses is not None:
             for key, value in geom_losses.items():
                 weight = getattr(self.config, f"loss_{key}_weight", 1.0)
-                losses[f"loss_{key}"] = value * weight
+                losses[f"loss_{key}"] = (
+                    self.config.loss_geom_scale * value * weight
+                )
 
         # ========== Auxiliary Losses (Deep Supervision) ==========
         if aux_outputs is not None:
@@ -298,9 +429,13 @@ class SAM3_3DLoss(nn.Module):
                 for key, value in aux_losses.items():
                     losses[f"d{i}.{key}"] = value * self.config.aux_loss_weight
         
-        # ========== Total Loss ==========
-        losses["loss_total"] = sum(v for k, v in losses.items() if k.startswith("loss_"))
+        # ========== Ensure all losses are tensors ==========
+        # vis4d LossModule expects dict of tensors
+        for k, v in list(losses.items()):
+            if not isinstance(v, Tensor):
+                losses[k] = torch.tensor(v, device=pred_logits.device)
 
+        # vis4d LossModule will sum all losses in the dict automatically
         return losses
 
     def _get_num_boxes(self, targets: dict) -> Tensor:
@@ -308,9 +443,14 @@ class SAM3_3DLoss(nn.Module):
         num_boxes = targets["num_boxes"].sum().float()
 
         if self.config.normalization == "global":
-            torch.distributed.all_reduce(num_boxes)
-            world_size = torch.distributed.get_world_size()
-            num_boxes = torch.clamp(num_boxes / world_size, min=1)
+            # Handle non-distributed case
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(num_boxes)
+                world_size = torch.distributed.get_world_size()
+                num_boxes = torch.clamp(num_boxes / world_size, min=1)
+            else:
+                # Non-distributed: just clamp
+                num_boxes = torch.clamp(num_boxes, min=1)
         elif self.config.normalization == "local":
             num_boxes = torch.clamp(num_boxes, min=1)
         else:  # "none"
@@ -377,7 +517,10 @@ class SAM3_3DLoss(nn.Module):
         )
         loss_neg = loss_neg * (1 - target_classes) * (prob ** self.config.gamma) * weak_mask
 
-        loss_bce = (loss_pos + loss_neg).sum() / num_boxes
+        # SAM3 original: use mean() over all B×S logits (not sum()/num_boxes)
+        # This is different from bbox/giou which use sum()/num_boxes
+        # That's why loss_cls_weight=20 is needed to compensate
+        loss_bce = (loss_pos + loss_neg).mean()
 
         return loss_bce
 
@@ -487,22 +630,33 @@ class SAM3_3DLoss(nn.Module):
         self,
         pred_logits: Tensor,  # (B, S, 1)
         pred_boxes_2d: Tensor,  # (B, S, 4)
+        pred_boxes_3d: Tensor | None,  # (B, S, reg_dims)
         targets: dict,
         num_boxes: Tensor,
+        intrinsics: Tensor | None = None,  # (B, 3, 3)
+        image_size: tuple[int, int] | None = None,
     ) -> dict[str, Tensor]:
         """Compute O2M (One-to-Many) auxiliary loss.
 
         O2M matching allows multiple predictions to match the same GT,
         which helps improve recall and stabilize training.
 
+        Following SAM3 original design, O2M computes ALL loss components
+        (classification, 2D boxes, AND 3D boxes) for matched predictions.
+        Normalization uses num_boxes (GT count), same as O2O.
+
         Args:
             pred_logits: Predicted objectness logits
             pred_boxes_2d: Predicted 2D boxes (normalized xyxy)
+            pred_boxes_3d: Predicted 3D box parameters (optional)
             targets: Ground truth targets
-            num_boxes: Number of boxes for normalization
+            num_boxes: Number of boxes for normalization (GT count)
+            intrinsics: Camera intrinsics for 3D loss (optional)
+            image_size: (H, W) for converting to pixel coordinates
 
         Returns:
-            Dictionary with O2M losses (loss_cls, loss_bbox, loss_giou)
+            Dictionary with O2M losses (loss_cls, loss_bbox, loss_giou,
+            and optionally loss_delta_2d, loss_depth, loss_dim, loss_rot)
         """
         losses = {}
         device = pred_logits.device
@@ -542,12 +696,21 @@ class SAM3_3DLoss(nn.Module):
 
         # Handle empty matching case
         if batch_idx.numel() == 0:
-            # No matches, return zero losses
-            return {
+            # No matches, return zero losses (2D + 3D if applicable)
+            zero_losses = {
                 "loss_cls": torch.tensor(0.0, device=device),
                 "loss_bbox": torch.tensor(0.0, device=device),
                 "loss_giou": torch.tensor(0.0, device=device),
             }
+            # Add 3D zero losses if 3D data is available
+            if pred_boxes_3d is not None and intrinsics is not None and "boxes_3d" in targets:
+                zero_losses.update({
+                    "loss_delta_2d": torch.tensor(0.0, device=device),
+                    "loss_depth": torch.tensor(0.0, device=device),
+                    "loss_dim": torch.tensor(0.0, device=device),
+                    "loss_rot": torch.tensor(0.0, device=device),
+                })
+            return zero_losses
 
         # O2M Classification Loss
         src_logits = pred_logits.squeeze(-1)  # (B, S)
@@ -575,23 +738,52 @@ class SAM3_3DLoss(nn.Module):
             src_logits, positive_target_classes, reduction="none"
         )
         loss_pos = loss_pos * target_classes * self.config.pos_weight
-        loss_cls = loss_pos.sum() / num_boxes
+        # SAM3 original: use mean() for cls (same as main loss)
+        loss_cls = loss_pos.mean()
 
         losses["loss_cls"] = loss_cls
 
         # O2M Box Losses
-        src_boxes = src_boxes_xyxy  # Already extracted above
-        target_boxes = target_boxes_xyxy  # Already extracted above
+        # Following SAM3 and GDino3D's design (consistent with _loss_boxes_2d):
+        # - L1 loss: computed in normalized cxcywh space [0, 1]
+        # - GIoU loss: computed in pixel xyxy space
 
-        # L1 loss
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+        # L1 loss in normalized cxcywh space
+        src_boxes_cxcywh = self._xyxy_to_cxcywh(src_boxes_xyxy)
+        target_boxes_cxcywh = self._xyxy_to_cxcywh(target_boxes_xyxy)
+        loss_bbox = F.l1_loss(src_boxes_cxcywh, target_boxes_cxcywh, reduction="none")
         loss_bbox = loss_bbox.sum() / num_boxes
         losses["loss_bbox"] = loss_bbox
 
-        # GIoU loss
-        loss_giou = 1 - fast_diag_generalized_box_iou(src_boxes, target_boxes)
+        # GIoU loss in pixel xyxy space
+        if image_size is not None:
+            H, W = image_size
+            factors = src_boxes_xyxy.new_tensor([W, H, W, H])
+            src_boxes_pixel = src_boxes_xyxy * factors
+            target_boxes_pixel = target_boxes_xyxy * factors
+        else:
+            # Fallback to normalized coordinates
+            src_boxes_pixel = src_boxes_xyxy
+            target_boxes_pixel = target_boxes_xyxy
+
+        loss_giou = 1 - fast_diag_generalized_box_iou(src_boxes_pixel, target_boxes_pixel)
         loss_giou = loss_giou.sum() / num_boxes
         losses["loss_giou"] = loss_giou
+
+        # O2M 3D Loss - same logic as O2O, just more matched pairs
+        # Following SAM3 original design: O2M computes ALL loss components
+        if pred_boxes_3d is not None and intrinsics is not None and "boxes_3d" in targets:
+            o2m_indices = (batch_idx, src_idx, tgt_idx)
+            loss_3d = self._loss_boxes_3d(
+                pred_boxes_2d=pred_boxes_2d,
+                pred_boxes_3d=pred_boxes_3d,
+                indices=o2m_indices,
+                targets=targets,
+                intrinsics=intrinsics,
+                num_boxes=num_boxes,  # Same normalization as 2D (GT count)
+                image_size=image_size,
+            )
+            losses.update(loss_3d)
 
         return losses
 
@@ -605,15 +797,19 @@ class SAM3_3DLoss(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """Compute 2D box regression losses (L1 + GIoU).
 
-        Following GDino3D's design, we compute losses in pixel coordinate space
-        for better numerical stability and to allow direct use of GDino3D loss weights.
+        Following SAM3 and GDino3D's design:
+        - L1 loss: computed in normalized cxcywh space [0, 1]
+        - GIoU loss: computed in pixel xyxy space
+
+        This allows direct use of GDino3D loss weights (bbox_loss_weight=5.0,
+        iou_loss_weight=2.0).
 
         Args:
             pred_boxes_2d: Predicted boxes (normalized xyxy [0, 1])
             indices: Matching indices
             targets: Ground truth targets (normalized xyxy [0, 1])
             num_boxes: Number of boxes for normalization
-            image_size: (H, W) for converting to pixel coordinates
+            image_size: (H, W) for converting to pixel coordinates (for GIoU)
 
         Returns:
             (loss_bbox, loss_giou) tuple
@@ -626,23 +822,24 @@ class SAM3_3DLoss(nn.Module):
             else targets["boxes_xyxy"]
         )
 
-        # Convert normalized [0, 1] coordinates to pixel coordinates
-        # Following GDino3D: factors = [img_w, img_h, img_w, img_h]
+        # L1 loss in normalized cxcywh space (following SAM3 and GDino3D)
+        # Convert xyxy -> cxcywh for L1 loss computation
+        src_boxes_cxcywh = self._xyxy_to_cxcywh(src_boxes)
+        target_boxes_cxcywh = self._xyxy_to_cxcywh(target_boxes)
+        loss_bbox = F.l1_loss(src_boxes_cxcywh, target_boxes_cxcywh, reduction="none")
+        loss_bbox = loss_bbox.sum() / num_boxes
+
+        # GIoU loss in pixel xyxy space (following GDino3D)
         if image_size is not None:
             H, W = image_size
             factors = src_boxes.new_tensor([W, H, W, H])
             src_boxes_pixel = src_boxes * factors
             target_boxes_pixel = target_boxes * factors
         else:
-            # Fallback to normalized coordinates (original behavior)
+            # Fallback to normalized coordinates
             src_boxes_pixel = src_boxes
             target_boxes_pixel = target_boxes
 
-        # L1 loss in pixel coordinates
-        loss_bbox = F.l1_loss(src_boxes_pixel, target_boxes_pixel, reduction="none")
-        loss_bbox = loss_bbox.sum() / num_boxes
-
-        # GIoU loss (GIoU is scale-invariant, but we compute on pixel coords for consistency)
         loss_giou = 1 - fast_diag_generalized_box_iou(src_boxes_pixel, target_boxes_pixel)
         loss_giou = loss_giou.sum() / num_boxes
 
@@ -656,15 +853,35 @@ class SAM3_3DLoss(nn.Module):
         targets: dict,
         intrinsics: Tensor,
         num_boxes: Tensor,
+        image_size: tuple[int, int] | None = None,
     ) -> dict[str, Tensor]:
-        """Compute 3D box regression losses."""
+        """Compute 3D box regression losses.
+
+        Args:
+            pred_boxes_2d: Predicted 2D boxes in normalized xyxy [0,1]. Shape (B, S, 4).
+            pred_boxes_3d: Predicted 3D box parameters. Shape (B, S, reg_dims).
+            indices: Matching indices (batch_idx, src_idx, tgt_idx).
+            targets: Target dict containing boxes_3d.
+            intrinsics: Camera intrinsics. Shape (B, 3, 3).
+            num_boxes: Number of matched boxes for normalization.
+            image_size: (H, W) tuple for converting normalized to pixel coords.
+                Required for correct box_coder.encode() which expects pixel coords.
+        """
         batch_idx, src_idx, tgt_idx = indices
 
-        # Get matched predictions
-        src_boxes_2d = pred_boxes_2d[(batch_idx, src_idx)]
+        # Get matched predictions (for loss computation)
         src_boxes_3d = pred_boxes_3d[(batch_idx, src_idx)]
 
-        # Get matched targets
+        # Get matched GT 2D boxes (for box_coder.encode target computation)
+        # IMPORTANT: Use GT 2D boxes, NOT predicted boxes!
+        # This matches GDino3D's design where encode() uses GT 2D boxes to compute
+        # stable targets, while decode() at inference uses predicted 2D boxes.
+        target_boxes_2d = (
+            targets["boxes_xyxy"][tgt_idx] if tgt_idx is not None
+            else targets["boxes_xyxy"]
+        )
+
+        # Get matched GT 3D boxes
         target_boxes_3d = (
             targets["boxes_3d"][tgt_idx] if tgt_idx is not None
             else targets["boxes_3d"]
@@ -672,12 +889,48 @@ class SAM3_3DLoss(nn.Module):
 
         # Get intrinsics for matched samples
         # Note: intrinsics is (B, 3, 3), need to index by batch_idx
-        matched_intrinsics = intrinsics[batch_idx]
+        # Since box_coder.encode() expects single intrinsics (3, 3),
+        # we need to process each matched box individually
+        if len(batch_idx) == 0:
+            # No matches, return zero losses
+            return {
+                "loss_delta_2d": torch.tensor(0.0, device=pred_boxes_2d.device),
+                "loss_depth": torch.tensor(0.0, device=pred_boxes_2d.device),
+                "loss_dim": torch.tensor(0.0, device=pred_boxes_2d.device),
+                "loss_rot": torch.tensor(0.0, device=pred_boxes_2d.device),
+            }
 
-        # Encode 3D targets
-        target_boxes_3d_encoded, weights_3d = self.box_coder.encode(
-            src_boxes_2d, target_boxes_3d, matched_intrinsics
-        )
+        target_boxes_3d_encoded_list = []
+        weights_3d_list = []
+
+        # Validate image_size is provided - required for correct box_coder.encode()
+        if image_size is None:
+            raise ValueError(
+                "image_size is required for _loss_boxes_3d. "
+                "box_coder.encode() expects pixel coordinates because "
+                "project_points() returns pixel coords and "
+                "delta_center = projected_3d_center - 2d_box_center (both in pixels)."
+            )
+
+        H, W = image_size
+        factors = target_boxes_2d.new_tensor([W, H, W, H])
+
+        for i in range(len(batch_idx)):
+            # Use GT 2D box (normalized xyxy) and convert to pixel
+            single_gt_box_2d = target_boxes_2d[i:i+1]  # GT 2D, normalized xyxy [0,1]
+            single_gt_box_2d_pixel = single_gt_box_2d * factors  # Convert to pixel
+
+            single_box_3d = target_boxes_3d[i:i+1]
+            single_intrinsic = intrinsics[batch_idx[i]]  # (3, 3)
+
+            encoded, weights = self.box_coder.encode(
+                single_gt_box_2d_pixel, single_box_3d, single_intrinsic,
+            )
+            target_boxes_3d_encoded_list.append(encoded)
+            weights_3d_list.append(weights)
+
+        target_boxes_3d_encoded = torch.cat(target_boxes_3d_encoded_list, dim=0)
+        weights_3d = torch.cat(weights_3d_list, dim=0)
 
         losses = {}
 
@@ -750,7 +1003,7 @@ class SAM3_3DLoss(nn.Module):
         """
         losses = {}
 
-        # Classification loss
+        # Classification loss (scaled by loss_2d_scale)
         if "pred_logits" in aux_out:
             loss_cls = self._loss_classification(
                 aux_out["pred_logits"],
@@ -759,18 +1012,24 @@ class SAM3_3DLoss(nn.Module):
                 targets,
                 num_boxes,
             )
-            losses["loss_cls"] = loss_cls * self.config.loss_cls_weight
+            losses["loss_cls"] = (
+                self.config.loss_2d_scale * loss_cls * self.config.loss_cls_weight
+            )
 
-        # 2D box loss (in pixel coordinate space)
+        # 2D box loss (L1 in normalized cxcywh, GIoU in pixel xyxy, scaled by loss_2d_scale)
         if "pred_boxes_2d" in aux_out or "pred_boxes" in aux_out:
             pred_boxes = aux_out.get("pred_boxes_2d", aux_out.get("pred_boxes"))
             loss_bbox, loss_giou = self._loss_boxes_2d(
                 pred_boxes, indices, targets, num_boxes, image_size
             )
-            losses["loss_bbox"] = loss_bbox * self.config.loss_bbox_weight
-            losses["loss_giou"] = loss_giou * self.config.loss_giou_weight
+            losses["loss_bbox"] = (
+                self.config.loss_2d_scale * loss_bbox * self.config.loss_bbox_weight
+            )
+            losses["loss_giou"] = (
+                self.config.loss_2d_scale * loss_giou * self.config.loss_giou_weight
+            )
 
-        # 3D box loss (following GDino3D's deep supervision design)
+        # 3D box loss (scaled by loss_3d_scale, following GDino3D's deep supervision design)
         if "pred_boxes_3d" in aux_out and intrinsics is not None:
             pred_boxes_2d = aux_out.get("pred_boxes_2d", aux_out.get("pred_boxes"))
             loss_3d = self._loss_boxes_3d(
@@ -780,45 +1039,32 @@ class SAM3_3DLoss(nn.Module):
                 targets,
                 intrinsics,
                 num_boxes,
+                image_size=image_size,
             )
-            losses.update(loss_3d)
+            # Apply loss_3d_scale to all 3D losses
+            for key, value in loss_3d.items():
+                losses[key] = self.config.loss_3d_scale * value
 
         return losses
 
     def _normalize_targets(self, targets: dict) -> dict:
-        """Normalize target boxes to [0, 1] range if needed.
+        """Ensure targets are in expected format for loss computation.
+
+        Note: SAM3_3D collator always outputs GT boxes in normalized [0, 1] xyxy format.
+        This function simply ensures the classes tensor exists (for binary classification).
 
         Args:
             targets: Dictionary containing ground truth data
-                - boxes_xyxy: (N, 4) boxes in xyxy format
+                - boxes_xyxy: (N, 4) boxes in normalized xyxy [0, 1] format
                 - classes: (N,) class labels (all ones for SAM3)
-                - num_boxes: scalar or (B,) number of boxes per sample
-                - boxes_3d: (N, 7) 3D boxes (optional)
-                - image_size: (2,) or (B, 2) image dimensions (H, W)
+                - num_boxes: (N,) number of boxes per prompt (always 1)
+                - boxes_3d: (N, 12) 3D boxes (optional)
 
         Returns:
-            Normalized targets with boxes_xyxy in [0, 1] range
+            Targets dict with classes tensor guaranteed to exist
         """
         normalized = targets.copy()
-
         boxes_xyxy = targets["boxes_xyxy"]
-
-        # Check if boxes are already normalized (max value <= 1.0)
-        if boxes_xyxy.numel() > 0 and boxes_xyxy.max() > 1.0:
-            # Boxes are in pixel coordinates, need to normalize
-            if "image_size" in targets:
-                img_h, img_w = targets["image_size"]
-                # Normalize: [x1, y1, x2, y2] / [W, H, W, H]
-                scale = torch.tensor(
-                    [img_w, img_h, img_w, img_h],
-                    dtype=boxes_xyxy.dtype,
-                    device=boxes_xyxy.device
-                )
-                normalized["boxes_xyxy"] = boxes_xyxy / scale
-            else:
-                # If no image_size provided, assume boxes are already normalized
-                # This should not happen, but we handle it gracefully
-                pass
 
         # Ensure classes tensor exists (all ones for binary classification)
         if "classes" not in normalized:

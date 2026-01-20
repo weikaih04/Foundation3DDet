@@ -23,7 +23,7 @@ Data Flow:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import List, NamedTuple, Optional
 
 import torch
@@ -33,7 +33,7 @@ from torch import Tensor, nn
 from sam3.model.sam3_image import Sam3Image
 from sam3.model.geometry_encoders import Prompt
 from sam3.model.box_ops import box_cxcywh_to_xyxy
-from sam3.model.data_misc import FindStage
+from sam3.model.data_misc import FindStage, BatchedFindTarget
 
 # 3D-MOOD imports
 from opendet3d.op.detect3d.grounding_dino_3d import (
@@ -41,6 +41,7 @@ from opendet3d.op.detect3d.grounding_dino_3d import (
     GroundingDINO3DCoder,
     RoI2Det3D,
 )
+from opendet3d.model.detect3d.grounding_dino_3d import Det3DOut
 from opendet3d.op.detect3d.geometry import GeometryBackendBase
 
 
@@ -73,6 +74,22 @@ class SAM3_3DOut(NamedTuple):
 
     # Encoder hidden states (for depth head if needed)
     encoder_hidden_states: Tensor | None  # (H*W, N_prompts, d_model)
+
+    # Matching indices from SAM3 (for loss computation)
+    # Format: (batch_idx, src_idx, tgt_idx) from Hungarian matching
+    indices: tuple | None = None
+
+    def __getitem__(self, key: str):
+        """Support dict-like access for vis4d data connector compatibility."""
+        return getattr(self, key)
+
+    def keys(self):
+        """Return field names for dict-like iteration."""
+        return [f.name for f in fields(self)]
+
+    def __contains__(self, key: str) -> bool:
+        """Support 'in' operator for dict-like access."""
+        return hasattr(self, key)
 
 
 @dataclass
@@ -115,6 +132,85 @@ class SAM3_3DBatchedInputs:
     gt_boxes3d: Tensor | None = None         # (N_prompts, max_gt, 12) - 3D params
     num_gts: Tensor | None = None            # (N_prompts,) - number of GTs per prompt
     gt_category_ids: Tensor | None = None    # (N_prompts, max_gt)
+
+    # Query type tracking (following SAM3 TEXT_ID convention)
+    # 0 = TEXT (one-to-many), 2 = GEOMETRY (one-to-one)
+    query_types: Tensor | None = None        # (N_prompts,) int
+
+    # Metadata for evaluation/visualization
+    sample_names: List[str] | None = None    # (B_images,) - image identifiers
+    dataset_name: List[str] | None = None    # (B_images,) - dataset names for evaluator
+    original_hw: List[tuple] | None = None   # (B_images,) - original (H, W) per image
+    original_images: Tensor | None = None    # (B_images, 3, H_orig, W_orig) - unresized
+    original_intrinsics: Tensor | None = None  # (B_images, 3, 3) - intrinsics before resize
+
+    # Depth Ground Truth (for geometry backend supervision)
+    depth_gt: Tensor | None = None            # (B_images, 1, H, W) depth map
+    depth_mask: Tensor | None = None          # (B_images, H, W) valid depth mask
+
+    # Key aliases for vis4d DataConnector compatibility
+    # Maps expected DataLoader keys to actual dataclass field names
+    _KEY_ALIASES = {
+        # Target boxes (for loss computation)
+        "boxes2d": "gt_boxes2d",
+        "boxes3d": "gt_boxes3d",
+        "boxes2d_classes": "gt_category_ids",
+        # Geometric prompts (for SAM3 input)
+        "prompt_boxes": "geo_boxes",
+        "prompt_box_labels": "geo_box_labels",
+        # Not available in per-prompt batch
+        "depth_maps": None,
+        "original_hw": None,
+        "original_images": None,
+        "padding": None,
+    }
+
+    def __getitem__(self, key: str):
+        """Support dict-like access for vis4d data connector compatibility.
+
+        Supports both actual field names and aliased keys from raw DataLoader.
+        """
+        # Check alias first
+        if key in self._KEY_ALIASES:
+            aliased_key = self._KEY_ALIASES[key]
+            if aliased_key is None:
+                return None  # Field not available
+            return getattr(self, aliased_key)
+
+        # Handle special computed fields
+        if key == "input_hw":
+            # Return (H, W) from images shape
+            return (self.images.shape[2], self.images.shape[3])
+
+        # Direct field access
+        if hasattr(self, key):
+            return getattr(self, key)
+
+        # Return None for unknown keys instead of raising error
+        return None
+
+    def keys(self):
+        """Return field names for dict-like iteration."""
+        return [f.name for f in fields(self)]
+
+    def __contains__(self, key: str) -> bool:
+        """Support 'in' operator for dict-like access."""
+        return hasattr(self, key)
+
+    @property
+    def num_images(self) -> int:
+        """Number of unique images."""
+        return self.images.shape[0]
+
+    @property
+    def num_prompts(self) -> int:
+        """Number of prompts (batch size for decoder)."""
+        return self.img_ids.shape[0]
+
+    @property
+    def device(self) -> torch.device:
+        """Device of the batch."""
+        return self.images.device
 
 
 class SAM3_3D(nn.Module):
@@ -170,9 +266,8 @@ class SAM3_3D(nn.Module):
         geometry_backend: GeometryBackendBase | None = None,
         roi2det3d: RoI2Det3D | None = None,
 
-        # ========== Freeze Settings ==========
-        freeze_sam3_backbone: bool = True,
-        freeze_geometry_backend_encoder: bool = True,
+        # ========== Depth-Memory Fusion ==========
+        early_depth_fusion: nn.Module | None = None,
     ) -> None:
         """Initialize SAM3_3D.
 
@@ -184,8 +279,13 @@ class SAM3_3D(nn.Module):
             box_coder: 3D box encoder/decoder. If None, creates default.
             geometry_backend: Depth estimation backend. If None, no depth.
             roi2det3d: Inference post-processor. If None, creates default.
-            freeze_sam3_backbone: Whether to freeze SAM3 ViT backbone.
-            freeze_geometry_backend_encoder: Whether to freeze depth encoder.
+            early_depth_fusion: Early fusion module (Backbone后、Encoder前).
+                If None, no early fusion is performed.
+
+        Note:
+            Learning rate control is handled by param_groups in optimizer config,
+            not by freezing parameters here. See opendet3d/zoo/sam3_3d/base/optim.py
+            for SAM3_3D-specific param_groups.
         """
         super().__init__()
 
@@ -197,7 +297,8 @@ class SAM3_3D(nn.Module):
                 checkpoint_path=sam3_checkpoint,
                 load_from_HF=(sam3_checkpoint is None),  # Only load from HF if no checkpoint provided
                 device="cpu",  # Will be moved to correct device later
-                eval_mode=True,
+                eval_mode=False,  # Must be False to enable matcher for training
+                enable_segmentation=False,  # Skip seg head for 3D detection (saves ~4GB memory)
             )
             # Store checkpoint path for logging in on_load_checkpoint
             self._sam3_checkpoint_path = sam3_checkpoint
@@ -209,26 +310,167 @@ class SAM3_3D(nn.Module):
 
         # 3D-MOOD components
         self.box_coder = box_coder or GroundingDINO3DCoder()
-        self.bbox3d_head = bbox3d_head
         self.geometry_backend = geometry_backend
         self.roi2det3d = roi2det3d
+        self.early_depth_fusion = early_depth_fusion
 
-        # Freeze settings
-        if freeze_sam3_backbone:
-            self._freeze_sam3_backbone()
-        if freeze_geometry_backend_encoder and geometry_backend is not None:
-            self._freeze_geometry_encoder()
+        # Determine use_camera_prompt based on geometry_backend.is_ray_aware
+        # Ray-aware backends (UniDepthV2, DetAny3D) already fuse ray info into depth_latents,
+        # so we don't need the separate ray_embeddings (camera prompt) branch.
+        if self.geometry_backend is not None and hasattr(self.geometry_backend, 'is_ray_aware'):
+            use_camera_prompt = not self.geometry_backend.is_ray_aware
+            print(f"[SAM3_3D] geometry_backend.is_ray_aware={self.geometry_backend.is_ray_aware}, use_camera_prompt={use_camera_prompt}")
+        else:
+            use_camera_prompt = True  # Default to True for safety
+            print(f"[SAM3_3D] No geometry_backend or is_ray_aware attr, defaulting use_camera_prompt=True")
 
-    def _freeze_sam3_backbone(self) -> None:
-        """Freeze SAM3 ViT backbone parameters."""
-        for param in self.sam3.backbone.parameters():
-            param.requires_grad = False
+        # Create or validate bbox3d_head with correct use_camera_prompt setting
+        if bbox3d_head is not None:
+            self.bbox3d_head = bbox3d_head
+            # Warn if provided head has mismatched use_camera_prompt
+            if hasattr(bbox3d_head, 'use_camera_prompt') and bbox3d_head.use_camera_prompt != use_camera_prompt:
+                print(f"[SAM3_3D] Warning: bbox3d_head.use_camera_prompt={bbox3d_head.use_camera_prompt} "
+                      f"but geometry_backend suggests use_camera_prompt={use_camera_prompt}")
+        else:
+            self.bbox3d_head = GroundingDINO3DHead(
+                embed_dims=self.hidden_dim,
+                box_coder=self.box_coder,
+                use_camera_prompt=use_camera_prompt,
+            )
+            print(f"[SAM3_3D] Created bbox3d_head with use_camera_prompt={use_camera_prompt}")
 
-    def _freeze_geometry_encoder(self) -> None:
-        """Freeze geometry backend encoder parameters."""
-        if hasattr(self.geometry_backend, 'encoder'):
-            for param in self.geometry_backend.encoder.parameters():
-                param.requires_grad = False
+        # Load geometry backend pretrained weights
+        # This is called during __init__ to ensure weights are loaded for first training
+        # (on_load_checkpoint is only called when resuming from checkpoint)
+        if self.geometry_backend is not None and hasattr(self.geometry_backend, 'load_pretrained_weights'):
+            print("[SAM3_3D] Loading geometry backend pretrained weights...")
+            self.geometry_backend.load_pretrained_weights()
+
+        # Ensure SAM3 has a matcher for training
+        # SAM3 built with eval_mode=True doesn't have a matcher, so we create one
+        if self.sam3.matcher is None:
+            from sam3.train.matcher import BinaryHungarianMatcher
+            print("[SAM3_3D] Creating BinaryHungarianMatcher for training...")
+            self.sam3.matcher = BinaryHungarianMatcher(
+                cost_class=1.0,
+                cost_bbox=5.0,
+                cost_giou=2.0,
+            )
+
+    def _xyxy_to_cxcywh(self, boxes: Tensor) -> Tensor:
+        """Convert boxes from xyxy to cxcywh format.
+
+        Args:
+            boxes: Tensor of shape (..., 4) in xyxy format
+
+        Returns:
+            Tensor of shape (..., 4) in cxcywh format
+        """
+        x1, y1, x2, y2 = boxes.unbind(-1)
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        w = x2 - x1
+        h = y2 - y1
+        return torch.stack([cx, cy, w, h], dim=-1)
+
+    def _build_find_target(self, batch: SAM3_3DBatchedInputs) -> BatchedFindTarget:
+        """Convert SAM3_3DBatchedInputs GT to SAM3's BatchedFindTarget format.
+
+        This is used for SAM3's internal matching during training.
+
+        SAM3 expects:
+        - boxes: (N_total, 4) packed cxcywh normalized
+        - boxes_padded: (N_prompts, max_gt, 4) padded cxcywh
+        - num_boxes: (N_prompts,) number of GT per prompt
+        - is_exhaustive: (N_prompts,) bool
+
+        Note: In SAM3_3D, each prompt corresponds to exactly one GT box,
+        so gt_boxes2d has shape (N_prompts, 4) not (N_prompts, max_gt, 4).
+
+        Args:
+            batch: SAM3_3DBatchedInputs with gt_boxes2d in normalized xyxy
+
+        Returns:
+            BatchedFindTarget for SAM3's _compute_matching
+        """
+        device = batch.gt_boxes2d.device
+        gt_boxes_xyxy = batch.gt_boxes2d
+
+        # Handle different input shapes
+        # Case 1: (N_prompts, 4) - one GT per prompt (SAM3_3D design)
+        # Case 2: (N_prompts, max_gt, 4) - multiple GTs per prompt (general case)
+        if gt_boxes_xyxy.dim() == 2:
+            # Shape: (N_prompts, 4) - one GT per prompt
+            N_prompts = gt_boxes_xyxy.shape[0]
+            max_gt = 1
+
+            # Convert xyxy -> cxcywh
+            gt_boxes_cxcywh = self._xyxy_to_cxcywh(gt_boxes_xyxy)  # (N_prompts, 4)
+
+            # Each prompt has exactly 1 GT box
+            num_boxes = torch.ones(N_prompts, dtype=torch.long, device=device)
+
+            # Packed boxes = all boxes (no padding)
+            boxes_packed = gt_boxes_cxcywh  # (N_prompts, 4)
+
+            # Padded format: add max_gt dimension
+            gt_boxes_cxcywh_padded = gt_boxes_cxcywh.unsqueeze(1)  # (N_prompts, 1, 4)
+
+            # Object IDs: sequential
+            object_ids = torch.arange(N_prompts, device=device)
+            object_ids_padded = torch.arange(N_prompts, device=device).unsqueeze(1)  # (N_prompts, 1)
+
+        else:
+            # Shape: (N_prompts, max_gt, 4) - multiple GTs per prompt
+            N_prompts = gt_boxes_xyxy.shape[0]
+            max_gt = gt_boxes_xyxy.shape[1]
+
+            # Convert xyxy -> cxcywh
+            gt_boxes_cxcywh = self._xyxy_to_cxcywh(gt_boxes_xyxy)
+
+            # Compute num_boxes per prompt (count non-zero boxes)
+            valid_mask = (gt_boxes_xyxy.abs().sum(dim=-1) > 1e-6)  # (N_prompts, max_gt)
+            num_boxes = valid_mask.sum(dim=-1)  # (N_prompts,)
+
+            # Pack boxes (remove padding)
+            boxes_list = []
+            for i in range(N_prompts):
+                n = int(num_boxes[i].item())
+                if n > 0:
+                    boxes_list.append(gt_boxes_cxcywh[i, :n])
+            if boxes_list:
+                boxes_packed = torch.cat(boxes_list, dim=0)  # (N_total, 4)
+            else:
+                boxes_packed = torch.zeros(0, 4, device=device)
+
+            gt_boxes_cxcywh_padded = gt_boxes_cxcywh
+
+            # Object IDs (placeholder - just sequential)
+            object_ids = torch.arange(len(boxes_packed), device=device)
+            object_ids_padded = torch.full(
+                (N_prompts, max_gt), -1, device=device, dtype=torch.long
+            )
+            offset = 0
+            for i in range(N_prompts):
+                n = int(num_boxes[i].item())
+                if n > 0:
+                    object_ids_padded[i, :n] = torch.arange(
+                        offset, offset + n, device=device
+                    )
+                    offset += n
+
+        return BatchedFindTarget(
+            num_boxes=num_boxes,
+            boxes=boxes_packed,
+            boxes_padded=gt_boxes_cxcywh_padded,
+            repeated_boxes=None,
+            segments=None,
+            semantic_segments=None,
+            is_valid_segment=None,
+            is_exhaustive=torch.ones(N_prompts, dtype=torch.bool, device=device),
+            object_ids=object_ids,
+            object_ids_padded=object_ids_padded,
+        )
 
     def on_load_checkpoint(self, checkpoint):
         """
@@ -344,10 +586,52 @@ class SAM3_3D(nn.Module):
         _, _, H, W = batch.images.shape
         device = batch.images.device
 
+        # Sync SAM3 training mode with parent module
+        # This is important because SAM3's forward_grounding only computes
+        # matching indices when self.training is True
+        if self.sam3.training != self.training:
+            self.sam3.train(self.training)
+
+        # Handle empty batch (no prompts)
+        if N_prompts == 0:
+            if self.training:
+                # Create dummy output connected to ALL model parameters for DDP backward
+                # DDP requires all parameters to participate in backward across all ranks
+                # Using only one parameter causes deadlock when other ranks use all params
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[SAM3_3D] Empty batch (N_prompts=0) on rank {rank}, using all-param dummy")
+                dummy_grad = sum(p.sum() * 0 for p in self.parameters() if p.requires_grad)
+                dummy_logits = torch.zeros(1, 1, 1, device=device) + dummy_grad
+                return SAM3_3DOut(
+                    pred_logits=dummy_logits,
+                    pred_boxes_2d=torch.zeros(1, 1, 4, device=device),
+                    pred_boxes_3d=None,
+                    aux_outputs=None,
+                    geom_losses=None,
+                    presence_logits=None,
+                    queries=None,
+                    encoder_hidden_states=None,
+                    indices=None,
+                )
+            else:
+                # Test mode: return empty Det3DOut
+                return Det3DOut(
+                    boxes=[torch.zeros(0, 4, device=device) for _ in range(B_images)],
+                    boxes3d=[torch.zeros(0, 10, device=device) for _ in range(B_images)],
+                    scores=[torch.zeros(0, device=device) for _ in range(B_images)],
+                    class_ids=[torch.zeros(0, dtype=torch.long, device=device) for _ in range(B_images)],
+                    depth_maps=None,
+                    categories=None,
+                )
+
         # ========== Step 1: SAM3 Backbone ==========
+        # Convert images from ImageNet normalization to SAM3 normalization
+        # vis4d uses ImageNet norm, but SAM3 expects (x - 0.5) / 0.5
+        images_for_sam3 = self._convert_imagenet_to_sam3_norm(batch.images)
+
         # Get image and text features
-        backbone_out = {"img_batch_all_stages": batch.images}
-        backbone_out.update(self.sam3.backbone.forward_image(batch.images))
+        backbone_out = {"img_batch_all_stages": batch.images}  # Keep original for depth
+        backbone_out.update(self.sam3.backbone.forward_image(images_for_sam3))
         text_out = self.sam3.backbone.forward_text(
             batch.unique_texts, device=device
         )
@@ -370,11 +654,12 @@ class SAM3_3D(nn.Module):
             intrinsics_per_image = batch.intrinsics
 
             # Prepare depth GT if in training mode
+            # Get depth_gt from batch directly (not from targets)
             depth_gt = None
             depth_mask = None
-            if self.training and targets is not None:
-                depth_gt = targets.get("depth_gt")
-                depth_mask = targets.get("depth_mask")
+            if self.training:
+                depth_gt = getattr(batch, 'depth_gt', None)
+                depth_mask = getattr(batch, 'depth_mask', None)
 
             # Call geometry backend with correct interface
             geom_out = self.geometry_backend(
@@ -386,43 +671,100 @@ class SAM3_3D(nn.Module):
                 depth_mask=depth_mask,
             )
             depth_latents = geom_out.get("depth_latents")
-            if self.training and targets is not None:
+            if self.training:
                 geom_losses = geom_out.get("losses", {})
+
+        # ========== Step 2.5: Early Depth Fusion (Backbone后、Encoder前) ==========
+        # Fuse depth_latents into backbone visual features before encoder
+        # This allows depth information to participate in encoder's self-attention
+        # and text cross-attention
+        if self.early_depth_fusion is not None and depth_latents is not None:
+            # Get depth_latents spatial dimensions from geometry backend output
+            aux = geom_out.get("aux", {})
+            depth_latents_hw = aux.get("depth_latents_hw")
+
+            if depth_latents_hw is not None and "backbone_fpn" in backbone_out:
+                # Fuse depth into visual features
+                backbone_fpn = backbone_out["backbone_fpn"]
+
+                # early_depth_fusion expects list of visual features
+                if not isinstance(backbone_fpn, list):
+                    backbone_fpn = [backbone_fpn]
+
+                # Perform fusion
+                fused_fpn = self.early_depth_fusion(
+                    visual_feats=backbone_fpn,
+                    depth_latents=depth_latents,
+                    depth_latents_hw=depth_latents_hw,
+                )
+
+                # Update backbone_out with fused features
+                # SAM3 will use these fused features in encoder
+                if len(fused_fpn) == 1:
+                    backbone_out["backbone_fpn"] = fused_fpn[0]
+                else:
+                    backbone_out["backbone_fpn"] = fused_fpn
+            else:
+                # Warn user that early depth fusion is configured but cannot run
+                import warnings
+                if depth_latents_hw is None:
+                    warnings.warn(
+                        "EarlyDepthFusion is configured but depth_latents_hw not "
+                        "provided by geometry backend. Skipping depth fusion. "
+                        "Check geometry backend outputs include 'aux.depth_latents_hw'.",
+                        UserWarning,
+                    )
+                elif "backbone_fpn" not in backbone_out:
+                    warnings.warn(
+                        "EarlyDepthFusion is configured but backbone_fpn not found "
+                        "in backbone outputs. Skipping depth fusion.",
+                        UserWarning,
+                    )
 
         # ========== Step 3: Build SAM3 inputs ==========
         find_input = self._build_find_stage(batch, device)
         geometric_prompt = self._build_geometric_prompt(batch, device)
 
         # ========== Step 4: SAM3 forward_grounding ==========
-        # This does: encode_prompt → encoder → decoder → score/box prediction
+        # This does: encode_prompt -> encoder -> decoder -> score/box prediction
+        #
+        # In training mode, we build find_target from batch GT boxes so that
+        # SAM3's internal _compute_matching can compute matching indices.
+        # These indices are then used by our loss function.
+        find_target = None
+        if self.training:
+            assert batch.gt_boxes2d is not None, \
+                "Training requires GT boxes (batch.gt_boxes2d)"
+            find_target = self._build_find_target(batch)
+
         sam3_out = self.sam3.forward_grounding(
             backbone_out=backbone_out,
             find_input=find_input,
-            find_target=None,  # We'll compute loss externally
+            find_target=find_target,
             geometric_prompt=geometric_prompt,
         )
 
         # ========== Step 5: Extract SAM3 outputs ==========
         # SAM3 output format (after _update_scores_and_boxes):
-        # - pred_logits: (N_prompts, num_queries, 1)
+        # - pred_logits: (N_prompts, num_queries, 1) - final layer
         # - pred_boxes: (N_prompts, num_queries, 4) - normalized cxcywh
         # - pred_boxes_xyxy: (N_prompts, num_queries, 4) - normalized xyxy
         # - queries: (N_prompts, num_queries, d_model) - last layer hidden states
+        # - aux_outputs: list of dicts for each decoder layer (for deep supervision)
         pred_logits = sam3_out["pred_logits"]  # (N_prompts, S, 1)
         pred_boxes_xyxy = sam3_out["pred_boxes_xyxy"]  # (N_prompts, S, 4)
         queries = sam3_out.get("queries")  # (N_prompts, S, d_model)
         encoder_hidden_states = sam3_out.get("encoder_hidden_states")
         presence_logits = sam3_out.get("presence_logit_dec")
 
+        # Extract auxiliary outputs from SAM3 for deep supervision
+        sam3_aux_outputs = sam3_out.get("aux_outputs", [])
+
         # ========== Step 6: 3D Head ==========
         pred_boxes_3d = None
         aux_outputs = None
 
         if self.bbox3d_head is not None and queries is not None:
-            # 3D head expects hidden_states in (L, B, S, C) format
-            # queries is (B, S, C), expand to (1, B, S, C) for single layer
-            hidden_states = queries.unsqueeze(0)  # (1, N_prompts, S, C)
-
             # Generate ray embeddings if camera prompt is enabled
             # For ray-aware backends (UniDepthV2, DetAny3D), depth_latents already
             # contain ray info, so we can either use camera prompt or skip it
@@ -445,18 +787,14 @@ class SAM3_3D(nn.Module):
                     ray_intrinsics, ray_image_hw, ray_downsample
                 )
 
-            # Align depth_latents and ray_embeddings spatial resolution
-            # This is required when using DINOv2-based geometry backends (UniDepthV2, DetAny3D).
+            # Align depth_latents and ray_embeddings spatial resolution (if needed)
             #
-            # DINOv2 uses patch_size=14, producing features at resolutions that don't align
-            # with standard 1/8 or 1/16 downsampling. For example:
-            #   - Input: 1008x1008
-            #   - DINOv2 patches: 1008/14 = 72 per side
-            #   - UniDepthV2 decoder output (2x upsample): 72*2 = 144x144
-            #   - Ray embeddings (1/8 downsample): 1008/8 = 126x126
+            # Note: This code only runs when use_camera_prompt=True (i.e., for non-ray-aware
+            # backends like UniDepthHead v1). For ray-aware backends (UniDepthV2, DetAny3D),
+            # use_camera_prompt=False and ray_embeddings=None, so this block is skipped.
             #
-            # The 3D head requires spatial alignment for cross-attention, so we resize
-            # depth_latents to match ray_embeddings resolution.
+            # When this does run, depth_latents and ray_embeddings may have different spatial
+            # resolutions that need to be aligned for the 3D head's cross-attention.
             if depth_latents is not None and ray_embeddings is not None:
                 # depth_latents: [B_images, N_depth, C_depth]
                 # ray_embeddings: [B_images, N_ray, C_ray]
@@ -501,25 +839,250 @@ class SAM3_3D(nn.Module):
                 # Index to get: [N_prompts, N, C]
                 depth_latents = depth_latents[batch.img_ids]
 
-            # Call 3D head with correct signature
-            pred_boxes_3d = self.bbox3d_head(
+            # ========== Deep Supervision: Process all decoder layers ==========
+            # Following SAM3's design, we process auxiliary outputs from all decoder layers
+            # for deep supervision during training
+            #
+            # SAM3's output structure:
+            # - aux_outputs[0..L-2]: intermediate decoder layers (layer 0 to layer L-2)
+            # - final output (pred_logits, queries, etc.): final decoder layer (layer L-1)
+
+            # Collect all layers' queries in correct order: [layer0, layer1, ..., layerL-1]
+            # Track which aux_outputs have queries for building aux_outputs later
+            all_layers_queries = []
+            aux_indices_with_queries = []  # Track original indices of aux_outputs with queries
+            for i, aux_out in enumerate(sam3_aux_outputs):
+                aux_queries = aux_out.get("queries")
+                if aux_queries is not None:
+                    all_layers_queries.append(aux_queries)
+                    aux_indices_with_queries.append(i)
+            all_layers_queries.append(queries)  # Final layer at the end
+
+            # Stack to (L, N_prompts, S, C) format expected by 3D head
+            if len(all_layers_queries) > 1:
+                # Have auxiliary outputs - stack all layers
+                hidden_states = torch.stack(all_layers_queries, dim=0)  # (L, N_prompts, S, C)
+            else:
+                # No auxiliary outputs - just expand final layer
+                hidden_states = queries.unsqueeze(0)  # (1, N_prompts, S, C)
+
+            # Call 3D head with all layers
+            # Returns: (L, N_prompts, S, 12) if L > 1, else (N_prompts, S, 12)
+            all_layers_boxes_3d = self.bbox3d_head(
                 hidden_states=hidden_states,
                 ray_embeddings=ray_embeddings,
                 depth_latents=depth_latents,
             )
 
-            # Note: GroundingDINO3DHead.forward() returns Tensor directly, not dict
-            # aux_outputs handling would be done differently if needed
+            # Extract final layer output
+            if len(all_layers_queries) > 1:
+                pred_boxes_3d = all_layers_boxes_3d[-1]  # (N_prompts, S, 12)
+            else:
+                # bbox3d_head always returns (L, N_prompts, S, 12), squeeze L dim when L=1
+                pred_boxes_3d = all_layers_boxes_3d.squeeze(0)  # (N_prompts, S, 12)
 
-        return SAM3_3DOut(
+            # Build auxiliary outputs for deep supervision
+            # Only include layers that have queries (tracked by aux_indices_with_queries)
+            if len(aux_indices_with_queries) > 0 and self.training:
+                aux_outputs = []
+                for layer_idx, orig_idx in enumerate(aux_indices_with_queries):
+                    aux_out = sam3_aux_outputs[orig_idx]
+                    aux_dict = {
+                        "pred_logits": aux_out["pred_logits"],
+                        "pred_boxes_2d": aux_out["pred_boxes_xyxy"],
+                        "pred_boxes_3d": all_layers_boxes_3d[layer_idx],  # 3D predictions for this layer
+                    }
+                    # Include presence logits if available
+                    if "presence_logit_dec" in aux_out:
+                        aux_dict["presence_logits"] = aux_out["presence_logit_dec"]
+                    aux_outputs.append(aux_dict)
+
+        # Training mode: return raw outputs for loss computation
+        if self.training:
+            # Extract matching indices from SAM3 output (computed by _compute_matching)
+            sam3_indices = sam3_out.get("indices", None)
+
+            return SAM3_3DOut(
+                pred_logits=pred_logits,
+                pred_boxes_2d=pred_boxes_xyxy,
+                pred_boxes_3d=pred_boxes_3d,
+                aux_outputs=aux_outputs,
+                geom_losses=geom_losses,
+                presence_logits=presence_logits,
+                queries=queries,
+                encoder_hidden_states=encoder_hidden_states,
+                indices=sam3_indices,
+            )
+
+        # Test mode: forward_test returns Det3DOut for evaluation
+        return self._forward_test(
             pred_logits=pred_logits,
             pred_boxes_2d=pred_boxes_xyxy,
             pred_boxes_3d=pred_boxes_3d,
-            aux_outputs=aux_outputs,
-            geom_losses=geom_losses,
-            presence_logits=presence_logits,
-            queries=queries,
-            encoder_hidden_states=encoder_hidden_states,
+            batch=batch,
+            geom_out=geom_out,
+        )
+
+    def _convert_imagenet_to_sam3_norm(self, images: Tensor) -> Tensor:
+        """Convert ImageNet normalized images to SAM3 normalization.
+
+        vis4d/3D-MOOD uses ImageNet normalization:
+            ImageNet: (x - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
+            Output range: ~[-2.5, 2.5]
+
+        SAM3 expects custom normalization:
+            SAM3: (x - 0.5) / 0.5
+            Output range: [-1, 1]
+
+        This function converts from ImageNet normalized to SAM3 normalized:
+            1. Denormalize ImageNet -> [0, 1]
+            2. Normalize SAM3 -> [-1, 1]
+
+        Args:
+            images: ImageNet normalized images (B, 3, H, W)
+
+        Returns:
+            SAM3 normalized images (B, 3, H, W)
+        """
+        # ImageNet constants
+        imagenet_mean = torch.tensor(
+            [0.485, 0.456, 0.406], device=images.device, dtype=images.dtype
+        ).view(1, 3, 1, 1)
+        imagenet_std = torch.tensor(
+            [0.229, 0.224, 0.225], device=images.device, dtype=images.dtype
+        ).view(1, 3, 1, 1)
+
+        # Denormalize: ImageNet normalized -> [0, 1]
+        images_01 = images * imagenet_std + imagenet_mean
+
+        # Normalize: [0, 1] -> SAM3 [-1, 1]
+        images_sam3 = (images_01 - 0.5) / 0.5
+
+        return images_sam3
+
+    def _forward_test(
+        self,
+        pred_logits: Tensor,
+        pred_boxes_2d: Tensor,
+        pred_boxes_3d: Tensor | None,
+        batch: SAM3_3DBatchedInputs,
+        geom_out: dict | None,
+    ) -> Det3DOut:
+        """Forward pass for test/inference mode.
+
+        Postprocesses model outputs to Det3DOut format for evaluation.
+        Converts per-prompt outputs to per-image outputs with:
+        - Pixel coordinate boxes (scaled from normalized)
+        - Decoded 3D boxes
+        - Score thresholding (optional)
+
+        Args:
+            pred_logits: (N_prompts, S, 1) objectness logits
+            pred_boxes_2d: (N_prompts, S, 4) normalized xyxy boxes
+            pred_boxes_3d: (N_prompts, S, 12) encoded 3D params or None
+            batch: Input batch with img_ids, intrinsics, etc.
+            geom_out: Geometry backend output (may contain depth_maps)
+
+        Returns:
+            Det3DOut with per-image detection results
+        """
+        H, W = batch.images.shape[2:]
+        device = pred_logits.device
+        B_images = batch.images.shape[0]
+
+        # Get scores from logits
+        scores_all = pred_logits.sigmoid().squeeze(-1)  # (N_prompts, S)
+
+        # Scale boxes to pixel coordinates
+        # pred_boxes_2d is normalized xyxy [0, 1]
+        boxes_pixel = pred_boxes_2d.clone()
+        boxes_pixel[..., 0::2] *= W
+        boxes_pixel[..., 1::2] *= H
+
+        # Group by image
+        boxes_list = []
+        boxes3d_list = []
+        scores_list = []
+        class_ids_list = []
+
+        for img_idx in range(B_images):
+            # Find prompts belonging to this image
+            prompt_mask = batch.img_ids == img_idx
+            n_prompts_this_img = prompt_mask.sum().item()
+
+            if n_prompts_this_img == 0:
+                # No prompts for this image
+                boxes_list.append(torch.zeros(0, 4, device=device))
+                boxes3d_list.append(torch.zeros(0, 10, device=device))
+                scores_list.append(torch.zeros(0, device=device))
+                class_ids_list.append(torch.zeros(0, dtype=torch.long, device=device))
+                continue
+
+            # Get predictions for this image's prompts
+            img_scores = scores_all[prompt_mask]  # (n_prompts, S)
+            img_boxes = boxes_pixel[prompt_mask]  # (n_prompts, S, 4)
+
+            # Flatten to get all detections
+            img_scores_flat = img_scores.flatten()  # (n_prompts * S,)
+            img_boxes_flat = img_boxes.reshape(-1, 4)  # (n_prompts * S, 4)
+
+            # Get best detection per prompt (SAM3 typically outputs 1 box per prompt)
+            # For now, take the max score detection from each prompt
+            best_scores, best_indices = img_scores.max(dim=1)  # (n_prompts,)
+            best_boxes = img_boxes[torch.arange(n_prompts_this_img, device=device), best_indices]
+
+            # Decode 3D boxes if available
+            if pred_boxes_3d is not None and self.box_coder is not None:
+                img_boxes3d = pred_boxes_3d[prompt_mask]  # (n_prompts, S, 12)
+                best_boxes3d_encoded = img_boxes3d[
+                    torch.arange(n_prompts_this_img, device=device), best_indices
+                ]  # (n_prompts, 12)
+
+                # Get intrinsics for this image (single 3x3 matrix)
+                intrinsics_this_img = batch.intrinsics[img_idx]  # (3, 3)
+
+                # Decode 3D boxes using box_coder
+                # IMPORTANT: box_coder.decode() expects PIXEL xyxy boxes, not normalized!
+                # This is because encode() computes delta_center in pixel space:
+                #   delta_center = project_points(center_3d, K) - box_2d_center
+                # where project_points() returns pixel coords and box_2d_center is in pixels.
+                # So decode() must also use pixel coords to correctly reverse:
+                #   proj_center_3d = box_2d_center + delta_center (both in pixels)
+                # box_coder.decode expects (3, 3) intrinsics, not batched
+                decoded_boxes3d = self.box_coder.decode(
+                    best_boxes,  # pixel xyxy (NOT normalized!)
+                    best_boxes3d_encoded,
+                    intrinsics_this_img,  # (3, 3)
+                )  # (n_prompts, 10)
+            else:
+                decoded_boxes3d = torch.zeros(n_prompts_this_img, 10, device=device)
+
+            # Class IDs: for SAM3, we use GT category as "class" since it's prompt-based
+            # During eval, the evaluator matches by coco_image_id
+            if batch.gt_category_ids is not None:
+                img_class_ids = batch.gt_category_ids[prompt_mask]
+                if img_class_ids.dim() > 1:
+                    img_class_ids = img_class_ids[:, 0]  # Take first if multiple
+            else:
+                img_class_ids = torch.zeros(n_prompts_this_img, dtype=torch.long, device=device)
+
+            boxes_list.append(best_boxes)
+            boxes3d_list.append(decoded_boxes3d)
+            scores_list.append(best_scores)
+            class_ids_list.append(img_class_ids)
+
+        # Get depth maps if available
+        depth_maps = None
+        if geom_out is not None and "depth" in geom_out:
+            depth_maps = [geom_out["depth"][i] for i in range(B_images)]
+
+        return Det3DOut(
+            boxes=boxes_list,
+            boxes3d=boxes3d_list,
+            scores=scores_list,
+            class_ids=class_ids_list,
+            depth_maps=depth_maps,
+            categories=None,
         )
 
     def _build_find_stage(
@@ -705,8 +1268,6 @@ def build_sam3_3d(
     geometry_backend_type: str = "unidepth_v2",
     hidden_dim: int = 256,
     num_decoder_layers: int = 6,
-    freeze_sam3_backbone: bool = True,
-    freeze_geometry_backend_encoder: bool = True,
     device: str = "cuda",
 ) -> SAM3_3D:
     """Factory function to build SAM3_3D model.
@@ -716,12 +1277,14 @@ def build_sam3_3d(
         geometry_backend_type: Type of geometry backend
         hidden_dim: Hidden dimension for 3D head
         num_decoder_layers: Number of decoder layers
-        freeze_sam3_backbone: Whether to freeze SAM3 backbone
-        freeze_geometry_backend_encoder: Whether to freeze depth encoder
         device: Device to load model on
 
     Returns:
         Initialized SAM3_3D model
+
+    Note:
+        Learning rate control is handled by param_groups in optimizer config,
+        not by freezing parameters. See opendet3d/zoo/sam3_3d/base/optim.py.
     """
     from sam3.model.sam3_image import build_sam3_image
     from opendet3d.op.detect3d.geometry import build_geometry_backend
@@ -754,8 +1317,6 @@ def build_sam3_3d(
         box_coder=box_coder,
         geometry_backend=geometry_backend,
         roi2det3d=roi2det3d,
-        freeze_sam3_backbone=freeze_sam3_backbone,
-        freeze_geometry_backend_encoder=freeze_geometry_backend_encoder,
     )
 
     return model.to(device)

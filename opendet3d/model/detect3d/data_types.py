@@ -22,28 +22,35 @@ from torch import Tensor
 
 @dataclass
 class SAM3_3DBatchedInputs:
-    """SAM3_3D batched inputs format (per-prompt batch).
-    
+    """SAM3_3D batched inputs format (per-category query batch).
+
     This dataclass aligns with SAM3's BatchedDatapoint and FindStage.
-    All prompt-level tensors have shape (N_prompts, ...) where N_prompts
-    is the total number of prompts across all images.
-    
+    Following SAM3 original design: per-category queries with multi-instance targets.
+
+    Key Design (SAM3 original):
+    - Each CATEGORY creates ONE query (not each box!)
+    - N_prompts = number of unique categories across batch
+    - Each query can have multiple GT boxes (multi-instance targets)
+    - Visual queries: randomly select one target as geo_box prompt
+
     Attributes:
-        images: (B_images, 3, H, W) - Input images (unique, shared across prompts)
+        images: (B_images, 3, H, W) - Input images (unique, shared across queries)
         intrinsics: (B_images, 3, 3) - Camera intrinsics per image
-        
-        img_ids: (N_prompts,) - Which image each prompt belongs to
-        text_ids: (N_prompts,) - Which unique_text each prompt uses
+
+        img_ids: (N_prompts,) - Which image each query belongs to
+        text_ids: (N_prompts,) - Which unique_text each query uses
         unique_texts: List of unique text prompts (includes "visual" for geo-only)
-        
-        geo_boxes: (max_K, N_prompts, 4) - Geometry prompts, normalized cxcywh
-                   Sequence-first format for SAM3's Prompt class
-        geo_boxes_mask: (N_prompts, max_K) - True = padding position
-        geo_box_labels: (max_K, N_prompts) - 0/1 for negative/positive prompt
-        
+
+        geo_boxes: (N_prompts, 1, 4) - Geometry prompts, normalized cxcywh
+                   Only visual queries have valid geo_boxes
+                   Text-only queries have geo_boxes_mask=True
+        geo_boxes_mask: (N_prompts, 1) - True = no valid box (text-only query)
+        geo_box_labels: (N_prompts, 1) - 1 for valid boxes, 0 for text-only
+
         gt_boxes2d: (N_prompts, max_gt, 4) - GT 2D boxes, normalized xyxy
+                    Multi-instance: each query can have multiple targets
         gt_boxes3d: (N_prompts, max_gt, 12) - GT 3D boxes (encoded)
-        num_gts: (N_prompts,) - Number of valid GTs per prompt
+        num_gts: (N_prompts,) - Number of valid GTs per query (can be > 1!)
     """
     
     # ========== Image-level (Backbone processes these) ==========
@@ -64,15 +71,29 @@ class SAM3_3DBatchedInputs:
     gt_boxes2d: Tensor | None = None    # (N_prompts, max_gt, 4) normalized xyxy
     gt_boxes3d: Tensor | None = None    # (N_prompts, max_gt, 12)
     num_gts: Tensor | None = None       # (N_prompts,) int
-    
-    # Optional: original image sizes for visualization
-    original_hw: Tensor | None = None   # (B_images, 2)
-    
+    gt_category_ids: Tensor | None = None  # (N_prompts,) category ids
+
+    # Query type tracking (following SAM3 TEXT_ID convention)
+    # 0 = TEXT (one-to-many), 2 = GEOMETRY (one-to-one)
+    query_types: Tensor | None = None   # (N_prompts,) int
+
+    # Point prompts (optional)
+    geo_points: Tensor | None = None    # (N_prompts, max_P, 2) normalized xy
+    geo_points_mask: Tensor | None = None  # (N_prompts, max_P) True=padding
+    geo_point_labels: Tensor | None = None  # (N_prompts, max_P) 0/1
+
+    # Metadata for evaluation/visualization
+    sample_names: List[str] | None = None  # Image identifiers
+    dataset_name: List[str] | None = None  # Dataset names
+    original_hw: List | Tensor | None = None  # (B_images, 2) or list
+    original_images: Tensor | None = None  # (B_images, 3, H, W) unresized
+    original_intrinsics: Tensor | None = None  # (B_images, 3, 3)
+
     def to(self, device: torch.device) -> "SAM3_3DBatchedInputs":
         """Move all tensors to specified device."""
         def move(t):
             return t.to(device) if isinstance(t, Tensor) else t
-        
+
         return SAM3_3DBatchedInputs(
             images=move(self.images),
             intrinsics=move(self.intrinsics),
@@ -85,7 +106,16 @@ class SAM3_3DBatchedInputs:
             gt_boxes2d=move(self.gt_boxes2d),
             gt_boxes3d=move(self.gt_boxes3d),
             num_gts=move(self.num_gts),
-            original_hw=move(self.original_hw),
+            gt_category_ids=move(self.gt_category_ids),
+            query_types=move(self.query_types),
+            geo_points=move(self.geo_points),
+            geo_points_mask=move(self.geo_points_mask),
+            geo_point_labels=move(self.geo_point_labels),
+            sample_names=self.sample_names,  # List, no move
+            dataset_name=self.dataset_name,  # List, no move
+            original_hw=self.original_hw,  # List or Tensor
+            original_images=move(self.original_images),
+            original_intrinsics=move(self.original_intrinsics),
         )
     
     @property

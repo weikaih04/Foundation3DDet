@@ -13,6 +13,7 @@ from opendet3d.op.detect3d.grounding_dino_3d import (
     RoI2Det3D,
 )
 from opendet3d.op.detect3d.geometry import UniDepthV2GeometryBackend
+from opendet3d.op.detect3d.early_depth_fusion import EarlyDepthFusion
 
 
 def get_sam3_3d_hyperparams_cfg(
@@ -38,12 +39,12 @@ def get_sam3_3d_hyperparams_cfg(
     depth_scale: float = 100.0,
     depth_output_scales: tuple[int, ...] = (4, 8, 16, 32),
 
-    # Freeze settings
-    freeze_sam3_backbone: bool = True,
-    freeze_geometry_backend_encoder: bool = True,
+    # Optimizer freeze settings (for get_sam3_3d_optim_cfg)
+    freeze_backbone: bool = False,
+    freeze_all_pretrained: bool = False,
 ) -> ExperimentParameters:
     """Get SAM3_3D hyperparameters.
-    
+
     Args:
         num_epochs: Number of training epochs.
         samples_per_gpu: Batch size per GPU.
@@ -55,11 +56,17 @@ def get_sam3_3d_hyperparams_cfg(
         num_decoder_layers: Number of decoder layers.
         depth_scale: Scale factor for depth prediction.
         depth_output_scales: Output scales for depth head.
-        freeze_sam3_backbone: Whether to freeze SAM3 backbone.
-        freeze_geometry_backend_encoder: Whether to freeze geometry encoder.
-        
+        freeze_backbone: If True, freeze vision + depth backbones (0.0x lr).
+        freeze_all_pretrained: If True, freeze all pretrained, only train 3D head.
+
     Returns:
         ExperimentParameters with all hyperparameters.
+
+    Note:
+        Learning rate control is handled by param_groups in optim.py:
+        - Default: All pretrained use 0.1x lr (like GDino3D)
+        - freeze_backbone=True: Freeze vision + depth backbones
+        - freeze_all_pretrained=True: Only train bbox3d_head + early_depth_fusion
     """
     params = ExperimentParameters()
 
@@ -87,9 +94,9 @@ def get_sam3_3d_hyperparams_cfg(
     params.depth_scale = depth_scale
     params.depth_output_scales = depth_output_scales
 
-    # Freeze settings
-    params.freeze_sam3_backbone = freeze_sam3_backbone
-    params.freeze_geometry_backend_encoder = freeze_geometry_backend_encoder
+    # Optimizer freeze settings
+    params.freeze_backbone = freeze_backbone
+    params.freeze_all_pretrained = freeze_all_pretrained
 
     return params
 
@@ -111,38 +118,56 @@ def get_sam3_3d_cfg(
     """
     # Box coder
     box_coder = class_config(GroundingDINO3DCoder)
-    
-    # 3D Head
-    bbox3d_head = class_config(
-        GroundingDINO3DHead,
-        hidden_dim=params.hidden_dim,
-        num_layers=params.num_decoder_layers,
-    )
+
+    # Note: bbox3d_head is NOT created here - let SAM3_3D create it automatically
+    # based on geometry_backend.is_ray_aware to get the correct use_camera_prompt setting.
+    # For ray-aware backends (UniDepthV2, DetAny3D), use_camera_prompt=False.
+    # For non-ray-aware backends (UniDepthHead v1), use_camera_prompt=True.
     
     # Geometry backend
     if geometry_backend_type == "unidepth_v2":
+        # Use UniDepthV2-Small (v2-vits14) - memory efficient
+        # output_scales=1 (default): 1/8 resolution, 256 channels, ~128x128
+        # Higher resolution (output_scales=2,3) has fewer channels (128, 64)
         geometry_backend = class_config(
             UniDepthV2GeometryBackend,
-            depth_scale=params.depth_scale,
+            version="v2-vits14",
+            encoder_pretrained="checkpoints/dinov2_backbones/unidepth_v2_s_dinov2_backbone.pth",
+            decoder_pretrained="checkpoints/depth_heads/unidepth_v2_decoder_vits.pth",
+            # output_scales=1 (default): 256 channels, latent_proj=Identity
         )
+        # UniDepthV2-Small outputs 256-dim latents at 1/8 scale, no projection needed
+        depth_latent_dim = 256
     else:
         geometry_backend = None
-    
+        depth_latent_dim = 128  # Default
+
+    # EarlyDepthFusion (Concat + Zero-init Project + Residual)
+    # More expressive: delta = W_P * P + W_D * D, output = P + delta
+    early_depth_fusion = class_config(
+        EarlyDepthFusion,
+        visual_dim=params.hidden_dim,  # 256 for SAM3
+        depth_dim=depth_latent_dim,    # 256 (no bottleneck)
+        fusion_type="concat_add",
+        zero_init=True,  # delta=0 at start, preserves pretrained features
+    )
+
     # RoI2Det3D for inference
     roi2det3d = class_config(RoI2Det3D, box_coder=box_coder)
-    
+
     # SAM3_3D model
     # Note: sam3_model will be built from checkpoint in __init__
+    # Learning rate control is handled by param_groups in optimizer config,
+    # not by freezing parameters. See optim.py for SAM3_3D-specific param_groups.
     model = class_config(
         SAM3_3D,
         sam3_model=None,  # Will be built in __init__
         sam3_checkpoint=sam3_checkpoint,  # Pass checkpoint path
-        bbox3d_head=bbox3d_head,
+        # bbox3d_head=None - let SAM3_3D create it based on is_ray_aware
         box_coder=box_coder,
         geometry_backend=geometry_backend,
         roi2det3d=roi2det3d,
-        freeze_sam3_backbone=params.freeze_sam3_backbone,
-        freeze_geometry_backend_encoder=params.freeze_geometry_backend_encoder,
+        early_depth_fusion=early_depth_fusion,
     )
 
     return model, box_coder

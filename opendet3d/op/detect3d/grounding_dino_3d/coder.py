@@ -48,9 +48,21 @@ class GroundingDINO3DCoder:
         self.reg_dims = reg_dims
 
     def encode(
-        self, boxes: Tensor, boxes3d: Tensor, intrinsics: Tensor
+        self, boxes: Tensor, boxes3d: Tensor, intrinsics: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Encode the 3D bounding boxes."""
+        """Encode the 3D bounding boxes.
+
+        Args:
+            boxes: 2D boxes in PIXEL xyxy format. Shape (N, 4).
+                   IMPORTANT: Should be GT 2D boxes during training (not predictions!)
+                   This ensures stable targets. At inference, decode() uses pred boxes.
+            boxes3d: GT 3D boxes [center_3d(3), dims(3), quat(4)]. Shape (N, 10).
+            intrinsics: Camera intrinsics. Shape (3, 3) or (N, 3, 3).
+
+        Returns:
+            boxes3d_target: Encoded targets [delta_2d(2), log_depth(1), log_dims(3), rot_6d(6)].
+            boxes3d_weights: Per-element weights (0 for invalid depth/dims).
+        """
         projected_center_3d = project_points(boxes3d[:, :3], intrinsics)
         ctr_x = (boxes[:, 0] + boxes[:, 2]) / 2
         ctr_y = (boxes[:, 1] + boxes[:, 3]) / 2

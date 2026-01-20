@@ -102,7 +102,7 @@ def get_checkpoint_path(
         # Fallback: try without geo_ft
         key_fallback = (backbone_type, model_size, use_mobileclip, False)
         if key_fallback in EFFICIENT_SAM3_CHECKPOINTS:
-            print(f"⚠️  Geometry fine-tuned checkpoint not found, using standard version")
+            print(f"[Warning] Geometry fine-tuned checkpoint not found, using standard version")
             checkpoint_name = EFFICIENT_SAM3_CHECKPOINTS[key_fallback]
         else:
             available_configs = [
@@ -173,14 +173,30 @@ def build_efficientsam3_for_3d(
         >>> from opendet3d.model.detect3d.sam3_3d import SAM3_3D
         >>> sam3_3d = SAM3_3D(sam3_model=model)
     """
-    # Add efficientsam3 to Python path if not already installed
+    # EfficientSAM3 has nested structure: efficientsam3/sam3/sam3/model_builder.py
+    # We need to temporarily override sam3 module to use efficientsam3's version
     import sys
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
-    efficientsam3_path = os.path.join(project_root, "efficientsam3")
-    if efficientsam3_path not in sys.path:
-        sys.path.insert(0, efficientsam3_path)
+    efficientsam3_sam3_path = os.path.join(project_root, "efficientsam3", "sam3")
 
+    # Save original sam3 module if exists
+    original_sam3 = sys.modules.get("sam3", None)
+    original_sam3_model = sys.modules.get("sam3.model", None)
+    original_sam3_model_builder = sys.modules.get("sam3.model_builder", None)
+
+    # Remove sam3 from modules cache to force reimport from efficientsam3
+    modules_to_remove = [k for k in sys.modules.keys() if k == "sam3" or k.startswith("sam3.")]
+    for mod in modules_to_remove:
+        del sys.modules[mod]
+
+    # Add efficientsam3/sam3 to front of path
+    sys.path.insert(0, efficientsam3_sam3_path)
+
+    # Now import from efficientsam3
     from sam3.model_builder import build_efficientsam3_image_model
+
+    # Restore path (keep efficientsam3 for model's internal imports)
+    # Don't restore original sam3 modules - efficientsam3 needs its own sam3
 
     # Auto-select checkpoint if not provided
     if checkpoint_path is None:
@@ -196,7 +212,7 @@ def build_efficientsam3_for_3d(
     if not os.path.exists(checkpoint_path):
         checkpoint_name = os.path.basename(checkpoint_path)
         raise FileNotFoundError(
-            f"❌ Checkpoint file not found: {checkpoint_path}\n\n"
+            f"[Error] Checkpoint file not found: {checkpoint_path}\n\n"
             f"Please download from Hugging Face:\n"
             f"  mkdir -p {checkpoint_dir}\n"
             f"  wget https://huggingface.co/Simon7108528/EfficientSAM3/resolve/main/stage1_all_converted/{checkpoint_name} \\\n"
@@ -206,11 +222,11 @@ def build_efficientsam3_for_3d(
         )
 
     print(f"\n{'='*80}")
-    print(f"🚀 Building EfficientSAM3 Model")
+    print(f"[EfficientSAM3] Building Model")
     print(f"{'='*80}")
     print(f"  Backbone: {backbone_type}-{model_size}")
     print(f"  Text Encoder: {'MobileCLIP-S1 (63.56M)' if use_mobileclip else 'SAM3 (353M)'}")
-    print(f"  Geometry FT: {'✅ Yes (optimized for box/point prompts)' if use_geo_ft else '❌ No'}")
+    print(f"  Geometry FT: {'Yes (optimized for box/point prompts)' if use_geo_ft else 'No'}")
     print(f"  Checkpoint: {checkpoint_path}")
     print(f"{'='*80}\n")
 
@@ -225,7 +241,7 @@ def build_efficientsam3_for_3d(
         text_encoder_type="MobileCLIP-S1" if use_mobileclip else None,
     )
 
-    print(f"\n✅ EfficientSAM3 model built successfully!")
+    print(f"\n[EfficientSAM3] Model built successfully!")
     print(f"   Model type: {type(model).__name__}")
     print(f"   Hidden dim: {model.hidden_dim}")
 

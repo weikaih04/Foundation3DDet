@@ -101,6 +101,7 @@ def get_test_transforms_cfg(
         class_config(GenResizeParameters, shape=shape),
         class_config(ResizeImages),
         class_config(ResizeIntrinsics),
+        class_config(ResizeDepthMaps),
     ]
 
     preprocess_transforms.append(class_config(NormalizeImages))
@@ -110,6 +111,7 @@ def get_test_transforms_cfg(
             CenterPadImages, stride=1, shape=shape, update_input_hw=True
         ),
         class_config(CenterPadIntrinsics),
+        class_config(CenterPadDepthMaps),
     ]
 
     test_preprocess_cfg = class_config(

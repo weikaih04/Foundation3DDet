@@ -47,10 +47,17 @@ class GroundingDINO3DHead(nn.Module):
         as_two_stage: bool = True,
         box_coder: GroundingDINO3DCoder | None = None,
         depth_output_scales: int = 1,
+        depth_latent_dim: int | None = None,
         use_camera_prompt: bool = True,
         use_depth_prompt: bool = True,
     ) -> None:
-        """Initialize the 3D Grounding DINO head."""
+        """Initialize the 3D Grounding DINO head.
+
+        Args:
+            depth_latent_dim: Dimension of depth latents from geometry backend.
+                If provided, uses this directly. If None, computes from
+                depth_output_scales as embed_dims // 2**depth_output_scales.
+        """
         super().__init__()
         self.embed_dims = embed_dims
         self.use_camera_prompt = use_camera_prompt
@@ -79,7 +86,11 @@ class GroundingDINO3DHead(nn.Module):
 
         # Depth prompt branch (only created if use_depth_prompt is True)
         if self.use_depth_prompt:
-            depth_embed_dims = embed_dims // 2**depth_output_scales
+            # Use depth_latent_dim directly if provided, else compute from depth_output_scales
+            if depth_latent_dim is not None:
+                depth_embed_dims = depth_latent_dim
+            else:
+                depth_embed_dims = embed_dims // 2**depth_output_scales
             project_depth, prompt_depth = self._get_condition_branch(
                 depth_embed_dims, expansion=4, embed_dims=embed_dims
             )

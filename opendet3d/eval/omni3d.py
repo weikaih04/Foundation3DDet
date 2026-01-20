@@ -206,6 +206,9 @@ class Omni3DEvaluator(Evaluator):
         pred_boxes3d: list[NDArrayNumber] | None = None,
     ) -> None:
         """Process sample and convert detections to coco format."""
+        # Handle empty batch (can happen when all images have 0 GT boxes)
+        if dataset_names is None or len(dataset_names) == 0:
+            return
         for i, dataset_name in enumerate(dataset_names):
             self.evaluators[dataset_name].process_batch(
                 [coco_image_id[i]],
