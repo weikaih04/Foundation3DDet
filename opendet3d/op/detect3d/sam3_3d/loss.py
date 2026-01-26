@@ -409,17 +409,29 @@ class SAM3_3DLoss(nn.Module):
                 intrinsics=intrinsics,
                 image_size=image_size,
             )
-            # Apply appropriate scale based on loss type (2D vs 3D)
+            # Apply appropriate scale and loss weights (following SAM3 original)
+            # SAM3 original: loss = loss_value * o2m_weight * loss_weight
+            # We need to apply the individual loss weights, not just o2m_loss_weight
+            o2m_weight_map = {
+                "loss_cls": self.config.loss_cls_weight,
+                "loss_bbox": self.config.loss_bbox_weight,
+                "loss_giou": self.config.loss_giou_weight,
+                "loss_delta_2d": self.config.loss_delta_2d_weight,
+                "loss_depth": self.config.loss_depth_weight,
+                "loss_dim": self.config.loss_dim_weight,
+                "loss_rot": self.config.loss_rot_weight,
+            }
             for key, value in o2m_losses.items():
+                loss_weight = o2m_weight_map.get(key, 1.0)
                 if key in ("loss_delta_2d", "loss_depth", "loss_dim", "loss_rot"):
                     # 3D losses use loss_3d_scale
                     losses[f"o2m_{key}"] = (
-                        self.config.loss_3d_scale * value * self.config.o2m_loss_weight
+                        self.config.loss_3d_scale * value * loss_weight * self.config.o2m_loss_weight
                     )
                 else:
                     # 2D losses (loss_cls, loss_bbox, loss_giou) use loss_2d_scale
                     losses[f"o2m_{key}"] = (
-                        self.config.loss_2d_scale * value * self.config.o2m_loss_weight
+                        self.config.loss_2d_scale * value * loss_weight * self.config.o2m_loss_weight
                     )
 
         # ========== 3D Losses (scaled by loss_3d_scale) ==========
@@ -524,6 +536,7 @@ class SAM3_3DLoss(nn.Module):
         """
         batch_idx, src_idx, tgt_idx = indices
         device = pred_logits.device
+        B = pred_logits.shape[0]
 
         src_logits = pred_logits.squeeze(-1)  # (B, S)
         prob = src_logits.sigmoid()
@@ -775,7 +788,7 @@ class SAM3_3DLoss(nn.Module):
                 })
             return zero_losses
 
-        # O2M Classification Loss
+        # O2M Classification Loss (following SAM3 original IABCEMdetr)
         src_logits = pred_logits.squeeze(-1)  # (B, S)
         prob = src_logits.sigmoid()
 
@@ -796,13 +809,31 @@ class SAM3_3DLoss(nn.Module):
             positive_target_classes = target_classes.clone()
             positive_target_classes[(batch_idx, src_idx)] = t.to(positive_target_classes.dtype)
 
-        # BCE loss (only on positives for O2M)
+        # Positive loss: BCE with soft target (same as main IABCEMdetr)
         loss_pos = F.binary_cross_entropy_with_logits(
             src_logits, positive_target_classes, reduction="none"
         )
         loss_pos = loss_pos * target_classes * self.config.pos_weight
+
+        # Negative loss: focal BCE (same as main IABCEMdetr)
+        loss_neg = F.binary_cross_entropy_with_logits(
+            src_logits, target_classes, reduction="none"
+        )
+        loss_neg = loss_neg * (1 - target_classes) * (prob ** self.config.gamma)
+
+        # Total cls loss: positive + negative (following SAM3 original)
+        loss_bce = loss_pos + loss_neg
+
+        # Apply keep_loss mask if use_presence is enabled (following SAM3 original)
+        # For prompts with no GT boxes, set classification loss to 0
+        # This is applied to O2M as well (SAM3 original: loss_bce = loss_bce * keep_loss)
+        if self.config.use_presence:
+            num_gts = targets.get("num_boxes", torch.zeros(B, dtype=torch.long, device=device))
+            keep_loss = (num_gts > 0).float().unsqueeze(-1)  # (B, 1)
+            loss_bce = loss_bce * keep_loss
+
         # SAM3 original: use mean() for cls (same as main loss)
-        loss_cls = loss_pos.mean()
+        loss_cls = loss_bce.mean()
 
         losses["loss_cls"] = loss_cls
 
