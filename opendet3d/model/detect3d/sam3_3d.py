@@ -81,6 +81,13 @@ class SAM3_3DOut(NamedTuple):
     # Format: (batch_idx, src_idx, tgt_idx) from Hungarian matching
     indices: tuple | None = None
 
+    # O2M (One-to-Many) outputs from SAM3 DAC (Deformable Attention Contrastive)
+    # These are produced by the O2M queries (second half of decoder queries)
+    # Only present during training when DAC is enabled
+    pred_logits_o2m: Tensor | None = None  # (N_prompts, num_queries, 1)
+    pred_boxes_2d_o2m: Tensor | None = None  # (N_prompts, num_queries, 4) - normalized xyxy
+    pred_boxes_3d_o2m: Tensor | None = None  # (N_prompts, num_queries, 12) - encoded 3D params
+
     def __getitem__(self, key: str):
         """Support dict-like access for vis4d data connector compatibility."""
         return getattr(self, key)
@@ -367,13 +374,17 @@ class SAM3_3D(nn.Module):
 
         # Ensure SAM3 has a matcher for training
         # SAM3 built with eval_mode=True doesn't have a matcher, so we create one
+        # Using BinaryHungarianMatcherV2 with focal=True to match SAM3 original config
         if self.sam3.matcher is None:
-            from sam3.train.matcher import BinaryHungarianMatcher
-            print("[SAM3_3D] Creating BinaryHungarianMatcher for training...")
-            self.sam3.matcher = BinaryHungarianMatcher(
-                cost_class=1.0,
-                cost_bbox=5.0,
-                cost_giou=2.0,
+            from sam3.train.matcher import BinaryHungarianMatcherV2
+            print("[SAM3_3D] Creating BinaryHungarianMatcherV2 for training...")
+            self.sam3.matcher = BinaryHungarianMatcherV2(
+                cost_class=2.0,  # SAM3 original
+                cost_bbox=5.0,   # SAM3 original
+                cost_giou=2.0,   # SAM3 original
+                focal=True,      # SAM3 original
+                alpha=0.25,      # SAM3 original
+                gamma=2.0,       # SAM3 original
             )
 
     def _xyxy_to_cxcywh(self, boxes: Tensor) -> Tensor:
@@ -801,12 +812,19 @@ class SAM3_3D(nn.Module):
         encoder_hidden_states = sam3_out.get("encoder_hidden_states")
         presence_logits = sam3_out.get("presence_logit_dec")
 
+        # Extract O2M outputs from SAM3 DAC (only present during training)
+        # SAM3 with dac=True produces separate O2M queries/outputs
+        pred_logits_o2m = sam3_out.get("pred_logits_o2m")  # (N_prompts, S, 1)
+        pred_boxes_xyxy_o2m = sam3_out.get("pred_boxes_xyxy_o2m")  # (N_prompts, S, 4)
+        queries_o2m = sam3_out.get("queries_o2m")  # (N_prompts, S, d_model)
+
         # Extract auxiliary outputs from SAM3 for deep supervision
         sam3_aux_outputs = sam3_out.get("aux_outputs", [])
 
         # ========== Step 6: 3D Head ==========
         profile_start("  3d_head")
         pred_boxes_3d = None
+        pred_boxes_3d_o2m = None
         aux_outputs = None
 
         if self.bbox3d_head is not None and queries is not None:
@@ -926,6 +944,17 @@ class SAM3_3D(nn.Module):
                 # bbox3d_head always returns (L, N_prompts, S, 12), squeeze L dim when L=1
                 pred_boxes_3d = all_layers_boxes_3d.squeeze(0)  # (N_prompts, S, 12)
 
+            # Compute 3D boxes for O2M queries (only during training when DAC is enabled)
+            pred_boxes_3d_o2m = None
+            if queries_o2m is not None and self.training:
+                # O2M queries only have final layer (no auxiliary outputs)
+                hidden_states_o2m = queries_o2m.unsqueeze(0)  # (1, N_prompts, S, C)
+                pred_boxes_3d_o2m = self.bbox3d_head(
+                    hidden_states=hidden_states_o2m,
+                    ray_embeddings=ray_embeddings,
+                    depth_latents=depth_latents,
+                ).squeeze(0)  # (N_prompts, S, 12)
+
             # Build auxiliary outputs for deep supervision
             # Only include layers that have queries (tracked by aux_indices_with_queries)
             if len(aux_indices_with_queries) > 0 and self.training:
@@ -963,6 +992,10 @@ class SAM3_3D(nn.Module):
                 queries=queries,
                 encoder_hidden_states=encoder_hidden_states,
                 indices=sam3_indices,
+                # O2M outputs (from SAM3 DAC)
+                pred_logits_o2m=pred_logits_o2m,
+                pred_boxes_2d_o2m=pred_boxes_xyxy_o2m,
+                pred_boxes_3d_o2m=pred_boxes_3d_o2m,
             )
 
         # Test mode: forward_test returns Det3DOut for evaluation

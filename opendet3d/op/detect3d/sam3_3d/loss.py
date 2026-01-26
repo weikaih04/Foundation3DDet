@@ -26,7 +26,8 @@ from vis4d.op.loss.reducer import SumWeightedLoss
 
 from opendet3d.op.detect3d.grounding_dino_3d.coder import GroundingDINO3DCoder
 from sam3.model.box_ops import fast_diag_box_iou, fast_diag_generalized_box_iou
-from sam3.train.matcher import BinaryHungarianMatcher, BinaryOneToManyMatcher
+from sam3.train.matcher import BinaryOneToManyMatcher
+from sam3.train.loss.loss_fns import sigmoid_focal_loss
 
 
 def _packed_to_padded(boxes_packed: Tensor, num_boxes: Tensor, fill_value: float = 0.0) -> Tensor:
@@ -81,17 +82,13 @@ class SAM3_3DLossConfig:
     loss_3d_scale: float = 1.0  # Scale for 3D losses (delta, depth, dim, rot)
     loss_geom_scale: float = 10.0  # Scale for geometry backend losses (SILog, SSI, camera angles)
 
-    # ========== Matcher Configuration ==========
-    matcher_cost_class: float = 2.0
-    matcher_cost_bbox: float = 5.0
-    matcher_cost_giou: float = 2.0
-
-    # O2M (One-to-Many) Matcher Configuration
+    # ========== O2M (One-to-Many) Matcher Configuration ==========
+    # Note: Main O2O matcher is configured in sam3_3d.py (self.sam3.matcher)
     use_o2m: bool = True  # Enable O2M matching
     o2m_alpha: float = 0.3  # Alpha for O2M cost computation
     o2m_threshold: float = 0.4  # IoU threshold for O2M matching
-    o2m_topk: int = 6  # Top-k predictions per GT
-    o2m_loss_weight: float = 1.0  # Weight for O2M loss
+    o2m_topk: int = 4  # Top-k predictions per GT (SAM3 original: topk: 4)
+    o2m_loss_weight: float = 2.0  # Weight for O2M loss (SAM3 original: o2m_weight: 2.0)
 
     # ========== 2D Loss Weights (SAM3 style) ==========
     # Classification loss (IABCEMdetr style)
@@ -101,10 +98,12 @@ class SAM3_3DLossConfig:
     alpha: float = 0.25  # IoU-aware alpha
 
     # IABCEMdetr advanced features
-    use_weak_loss: bool = True  # Enable weak supervision (non-exhaustive annotations)
-    weak_loss_weight: float = 1.0  # Weight for weak loss
-    use_presence: bool = True  # Enable presence loss (empty image detection)
-    presence_loss_weight: float = 1.0  # Weight for presence loss
+    use_weak_loss: bool = False  # Enable weak supervision (SAM3 original: weak_loss: False)
+    weak_loss_weight: float = 1.0  # Weight for weak loss (only used if use_weak_loss=True)
+    use_presence: bool = True  # Enable presence loss (per-category presence detection)
+    presence_loss_weight: float = 20.0  # Weight for presence loss (SAM3 original: presence_weight: 20.0)
+    presence_alpha: float = 0.5  # SAM3 original presence focal loss alpha
+    presence_gamma: float = 0.0  # SAM3 original presence focal loss gamma
 
     # Box regression loss
     loss_bbox_weight: float = 5.0  # L1 loss weight
@@ -161,12 +160,8 @@ class SAM3_3DLoss(nn.Module):
         self.box_coder = box_coder or GroundingDINO3DCoder()
         self.reg_dims = self.box_coder.reg_dims
 
-        # Initialize matcher
-        self.matcher = BinaryHungarianMatcher(
-            cost_class=self.config.matcher_cost_class,
-            cost_bbox=self.config.matcher_cost_bbox,
-            cost_giou=self.config.matcher_cost_giou,
-        )
+        # Note: Main O2O matching is done by SAM3 internally (self.sam3.matcher)
+        # We only need O2M matcher here for O2M loss computation
 
         # Initialize O2M matcher if enabled
         if self.config.use_o2m:
@@ -375,9 +370,10 @@ class SAM3_3DLoss(nn.Module):
             torch.cuda.synchronize()
             _loss_cls_time = (time.perf_counter() - _t0) * 1000
 
-        # Presence loss (empty image detection)
-        if self.config.use_presence:
-            loss_presence = self._loss_presence(pred_logits, normalized_targets)
+        # Presence loss (per-category presence detection, following SAM3 original)
+        # Uses presence_logit_dec to predict whether each category exists in the image
+        if self.config.use_presence and out.presence_logits is not None:
+            loss_presence = self._loss_presence(out.presence_logits, normalized_targets)
             losses["loss_presence"] = (
                 self.config.loss_2d_scale * loss_presence * self.config.presence_loss_weight
             )
@@ -402,11 +398,12 @@ class SAM3_3DLoss(nn.Module):
             _loss_2d_box_time = (time.perf_counter() - _t1) * 1000
 
         # ========== O2M Loss (2D scaled by loss_2d_scale, 3D scaled by loss_3d_scale) ==========
-        if self.config.use_o2m and self.o2m_matcher is not None:
+        # Use real O2M outputs from SAM3 DAC (not hacking with O2O outputs)
+        if self.config.use_o2m and self.o2m_matcher is not None and out.pred_logits_o2m is not None:
             o2m_losses = self._loss_o2m(
-                pred_logits=pred_logits,
-                pred_boxes_2d=pred_boxes_2d,
-                pred_boxes_3d=pred_boxes_3d,
+                pred_logits=out.pred_logits_o2m,      # Real O2M outputs
+                pred_boxes_2d=out.pred_boxes_2d_o2m,  # Real O2M outputs
+                pred_boxes_3d=out.pred_boxes_3d_o2m,  # Real O2M outputs (computed from queries_o2m)
                 targets=normalized_targets,
                 num_boxes=num_boxes,
                 intrinsics=intrinsics,
@@ -571,10 +568,20 @@ class SAM3_3DLoss(nn.Module):
         )
         loss_neg = loss_neg * (1 - target_classes) * (prob ** self.config.gamma) * weak_mask
 
+        loss_bce = loss_pos + loss_neg
+
+        # Apply keep_loss mask if use_presence is enabled (following SAM3 original)
+        # For prompts with no GT boxes, set classification loss to 0
+        # Only presence loss supervises these prompts (to predict presence = 0)
+        if self.config.use_presence:
+            num_gts = targets.get("num_boxes", torch.zeros(B, dtype=torch.long, device=device))
+            keep_loss = (num_gts > 0).float().unsqueeze(-1)  # (B, 1)
+            loss_bce = loss_bce * keep_loss
+
         # SAM3 original: use mean() over all B×S logits (not sum()/num_boxes)
         # This is different from bbox/giou which use sum()/num_boxes
         # That's why loss_cls_weight=20 is needed to compensate
-        loss_bce = (loss_pos + loss_neg).mean()
+        loss_bce = loss_bce.mean()
 
         return loss_bce
 
@@ -641,41 +648,43 @@ class SAM3_3DLoss(nn.Module):
 
     def _loss_presence(
         self,
-        pred_logits: Tensor,  # (B, S, 1)
+        presence_logits: Tensor,  # (N_prompts, 1) from presence_logit_dec
         targets: dict,
     ) -> Tensor:
-        """Compute presence loss for empty image detection.
+        """Compute presence loss for per-category presence detection.
 
-        Presence loss encourages the model to predict all negatives for images
-        without any objects (empty images). This helps with false positive reduction.
+        Following SAM3 original: presence_logit_dec predicts whether each
+        category/prompt has any visible objects in the image.
+
+        This is different from empty image detection - it's per-category:
+        - If category "car" has GT boxes -> target = 1
+        - If category "bicycle" has no GT boxes -> target = 0
 
         Args:
-            pred_logits: Predicted objectness logits (B, S, 1)
+            presence_logits: Predicted presence logits (N_prompts, 1) from presence_logit_dec
             targets: Ground truth targets with num_boxes field
 
         Returns:
-            Presence loss scalar
+            Presence loss scalar (sigmoid focal loss)
         """
-        device = pred_logits.device
-        B, S = pred_logits.shape[:2]
+        device = presence_logits.device
+        N_prompts = presence_logits.shape[0]
 
-        src_logits = pred_logits.squeeze(-1)  # (B, S)
+        # Get number of GT boxes per prompt
+        num_gts = targets.get("num_boxes", torch.zeros(N_prompts, dtype=torch.long, device=device))
 
-        # Identify empty images (num_gts == 0)
-        num_gts = targets.get("num_boxes", torch.zeros(B, dtype=torch.long, device=device))
-        is_empty = (num_gts == 0)  # (B,)
+        # Target: 1 if prompt has GT boxes, 0 otherwise (following SAM3 original)
+        # SAM3 uses: keep_loss = (gt_padded_is_visible.sum(dim=-1)[..., None] != 0).float()
+        presence_target = (num_gts > 0).float().unsqueeze(-1)  # (N_prompts, 1)
 
-        if not is_empty.any():
-            # No empty images in batch, no presence loss
-            return torch.tensor(0.0, device=device)
-
-        # For empty images, all predictions should be negative
-        empty_logits = src_logits[is_empty]  # (N_empty * S,)
-        target_empty = torch.zeros_like(empty_logits)
-
-        # BCE loss for empty image predictions
-        loss_presence = F.binary_cross_entropy_with_logits(
-            empty_logits, target_empty, reduction="mean"
+        # Sigmoid focal loss (following SAM3 original)
+        # SAM3 uses: sigmoid_focal_loss(presence_logits, keep_loss, num_boxes=bs, alpha=0.5, gamma=0.0)
+        loss_presence = sigmoid_focal_loss(
+            presence_logits,
+            presence_target,
+            num_boxes=N_prompts,
+            alpha=self.config.presence_alpha,
+            gamma=self.config.presence_gamma,
         )
 
         return loss_presence
