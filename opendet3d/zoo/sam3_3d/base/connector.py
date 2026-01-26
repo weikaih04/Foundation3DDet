@@ -9,12 +9,15 @@ This module provides:
 from __future__ import annotations
 
 import random
+import time
 from collections import defaultdict
 from typing import List, Literal, Optional
 
 import numpy as np
 import torch
 from torch import Tensor
+
+from opendet3d.utils.profiler import profile_start, profile_stop
 
 from ml_collections import ConfigDict
 from vis4d.config import class_config
@@ -411,6 +414,8 @@ class SAM3_3DCollator:
         Returns:
             SAM3_3DBatchedInputs with per-prompt batch
         """
+        profile_start("  collator_total")
+
         # Filter out images with no GT boxes to avoid empty prompts
         # This reduces the probability of empty batches during training
         original_batch_size = len(batch)
@@ -455,6 +460,7 @@ class SAM3_3DCollator:
         device = batch[0]["images"].device if batch[0]["images"].is_cuda else "cpu"
 
         # Collect image-level data
+        profile_start("  collator_image_stack")
         # Images might be (3, H, W) or (1, 3, H, W) depending on data pipeline
         images_list = []
         for b in batch:
@@ -466,6 +472,7 @@ class SAM3_3DCollator:
         images = torch.stack(images_list)  # (B, 3, H, W)
         intrinsics = torch.stack([b["intrinsics"] for b in batch])  # (B, 3, 3)
         H, W = images.shape[-2:]  # Use -2: and -1 for H, W to be safe
+        profile_stop("  collator_image_stack")
 
         # Collect metadata for evaluation/visualization
         sample_names = []
@@ -565,6 +572,7 @@ class SAM3_3DCollator:
         unique_texts = []
         text_to_id = {}
 
+        profile_start("  collator_category_group")
         for img_idx, sample in enumerate(batch):
             boxes2d = sample.get("boxes2d")  # (N_i, 4) pixel xyxy
             boxes3d = sample.get("boxes3d")  # (N_i, 7+)
@@ -754,6 +762,8 @@ class SAM3_3DCollator:
                     gt_boxes2d_per_query.append(query_gt_boxes2d)
                     gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
 
+        profile_stop("  collator_category_group")
+
         N_prompts = len(img_ids_list)
 
         if N_prompts == 0:
@@ -777,6 +787,7 @@ class SAM3_3DCollator:
             )
 
         # Stack tensors
+        profile_start("  collator_tensor_stack")
         img_ids = torch.tensor(img_ids_list, dtype=torch.long, device=device)
         text_ids = torch.tensor(text_ids_list, dtype=torch.long, device=device)
 
@@ -859,6 +870,8 @@ class SAM3_3DCollator:
 
         # Query types: 0=TEXT, 1=VISUAL, 2=GEOMETRY
         query_types = torch.tensor(query_types_list, dtype=torch.long, device=device)
+        profile_stop("  collator_tensor_stack")
+        profile_stop("  collator_total")
 
         return SAM3_3DBatchedInputs(
             images=images,

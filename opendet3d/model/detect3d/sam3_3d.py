@@ -29,6 +29,8 @@ from typing import List, NamedTuple, Optional
 import torch
 from torch import Tensor, nn
 
+from opendet3d.utils.profiler import profile_start, profile_stop, profile_step
+
 # SAM3 imports
 from sam3.model.sam3_image import Sam3Image
 from sam3.model.geometry_encoders import Prompt
@@ -291,7 +293,16 @@ class SAM3_3D(nn.Module):
 
         # SAM3 model - build if not provided
         if sam3_model is None:
+            import os
             from sam3.model_builder import build_sam3_image_model
+
+            # Check if torch.compile should be enabled for SAM3
+            use_compile = os.environ.get("SAM3_COMPILE", "0") == "1"
+            if use_compile:
+                print("[SAM3_3D] torch.compile ENABLED for SAM3 backbone (SAM3_COMPILE=1)")
+            else:
+                print("[SAM3_3D] torch.compile disabled (set SAM3_COMPILE=1 to enable)")
+
             print(f"Building SAM3 model from checkpoint: {sam3_checkpoint}")
             sam3_model = build_sam3_image_model(
                 checkpoint_path=sam3_checkpoint,
@@ -299,6 +310,7 @@ class SAM3_3D(nn.Module):
                 device="cpu",  # Will be moved to correct device later
                 eval_mode=False,  # Must be False to enable matcher for training
                 enable_segmentation=False,  # Skip seg head for 3D detection (saves ~4GB memory)
+                compile=use_compile,  # Enable torch.compile for backbone
             )
             # Store checkpoint path for logging in on_load_checkpoint
             self._sam3_checkpoint_path = sam3_checkpoint
@@ -593,6 +605,8 @@ class SAM3_3D(nn.Module):
         _, _, H, W = batch.images.shape
         device = batch.images.device
 
+        profile_start("forward_total")
+
         # Sync SAM3 training mode with parent module
         # This is important because SAM3's forward_grounding only computes
         # matching indices when self.training is True
@@ -631,55 +645,76 @@ class SAM3_3D(nn.Module):
                     categories=None,
                 )
 
-        # ========== Step 1: SAM3 Backbone ==========
-        # Convert images from ImageNet normalization to SAM3 normalization
-        # vis4d uses ImageNet norm, but SAM3 expects (x - 0.5) / 0.5
+        # ========== Step 1 & 2: SAM3 Backbone + Geometry Backend (PARALLEL) ==========
+        # These two operations are independent - run them in parallel using CUDA streams
+        profile_start("  backbone+geom_parallel")
+
+        # Convert images for SAM3 (needed by backbone)
         images_for_sam3 = self._convert_imagenet_to_sam3_norm(batch.images)
 
-        # Get image and text features
-        backbone_out = {"img_batch_all_stages": batch.images}  # Keep original for depth
-        backbone_out.update(self.sam3.backbone.forward_image(images_for_sam3))
-        text_out = self.sam3.backbone.forward_text(
-            batch.unique_texts, device=device
-        )
-        backbone_out.update(text_out)
-
-        # ========== Step 2: Geometry Backend (Depth) ==========
+        # Prepare geometry backend inputs
         geom_losses = None
         depth_latents = None
         geom_out = None
+        _, _, H, W = batch.images.shape
+
         if self.geometry_backend is not None:
-            # Extract depth features from SAM3 backbone
-            # SAM3's backbone_fpn is a list of multi-scale features, similar to FPN
-            depth_feats = backbone_out.get("backbone_fpn", None)
+            # Create CUDA streams for parallel execution
+            backbone_stream = torch.cuda.Stream()
+            geom_stream = torch.cuda.Stream()
 
-            # Get image dimensions
-            _, _, H, W = batch.images.shape
-
-            # Index intrinsics per image (NOT per prompt) for geometry backend
-            # Geometry backend processes per-image, not per-prompt
+            # Prepare inputs for geometry backend (before streams)
             intrinsics_per_image = batch.intrinsics
-
-            # Prepare depth GT if in training mode
-            # Get depth_gt from batch directly (not from targets)
             depth_gt = None
             depth_mask = None
             if self.training:
                 depth_gt = getattr(batch, 'depth_gt', None)
                 depth_mask = getattr(batch, 'depth_mask', None)
 
-            # Call geometry backend with correct interface
-            geom_out = self.geometry_backend(
-                images=batch.images,
-                depth_feats=depth_feats,
-                intrinsics=intrinsics_per_image,
-                image_hw=(H, W),
-                depth_gt=depth_gt,
-                depth_mask=depth_mask,
-            )
+            # Run backbone on stream 1
+            profile_start("  backbone")
+            with torch.cuda.stream(backbone_stream):
+                backbone_out = {"img_batch_all_stages": batch.images}
+                backbone_out.update(self.sam3.backbone.forward_image(images_for_sam3))
+                text_out = self.sam3.backbone.forward_text(
+                    batch.unique_texts, device=device
+                )
+                backbone_out.update(text_out)
+
+            # Run geometry backend on stream 2 (parallel with backbone)
+            profile_start("  geometry_backend")
+            with torch.cuda.stream(geom_stream):
+                geom_out = self.geometry_backend(
+                    images=batch.images,
+                    depth_feats=None,  # Not using backbone features
+                    intrinsics=intrinsics_per_image,
+                    image_hw=(H, W),
+                    depth_gt=depth_gt,
+                    depth_mask=depth_mask,
+                )
+
+            # Wait for both streams to complete
+            backbone_stream.synchronize()
+            profile_stop("  backbone")
+            geom_stream.synchronize()
+            profile_stop("  geometry_backend")
+
+            # Extract geometry outputs
             depth_latents = geom_out.get("depth_latents")
             if self.training:
                 geom_losses = geom_out.get("losses", {})
+        else:
+            # No geometry backend - just run backbone
+            profile_start("  backbone")
+            backbone_out = {"img_batch_all_stages": batch.images}
+            backbone_out.update(self.sam3.backbone.forward_image(images_for_sam3))
+            text_out = self.sam3.backbone.forward_text(
+                batch.unique_texts, device=device
+            )
+            backbone_out.update(text_out)
+            profile_stop("  backbone")
+
+        profile_stop("  backbone+geom_parallel")
 
         # ========== Step 2.5: Early Depth Fusion (Backbone后、Encoder前) ==========
         # Fuse depth_latents into backbone visual features before encoder
@@ -744,12 +779,14 @@ class SAM3_3D(nn.Module):
                 "Training requires GT boxes (batch.gt_boxes2d)"
             find_target = self._build_find_target(batch)
 
+        profile_start("  sam3_grounding")
         sam3_out = self.sam3.forward_grounding(
             backbone_out=backbone_out,
             find_input=find_input,
             find_target=find_target,
             geometric_prompt=geometric_prompt,
         )
+        profile_stop("  sam3_grounding")
 
         # ========== Step 5: Extract SAM3 outputs ==========
         # SAM3 output format (after _update_scores_and_boxes):
@@ -768,6 +805,7 @@ class SAM3_3D(nn.Module):
         sam3_aux_outputs = sam3_out.get("aux_outputs", [])
 
         # ========== Step 6: 3D Head ==========
+        profile_start("  3d_head")
         pred_boxes_3d = None
         aux_outputs = None
 
@@ -903,11 +941,17 @@ class SAM3_3D(nn.Module):
                     if "presence_logit_dec" in aux_out:
                         aux_dict["presence_logits"] = aux_out["presence_logit_dec"]
                     aux_outputs.append(aux_dict)
+        profile_stop("  3d_head")
 
         # Training mode: return raw outputs for loss computation
         if self.training:
             # Extract matching indices from SAM3 output (computed by _compute_matching)
             sam3_indices = sam3_out.get("indices", None)
+
+            profile_stop("forward_total")
+
+            # Record profiling step (will print summary every N steps if enabled)
+            profile_step()
 
             return SAM3_3DOut(
                 pred_logits=pred_logits,
@@ -926,6 +970,7 @@ class SAM3_3D(nn.Module):
             pred_logits=pred_logits,
             pred_boxes_2d=pred_boxes_xyxy,
             pred_boxes_3d=pred_boxes_3d,
+            presence_logits=presence_logits,
             batch=batch,
             geom_out=geom_out,
         )
@@ -972,6 +1017,7 @@ class SAM3_3D(nn.Module):
         pred_logits: Tensor,
         pred_boxes_2d: Tensor,
         pred_boxes_3d: Tensor | None,
+        presence_logits: Tensor | None,
         batch: SAM3_3DBatchedInputs,
         geom_out: dict | None,
     ) -> Det3DOut:
@@ -987,6 +1033,7 @@ class SAM3_3D(nn.Module):
             pred_logits: (N_prompts, S, 1) objectness logits
             pred_boxes_2d: (N_prompts, S, 4) normalized xyxy boxes
             pred_boxes_3d: (N_prompts, S, 12) encoded 3D params or None
+            presence_logits: (N_prompts, 1) presence logits (category exists in image)
             batch: Input batch with img_ids, intrinsics, etc.
             geom_out: Geometry backend output (may contain depth_maps)
 
@@ -1000,6 +1047,17 @@ class SAM3_3D(nn.Module):
         # Get scores from logits
         scores_all = pred_logits.sigmoid().squeeze(-1)  # (N_prompts, S)
 
+        # Apply presence score if available (following SAM3 original postprocessors.py)
+        # Presence score indicates whether a category has objects in the image
+        # This suppresses all proposals for categories that don't exist in the image
+        # SAM3 original: presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1)
+        if presence_logits is not None:
+            presence_score = presence_logits.sigmoid()
+            # Ensure correct shape for broadcasting: (N_prompts, 1) or (N_prompts,) -> (N_prompts, 1)
+            if presence_score.dim() == 1:
+                presence_score = presence_score.unsqueeze(-1)
+            scores_all = scores_all * presence_score  # (N_prompts, S) * (N_prompts, 1)
+
         # Scale boxes to pixel coordinates
         # pred_boxes_2d is normalized xyxy [0, 1]
         boxes_pixel = pred_boxes_2d.clone()
@@ -1011,6 +1069,13 @@ class SAM3_3D(nn.Module):
         boxes3d_list = []
         scores_list = []
         class_ids_list = []
+
+        # Get parameters from roi2det3d if available
+        # Default values match SAM3 ODinW config: max_dets_per_img=-1, detection_threshold=-1.0
+        max_per_img = getattr(self.roi2det3d, 'max_per_img', -1) if self.roi2det3d else -1
+        score_threshold = getattr(self.roi2det3d, 'score_threshold', -1.0) if self.roi2det3d else -1.0
+
+        S = scores_all.shape[1]  # predictions per prompt
 
         for img_idx in range(B_images):
             # Find prompts belonging to this image
@@ -1029,59 +1094,84 @@ class SAM3_3D(nn.Module):
             img_scores = scores_all[prompt_mask]  # (n_prompts, S)
             img_boxes = boxes_pixel[prompt_mask]  # (n_prompts, S, 4)
 
-            # Flatten to get all detections
-            img_scores_flat = img_scores.flatten()  # (n_prompts * S,)
-            img_boxes_flat = img_boxes.reshape(-1, 4)  # (n_prompts * S, 4)
-
-            # Get best detection per prompt (SAM3 typically outputs 1 box per prompt)
-            # For now, take the max score detection from each prompt
-            best_scores, best_indices = img_scores.max(dim=1)  # (n_prompts,)
-            best_boxes = img_boxes[torch.arange(n_prompts_this_img, device=device), best_indices]
-
-            # Decode 3D boxes if available
-            if pred_boxes_3d is not None and self.box_coder is not None:
-                img_boxes3d = pred_boxes_3d[prompt_mask]  # (n_prompts, S, 12)
-                best_boxes3d_encoded = img_boxes3d[
-                    torch.arange(n_prompts_this_img, device=device), best_indices
-                ]  # (n_prompts, 12)
-
-                # Get intrinsics for this image (single 3x3 matrix)
-                intrinsics_this_img = batch.intrinsics[img_idx]  # (3, 3)
-
-                # Decode 3D boxes using box_coder
-                # IMPORTANT: box_coder.decode() expects PIXEL xyxy boxes, not normalized!
-                # This is because encode() computes delta_center in pixel space:
-                #   delta_center = project_points(center_3d, K) - box_2d_center
-                # where project_points() returns pixel coords and box_2d_center is in pixels.
-                # So decode() must also use pixel coords to correctly reverse:
-                #   proj_center_3d = box_2d_center + delta_center (both in pixels)
-                # box_coder.decode expects (3, 3) intrinsics, not batched
-                decoded_boxes3d = self.box_coder.decode(
-                    best_boxes,  # pixel xyxy (NOT normalized!)
-                    best_boxes3d_encoded,
-                    intrinsics_this_img,  # (3, 3)
-                )  # (n_prompts, 10)
-            else:
-                decoded_boxes3d = torch.zeros(n_prompts_this_img, 10, device=device)
-
-            # Class IDs: for SAM3, we use GT category as "class" since it's prompt-based
-            # During eval, the evaluator matches by coco_image_id
+            # Get class IDs for each prompt
             if batch.gt_category_ids is not None:
-                img_class_ids = batch.gt_category_ids[prompt_mask]
+                img_class_ids = batch.gt_category_ids[prompt_mask]  # (n_prompts,) or (n_prompts, max_gt)
                 if img_class_ids.dim() > 1:
                     img_class_ids = img_class_ids[:, 0]  # Take first if multiple
             else:
                 img_class_ids = torch.zeros(n_prompts_this_img, dtype=torch.long, device=device)
 
-            boxes_list.append(best_boxes)
+            # Flatten all predictions: (n_prompts, S) -> (n_prompts * S,)
+            # Each prompt outputs S=100 predictions, we want ALL of them for multi-instance detection
+            img_scores_flat = img_scores.flatten()  # (n_prompts * S,)
+            img_boxes_flat = img_boxes.reshape(-1, 4)  # (n_prompts * S, 4)
+
+            # Expand class_ids to match flattened shape
+            # Each prompt has S predictions, all with the same class_id
+            img_class_ids_flat = img_class_ids.unsqueeze(1).expand(-1, S).flatten()  # (n_prompts * S,)
+
+            # Get 3D boxes if available (flattened)
+            if pred_boxes_3d is not None:
+                img_boxes3d = pred_boxes_3d[prompt_mask]  # (n_prompts, S, 12)
+                img_boxes3d_flat = img_boxes3d.reshape(-1, 12)  # (n_prompts * S, 12)
+            else:
+                img_boxes3d_flat = None
+
+            # No topk filtering here - keep all 100 proposals per category
+            # SAM3_3D outputs S=100 proposals per prompt, each prompt is one category
+            # Evaluator does per-category matching anyway, so no need to limit here
+            # This ensures fair evaluation across all categories
+
+            # Score threshold filter
+            if score_threshold > 0:
+                keep = img_scores_flat > score_threshold
+                img_scores_flat = img_scores_flat[keep]
+                img_boxes_flat = img_boxes_flat[keep]
+                img_class_ids_flat = img_class_ids_flat[keep]
+                if img_boxes3d_flat is not None:
+                    img_boxes3d_flat = img_boxes3d_flat[keep]
+
+            # Rescale 2D boxes from resize space (H, W) to original image space
+            # GDino3D does this in RoI2Det3D.__call__ (line 396): det_bboxes /= scales
+            # This is CRITICAL for correct IoU computation in evaluation!
+            if batch.original_hw is not None and batch.original_hw[img_idx] is not None:
+                orig_h, orig_w = batch.original_hw[img_idx]
+                scale_x = W / orig_w
+                scale_y = H / orig_h
+                img_boxes_flat = img_boxes_flat.clone()  # Don't modify in-place
+                img_boxes_flat[:, 0::2] /= scale_x  # x coordinates
+                img_boxes_flat[:, 1::2] /= scale_y  # y coordinates
+
+            # Decode 3D boxes AFTER filtering (more efficient)
+            # Use original intrinsics for 3D decoding if available
+            if img_boxes3d_flat is not None and self.box_coder is not None and len(img_boxes_flat) > 0:
+                if batch.original_intrinsics is not None:
+                    intrinsics_this_img = batch.original_intrinsics[img_idx]  # (3, 3)
+                else:
+                    intrinsics_this_img = batch.intrinsics[img_idx]  # (3, 3)
+                decoded_boxes3d = self.box_coder.decode(
+                    img_boxes_flat,  # pixel xyxy in original image space
+                    img_boxes3d_flat,
+                    intrinsics_this_img,
+                )
+            else:
+                decoded_boxes3d = torch.zeros(len(img_boxes_flat), 10, device=device)
+
+            boxes_list.append(img_boxes_flat)
             boxes3d_list.append(decoded_boxes3d)
-            scores_list.append(best_scores)
-            class_ids_list.append(img_class_ids)
+            scores_list.append(img_scores_flat)
+            class_ids_list.append(img_class_ids_flat)
 
         # Get depth maps if available
         depth_maps = None
         if geom_out is not None and "depth" in geom_out:
             depth_maps = [geom_out["depth"][i] for i in range(B_images)]
+
+        # Get predicted intrinsics if available
+        predicted_intrinsics = None
+        if geom_out is not None and "K_pred" in geom_out:
+            predicted_intrinsics = geom_out["K_pred"]
 
         return Det3DOut(
             boxes=boxes_list,
@@ -1090,6 +1180,7 @@ class SAM3_3D(nn.Module):
             class_ids=class_ids_list,
             depth_maps=depth_maps,
             categories=None,
+            predicted_intrinsics=predicted_intrinsics,
         )
 
     def _build_find_stage(

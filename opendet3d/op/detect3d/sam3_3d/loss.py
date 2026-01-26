@@ -292,6 +292,13 @@ class SAM3_3DLoss(nn.Module):
         Returns:
             Dict of loss tensors (vis4d LossModule will sum them)
         """
+        import time
+        import os
+        import torch
+        _PROFILE_LOSS = os.environ.get("PROFILE_SAM3_3D", "0") == "1"
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _loss_start = time.perf_counter()
         # Unpack model outputs
         pred_logits = out.pred_logits
         pred_boxes_2d = out.pred_boxes_2d
@@ -353,12 +360,20 @@ class SAM3_3DLoss(nn.Module):
         num_boxes = self._get_num_boxes(normalized_targets)
         
         # ========== 2D Losses (scaled by loss_2d_scale) ==========
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
         loss_cls = self._loss_classification(
             pred_logits, pred_boxes_2d, indices, normalized_targets, num_boxes
         )
         losses["loss_cls"] = (
             self.config.loss_2d_scale * loss_cls * self.config.loss_cls_weight
         )
+
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _loss_cls_time = (time.perf_counter() - _t0) * 1000
 
         # Presence loss (empty image detection)
         if self.config.use_presence:
@@ -368,6 +383,10 @@ class SAM3_3DLoss(nn.Module):
             )
 
         # 2D box losses (L1 in normalized cxcywh, GIoU in pixel xyxy - following SAM3/GDino3D)
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _t1 = time.perf_counter()
+
         loss_bbox, loss_giou = self._loss_boxes_2d(
             pred_boxes_2d, indices, normalized_targets, num_boxes, image_size
         )
@@ -377,6 +396,10 @@ class SAM3_3DLoss(nn.Module):
         losses["loss_giou"] = (
             self.config.loss_2d_scale * loss_giou * self.config.loss_giou_weight
         )
+
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _loss_2d_box_time = (time.perf_counter() - _t1) * 1000
 
         # ========== O2M Loss (2D scaled by loss_2d_scale, 3D scaled by loss_3d_scale) ==========
         if self.config.use_o2m and self.o2m_matcher is not None:
@@ -403,6 +426,11 @@ class SAM3_3DLoss(nn.Module):
                     )
 
         # ========== 3D Losses (scaled by loss_3d_scale) ==========
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _t2 = time.perf_counter()
+            _loss_3d_time = 0
+
         if pred_boxes_3d is not None and intrinsics is not None:
             loss_3d = self._loss_boxes_3d(
                 pred_boxes_2d, pred_boxes_3d, indices, normalized_targets,
@@ -411,6 +439,10 @@ class SAM3_3DLoss(nn.Module):
             # Apply loss_3d_scale to all 3D losses
             for key, value in loss_3d.items():
                 losses[key] = self.config.loss_3d_scale * value
+
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _loss_3d_time = (time.perf_counter() - _t2) * 1000
 
         # ========== Geometry Backend Losses (scaled by loss_geom_scale) ==========
         if geom_losses is not None:
@@ -421,14 +453,36 @@ class SAM3_3DLoss(nn.Module):
                 )
 
         # ========== Auxiliary Losses (Deep Supervision) ==========
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _t3 = time.perf_counter()
+            _loss_aux_time = 0
+
+        _num_aux_layers = 0
         if aux_outputs is not None:
+            _num_aux_layers = len(aux_outputs)
             for i, aux_out in enumerate(aux_outputs):
                 aux_losses = self._compute_aux_loss(
                     aux_out, indices, normalized_targets, num_boxes, intrinsics, image_size
                 )
                 for key, value in aux_losses.items():
                     losses[f"d{i}.{key}"] = value * self.config.aux_loss_weight
-        
+
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _loss_aux_time = (time.perf_counter() - _t3) * 1000
+            _loss_total_time = (time.perf_counter() - _loss_start) * 1000
+
+            # Print loss timing summary (every N steps via profiler)
+            from opendet3d.utils.profiler import profiler
+            p = profiler()
+            p.current_step_timings["loss_total"] = _loss_total_time / 1000
+            p.current_step_timings["  loss_cls"] = _loss_cls_time / 1000
+            p.current_step_timings["  loss_2d_box"] = _loss_2d_box_time / 1000
+            p.current_step_timings["  loss_3d"] = _loss_3d_time / 1000
+            p.current_step_timings["  loss_aux"] = _loss_aux_time / 1000
+            p.current_step_timings["  loss_aux_layers"] = _num_aux_layers
+
         # ========== Ensure all losses are tensors ==========
         # vis4d LossModule expects dict of tensors
         for k, v in list(losses.items()):
@@ -496,7 +550,7 @@ class SAM3_3DLoss(nn.Module):
             t = torch.clamp(t, 0.01).detach()
 
             positive_target_classes = target_classes.clone()
-            positive_target_classes[(batch_idx, src_idx)] = t
+            positive_target_classes[(batch_idx, src_idx)] = t.to(positive_target_classes.dtype)
 
         # Compute weak loss mask if enabled
         weak_mask = torch.ones_like(src_logits)
@@ -731,7 +785,7 @@ class SAM3_3DLoss(nn.Module):
             t = torch.clamp(t, 0.01).detach()
 
             positive_target_classes = target_classes.clone()
-            positive_target_classes[(batch_idx, src_idx)] = t
+            positive_target_classes[(batch_idx, src_idx)] = t.to(positive_target_classes.dtype)
 
         # BCE loss (only on positives for O2M)
         loss_pos = F.binary_cross_entropy_with_logits(

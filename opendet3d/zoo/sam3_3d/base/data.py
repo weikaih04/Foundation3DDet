@@ -130,11 +130,18 @@ def get_sam3_3d_data_cfg(
     box_noise_max: float | None = 20.0,
     # Dataloader options
     shuffle: bool = True,
+    # Test-specific collator options (for pure text evaluation like GDino3D)
+    test_text_query_prob: float = 1.0,
+    test_use_geometry_prompts: bool = False,
 ) -> DataConfig:
     """Get the data config for SAM3_3D with custom collator.
 
     This differs from gdino3d's get_data_cfg by using SAM3_3DCollator
     to convert per-image data to per-prompt batch (SAM3_3DBatchedInputs).
+
+    IMPORTANT: Training and test use SEPARATE collators by default:
+    - Training: Uses configured text_query_prob and use_geometry_prompts
+    - Testing: Uses test_text_query_prob=1.0 (pure text) for fair evaluation
 
     Args:
         train_datasets: Training dataset configuration
@@ -158,14 +165,18 @@ def get_sam3_3d_data_cfg(
         box_noise_max: Max noise in pixels
         shuffle: Whether to shuffle training data (default True)
             Set to False for deterministic overfit tests
+        test_text_query_prob: Probability of text queries during test (default 1.0)
+            1.0 = pure text evaluation (like GDino3D)
+        test_use_geometry_prompts: Whether to use geometry prompts during test
+            False = pure text evaluation (like GDino3D)
 
     Returns:
         DataConfig with train and test dataloaders
     """
     data = DataConfig()
 
-    # Create collate function with configured parameters
-    collate_fn = create_sam3_3d_collate_fn(
+    # Create TRAIN collate function with configured parameters
+    train_collate_fn = create_sam3_3d_collate_fn(
         max_prompts_per_image=max_prompts_per_image,
         use_text_prompts=use_text_prompts,
         text_query_prob=text_query_prob,
@@ -174,6 +185,18 @@ def get_sam3_3d_data_cfg(
         geometric_query_str=geometric_query_str,
         box_noise_std=box_noise_std,
         box_noise_max=box_noise_max,
+    )
+
+    # Create TEST collate function (pure text by default, like GDino3D)
+    test_collate_fn = create_sam3_3d_collate_fn(
+        max_prompts_per_image=max_prompts_per_image,
+        use_text_prompts=True,  # Always use text for test
+        text_query_prob=test_text_query_prob,  # 1.0 = pure text
+        keep_text_for_visual=False,  # Not relevant with pure text
+        use_geometry_prompts=test_use_geometry_prompts,  # False = no geometry
+        geometric_query_str=geometric_query_str,
+        box_noise_std=0.0,  # No noise during test
+        box_noise_max=None,
     )
 
     # Train dataloader
@@ -186,13 +209,11 @@ def get_sam3_3d_data_cfg(
         batchprocess_cfg=train_batchprocess_cfg,
         samples_per_gpu=samples_per_gpu,
         workers_per_gpu=workers_per_gpu,
-        collate_fn=collate_fn,
+        collate_fn=train_collate_fn,
         shuffle=shuffle,
     )
 
-    # Test dataloader
-    # Use the same collator to convert GT boxes to prompts for evaluation
-    # This allows testing 2D detection with GT boxes as prompts
+    # Test dataloader with SEPARATE pure-text collator
     test_batchprocess_cfg = class_config(
         compose, transforms=[class_config(ToTensor)]
     )
@@ -207,7 +228,7 @@ def get_sam3_3d_data_cfg(
         batchprocess_cfg=test_batchprocess_cfg,
         samples_per_gpu=1,  # Use batch size 1 for inference
         workers_per_gpu=workers_per_gpu,
-        collate_fn=collate_fn,  # Use same collator as training
+        collate_fn=test_collate_fn,  # Use SEPARATE test collator (pure text)
     )
 
     return data

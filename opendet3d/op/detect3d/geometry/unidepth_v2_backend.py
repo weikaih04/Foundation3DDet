@@ -22,11 +22,12 @@ import matplotlib.pyplot as plt
 
 from .base import GeometryBackendBase, GeometryBackendOutput
 from .dinov2_mixin import DINOv2Mixin
+from opendet3d.utils.profiler import profile_start, profile_stop
 
 # Global counter for depth visualization
 _DEPTH_VIS_COUNTER = 0
 _DEPTH_VIS_SAVE_DIR = "/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet/mmdetection_exp/training/depth_ablation/unidepth_v2_depth_vis"
-_DEPTH_VIS_MAX_SAVE = 100  # Only save first 100 samples
+_DEPTH_VIS_MAX_SAVE = 0  # Disabled for training (set > 0 for debugging)
 
 # Debug prints (intrinsics/rays sanity checks). Keep off by default.
 _DEBUG_PREPARE_INPUTS = False
@@ -481,6 +482,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         orig_H, orig_W = image_hw
 
         # 1. Resize images to be divisible by DINOv2 patch size (14) and adjust intrinsics
+        profile_start("    geom_preprocess")
         images_resized, intrinsics_adjusted = self._make_divisible_by_dinov2_patch(
             images, intrinsics
         )
@@ -488,6 +490,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         # Update image_hw to match resized dimensions
         _, _, new_H, new_W = images_resized.shape
         image_hw_adjusted = (new_H, new_W)
+        profile_stop("    geom_preprocess")
 
         # 2. Resize depth_gt and depth_mask to match resized image dimensions
         depth_gt_resized = None
@@ -533,6 +536,14 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         )
 
         # 3. Run UniDepthV2 forward_train (uses native compute_losses)
+        # Profile encoder separately (just to measure time, not used in computation)
+        profile_start("    geom_encoder_only")
+        with torch.no_grad():
+            _ = self.unidepth_model.pixel_encoder(inputs["image"])
+        profile_stop("    geom_encoder_only")
+
+        # Profile full forward (encoder + decoder + loss)
+        profile_start("    geom_full_forward")
         if self.use_native_losses and depth_gt is not None:
             outputs, losses_dict = self.unidepth_model.forward_train(
                 inputs, image_metas
@@ -547,6 +558,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
             # Just encode-decode without loss computation
             inputs, outputs = self.unidepth_model.encode_decode(inputs, image_metas)
             losses = {}
+        profile_stop("    geom_full_forward")
 
         # 4. Extract outputs
         depth_map = outputs.get("depth")  # [B, 1, H', W']
@@ -554,12 +566,15 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         pred_K = outputs.get("intrinsics")  # [B, 3, 3]
 
         # 5. Resize depth_map back to original dimensions
+        profile_start("    geom_postprocess")
         depth_map_resized = self._resize_depth_to_original(depth_map, (orig_H, orig_W))
 
         # 5.5 Save depth visualization (first N samples only)
+        profile_start("    geom_save_vis")
         self._save_depth_visualization(
             depth_map_resized, depth_gt, images, image_hw
         )
+        profile_stop("    geom_save_vis")
 
         # 6. Scale pred_K back to original dimensions
         # Intrinsic matrix scaling: fx, cx scale with width; fy, cy scale with height
@@ -587,6 +602,7 @@ class UniDepthV2GeometryBackend(GeometryBackendBase, DINOv2Mixin):
         # 7. Extract and project depth latents
         depth_latents, depth_latents_hw = self._extract_depth_latents(out_features)
         depth_latents = self._maybe_detach_latents(depth_latents)
+        profile_stop("    geom_postprocess")
 
         # Compute downsample factor based on output_scales (1=1/8, 2=1/4, 3=1/2)
         ray_downsample = 8 // (2 ** (self.output_scales - 1))

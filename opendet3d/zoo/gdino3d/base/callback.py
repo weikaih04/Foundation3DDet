@@ -50,6 +50,12 @@ def get_callback_cfg(
     # Logger
     callbacks = get_default_callbacks_cfg()
 
+    # Add profiling callback if enabled via environment variable
+    if os.environ.get("PROFILE_SAM3_3D", "0") == "1":
+        from opendet3d.utils.profiler_callback import EnhancedProfilingCallback
+        print("[Profiling] EnhancedProfilingCallback will be added to callbacks")
+        callbacks.append(class_config(EnhancedProfilingCallback))
+
     # Evaluator
     if "ScanNet200_val" in open_test_datasets:
         assert (
