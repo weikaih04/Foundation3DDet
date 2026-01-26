@@ -57,11 +57,11 @@ class SAM3_3DOut(NamedTuple):
     - pred_boxes_2d: normalized xyxy [0, 1]
     - pred_boxes_3d: encoded 3D params (delta_center, log_depth, log_dims, rot_6d)
     """
-    # 2D Detection (from SAM3 decoder)
+    # 2D Detection (from SAM3 decoder) - O2O outputs
     pred_logits: Tensor  # (N_prompts, num_queries, 1) - objectness
     pred_boxes_2d: Tensor  # (N_prompts, num_queries, 4) - normalized xyxy
 
-    # 3D Detection (from 3D head)
+    # 3D Detection (from 3D head) - O2O outputs
     pred_boxes_3d: Tensor | None  # (N_prompts, num_queries, 12) - encoded 3D params
 
     # Auxiliary outputs for each decoder layer (for deep supervision)
@@ -81,9 +81,8 @@ class SAM3_3DOut(NamedTuple):
     # Format: (batch_idx, src_idx, tgt_idx) from Hungarian matching
     indices: tuple | None = None
 
-    # O2M (One-to-Many) outputs from SAM3 DAC (Deformable Attention Contrastive)
-    # These are produced by the O2M queries (second half of decoder queries)
-    # Only present during training when DAC is enabled
+    # O2M (One-to-Many) outputs from SAM3 DAC mechanism
+    # These are separate outputs from the second half of queries in DAC mode
     pred_logits_o2m: Tensor | None = None  # (N_prompts, num_queries, 1)
     pred_boxes_2d_o2m: Tensor | None = None  # (N_prompts, num_queries, 4) - normalized xyxy
     pred_boxes_3d_o2m: Tensor | None = None  # (N_prompts, num_queries, 12) - encoded 3D params
@@ -806,14 +805,15 @@ class SAM3_3D(nn.Module):
         # - pred_boxes_xyxy: (N_prompts, num_queries, 4) - normalized xyxy
         # - queries: (N_prompts, num_queries, d_model) - last layer hidden states
         # - aux_outputs: list of dicts for each decoder layer (for deep supervision)
+        # O2O outputs (one-to-one matching)
         pred_logits = sam3_out["pred_logits"]  # (N_prompts, S, 1)
         pred_boxes_xyxy = sam3_out["pred_boxes_xyxy"]  # (N_prompts, S, 4)
         queries = sam3_out.get("queries")  # (N_prompts, S, d_model)
         encoder_hidden_states = sam3_out.get("encoder_hidden_states")
         presence_logits = sam3_out.get("presence_logit_dec")
 
-        # Extract O2M outputs from SAM3 DAC (only present during training)
-        # SAM3 with dac=True produces separate O2M queries/outputs
+        # O2M outputs (one-to-many matching) from SAM3 DAC mechanism
+        # These are separate outputs from the second half of queries in DAC mode
         pred_logits_o2m = sam3_out.get("pred_logits_o2m")  # (N_prompts, S, 1)
         pred_boxes_xyxy_o2m = sam3_out.get("pred_boxes_xyxy_o2m")  # (N_prompts, S, 4)
         queries_o2m = sam3_out.get("queries_o2m")  # (N_prompts, S, d_model)
@@ -824,7 +824,6 @@ class SAM3_3D(nn.Module):
         # ========== Step 6: 3D Head ==========
         profile_start("  3d_head")
         pred_boxes_3d = None
-        pred_boxes_3d_o2m = None
         aux_outputs = None
 
         if self.bbox3d_head is not None and queries is not None:
@@ -944,17 +943,6 @@ class SAM3_3D(nn.Module):
                 # bbox3d_head always returns (L, N_prompts, S, 12), squeeze L dim when L=1
                 pred_boxes_3d = all_layers_boxes_3d.squeeze(0)  # (N_prompts, S, 12)
 
-            # Compute 3D boxes for O2M queries (only during training when DAC is enabled)
-            pred_boxes_3d_o2m = None
-            if queries_o2m is not None and self.training:
-                # O2M queries only have final layer (no auxiliary outputs)
-                hidden_states_o2m = queries_o2m.unsqueeze(0)  # (1, N_prompts, S, C)
-                pred_boxes_3d_o2m = self.bbox3d_head(
-                    hidden_states=hidden_states_o2m,
-                    ray_embeddings=ray_embeddings,
-                    depth_latents=depth_latents,
-                ).squeeze(0)  # (N_prompts, S, 12)
-
             # Build auxiliary outputs for deep supervision
             # Only include layers that have queries (tracked by aux_indices_with_queries)
             if len(aux_indices_with_queries) > 0 and self.training:
@@ -970,6 +958,19 @@ class SAM3_3D(nn.Module):
                     if "presence_logit_dec" in aux_out:
                         aux_dict["presence_logits"] = aux_out["presence_logit_dec"]
                     aux_outputs.append(aux_dict)
+
+        # Compute 3D boxes for O2M queries (if available, only during training)
+        pred_boxes_3d_o2m = None
+        if self.bbox3d_head is not None and queries_o2m is not None and self.training:
+            # O2M queries use the same 3D head but only compute final layer (no aux)
+            o2m_hidden_states = queries_o2m.unsqueeze(0)  # (1, N_prompts, S, C)
+            o2m_boxes_3d = self.bbox3d_head(
+                hidden_states=o2m_hidden_states,
+                ray_embeddings=ray_embeddings,
+                depth_latents=depth_latents,
+            )
+            pred_boxes_3d_o2m = o2m_boxes_3d.squeeze(0)  # (N_prompts, S, 12)
+
         profile_stop("  3d_head")
 
         # Training mode: return raw outputs for loss computation
@@ -992,7 +993,7 @@ class SAM3_3D(nn.Module):
                 queries=queries,
                 encoder_hidden_states=encoder_hidden_states,
                 indices=sam3_indices,
-                # O2M outputs (from SAM3 DAC)
+                # O2M outputs from SAM3 DAC mechanism
                 pred_logits_o2m=pred_logits_o2m,
                 pred_boxes_2d_o2m=pred_boxes_xyxy_o2m,
                 pred_boxes_3d_o2m=pred_boxes_3d_o2m,

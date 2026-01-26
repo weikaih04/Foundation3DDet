@@ -83,7 +83,7 @@ class SAM3_3DLossConfig:
     loss_geom_scale: float = 10.0  # Scale for geometry backend losses (SILog, SSI, camera angles)
 
     # ========== O2M (One-to-Many) Matcher Configuration ==========
-    # Note: Main O2O matcher is configured in sam3_3d.py (self.sam3.matcher)
+    # Note: O2O matcher is configured in sam3_3d.py (self.sam3.matcher)
     use_o2m: bool = True  # Enable O2M matching
     o2m_alpha: float = 0.3  # Alpha for O2M cost computation
     o2m_threshold: float = 0.4  # IoU threshold for O2M matching
@@ -160,7 +160,7 @@ class SAM3_3DLoss(nn.Module):
         self.box_coder = box_coder or GroundingDINO3DCoder()
         self.reg_dims = self.box_coder.reg_dims
 
-        # Note: Main O2O matching is done by SAM3 internally (self.sam3.matcher)
+        # Note: O2O matcher is configured in sam3_3d.py (self.sam3.matcher)
         # We only need O2M matcher here for O2M loss computation
 
         # Initialize O2M matcher if enabled
@@ -398,12 +398,12 @@ class SAM3_3DLoss(nn.Module):
             _loss_2d_box_time = (time.perf_counter() - _t1) * 1000
 
         # ========== O2M Loss (2D scaled by loss_2d_scale, 3D scaled by loss_3d_scale) ==========
-        # Use real O2M outputs from SAM3 DAC (not hacking with O2O outputs)
+        # Use real O2M outputs from SAM3 DAC mechanism (not O2O outputs)
         if self.config.use_o2m and self.o2m_matcher is not None and out.pred_logits_o2m is not None:
             o2m_losses = self._loss_o2m(
-                pred_logits=out.pred_logits_o2m,      # Real O2M outputs
-                pred_boxes_2d=out.pred_boxes_2d_o2m,  # Real O2M outputs
-                pred_boxes_3d=out.pred_boxes_3d_o2m,  # Real O2M outputs (computed from queries_o2m)
+                pred_logits=out.pred_logits_o2m,
+                pred_boxes_2d=out.pred_boxes_2d_o2m,
+                pred_boxes_3d=out.pred_boxes_3d_o2m,
                 targets=normalized_targets,
                 num_boxes=num_boxes,
                 intrinsics=intrinsics,
