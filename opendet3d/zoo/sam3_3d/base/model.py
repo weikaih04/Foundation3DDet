@@ -42,6 +42,12 @@ def get_sam3_3d_hyperparams_cfg(
     # Optimizer freeze settings (for get_sam3_3d_optim_cfg)
     freeze_backbone: bool = False,
     freeze_all_pretrained: bool = False,
+
+    # NMS settings for evaluation (following 3D-MOOD's RoI2Det3D design)
+    nms: bool = True,  # Whether to apply NMS during eval (enabled by default)
+    class_agnostic_nms: bool = False,  # If False, NMS only within same category (recommended)
+    nms_iou_threshold: float = 0.6,  # IoU threshold for NMS
+    score_threshold: float = 0.0,  # Score threshold before NMS (0 = no filtering)
 ) -> ExperimentParameters:
     """Get SAM3_3D hyperparameters.
 
@@ -97,6 +103,12 @@ def get_sam3_3d_hyperparams_cfg(
     # Optimizer freeze settings
     params.freeze_backbone = freeze_backbone
     params.freeze_all_pretrained = freeze_all_pretrained
+
+    # NMS settings for evaluation
+    params.nms = nms
+    params.class_agnostic_nms = class_agnostic_nms
+    params.nms_iou_threshold = nms_iou_threshold
+    params.score_threshold = score_threshold
 
     return params
 
@@ -155,8 +167,16 @@ def get_sam3_3d_cfg(
         zero_init=True,  # delta=0 at start, preserves pretrained features
     )
 
-    # RoI2Det3D for inference
-    roi2det3d = class_config(RoI2Det3D, box_coder=box_coder)
+    # RoI2Det3D for inference (with NMS support)
+    # Note: max_per_img not used - SAM3_3D already limits to 100 proposals per category
+    roi2det3d = class_config(
+        RoI2Det3D,
+        box_coder=box_coder,
+        nms=params.nms,
+        class_agnostic_nms=params.class_agnostic_nms,
+        iou_threshold=params.nms_iou_threshold,
+        score_threshold=params.score_threshold,
+    )
 
     # SAM3_3D model
     # Learning rate control is handled by param_groups in optimizer config,

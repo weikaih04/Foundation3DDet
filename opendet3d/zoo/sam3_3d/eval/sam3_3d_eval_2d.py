@@ -106,8 +106,10 @@ def get_config() -> ExperimentConfig:
         test_datasets=test_datasets_cfg,
         samples_per_gpu=params.samples_per_gpu,
         workers_per_gpu=params.workers_per_gpu,
-        max_prompts_per_image=50,  # Max GT boxes per image
+        max_prompts_per_image=50,  # Max categories per image
         use_text_prompts=True,  # Include class names as text prompts
+        # For evaluation, use pure text queries to test open-vocab detection
+        text_query_prob=1.0,  # All text queries for eval
     )
 
     ######################################################

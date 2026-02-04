@@ -85,6 +85,7 @@ class SAM3_3DLossConfig:
     # ========== O2M (One-to-Many) Matcher Configuration ==========
     # Note: O2O matcher is configured in sam3_3d.py (self.sam3.matcher)
     use_o2m: bool = True  # Enable O2M matching
+    o2m_loss_clip: float = 150.0  # Clip O2M loss to prevent gradient explosion
     o2m_alpha: float = 0.3  # Alpha for O2M cost computation
     o2m_threshold: float = 0.4  # IoU threshold for O2M matching
     o2m_topk: int = 4  # Top-k predictions per GT (SAM3 original: topk: 4)
@@ -425,14 +426,16 @@ class SAM3_3DLoss(nn.Module):
                 loss_weight = o2m_weight_map.get(key, 1.0)
                 if key in ("loss_delta_2d", "loss_depth", "loss_dim", "loss_rot"):
                     # 3D losses use loss_3d_scale
-                    losses[f"o2m_{key}"] = (
+                    o2m_loss_val = (
                         self.config.loss_3d_scale * value * loss_weight * self.config.o2m_loss_weight
                     )
                 else:
                     # 2D losses (loss_cls, loss_bbox, loss_giou) use loss_2d_scale
-                    losses[f"o2m_{key}"] = (
+                    o2m_loss_val = (
                         self.config.loss_2d_scale * value * loss_weight * self.config.o2m_loss_weight
                     )
+                # Clip O2M loss to prevent gradient explosion
+                losses[f"o2m_{key}"] = torch.clamp(o2m_loss_val, max=self.config.o2m_loss_clip)
 
         # ========== 3D Losses (scaled by loss_3d_scale) ==========
         if _PROFILE_LOSS:

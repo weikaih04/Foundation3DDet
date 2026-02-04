@@ -28,6 +28,7 @@ from typing import List, NamedTuple, Optional
 
 import torch
 from torch import Tensor, nn
+from torchvision.ops import nms, batched_nms
 
 from opendet3d.utils.profiler import profile_start, profile_stop, profile_step
 
@@ -1105,9 +1106,34 @@ class SAM3_3D(nn.Module):
         class_ids_list = []
 
         # Get parameters from roi2det3d if available
-        # Default values match SAM3 ODinW config: max_dets_per_img=-1, detection_threshold=-1.0
-        max_per_img = getattr(self.roi2det3d, 'max_per_img', -1) if self.roi2det3d else -1
         score_threshold = getattr(self.roi2det3d, 'score_threshold', -1.0) if self.roi2det3d else -1.0
+
+        # NMS parameters (following 3D-MOOD's RoI2Det3D design)
+        # Note: max_per_img not used - SAM3_3D already limits to 100 proposals per category
+        use_nms = getattr(self.roi2det3d, 'nms', False) if self.roi2det3d else False
+        # class_agnostic_nms=False: NMS only within same category (recommended for per-category prediction)
+        class_agnostic_nms = getattr(self.roi2det3d, 'class_agnostic_nms', False) if self.roi2det3d else False
+        iou_threshold = getattr(self.roi2det3d, 'iou_threshold', 0.5) if self.roi2det3d else 0.5
+
+        # Environment variable overrides (useful for A/B testing)
+        import os
+        # SAM3_NMS=0 to disable, SAM3_NMS=1 to enable
+        nms_override = os.environ.get("SAM3_NMS", None)
+        if nms_override is not None:
+            use_nms = nms_override == "1"
+        # SAM3_SCORE_THRESH to override score threshold (e.g., "0.0" to disable)
+        score_thresh_override = os.environ.get("SAM3_SCORE_THRESH", None)
+        if score_thresh_override is not None:
+            score_threshold = float(score_thresh_override)
+        # SAM3_IOU_THRESH to override NMS IoU threshold (e.g., "0.8" for more conservative)
+        iou_thresh_override = os.environ.get("SAM3_IOU_THRESH", None)
+        if iou_thresh_override is not None:
+            iou_threshold = float(iou_thresh_override)
+
+        # Debug: print NMS config once at start
+        if not hasattr(self, '_nms_config_printed'):
+            print(f"[NMS CONFIG] use_nms={use_nms}, class_agnostic={class_agnostic_nms}, iou_thresh={iou_threshold}, score_thresh={score_threshold}")
+            self._nms_config_printed = True
 
         S = scores_all.shape[1]  # predictions per prompt
 
@@ -1165,6 +1191,28 @@ class SAM3_3D(nn.Module):
                 img_class_ids_flat = img_class_ids_flat[keep]
                 if img_boxes3d_flat is not None:
                     img_boxes3d_flat = img_boxes3d_flat[keep]
+
+            # NMS based on 2D boxes (following 3D-MOOD's RoI2Det3D design)
+            # NMS is applied in resize space before rescaling to original space
+            if use_nms and len(img_boxes_flat) > 0:
+                n_before_nms = len(img_boxes_flat)
+                if class_agnostic_nms:
+                    # Class-agnostic NMS: treat all boxes as same class
+                    keep = nms(img_boxes_flat, img_scores_flat, iou_threshold)
+                else:
+                    # Class-aware NMS: only suppress within same class
+                    keep = batched_nms(
+                        img_boxes_flat, img_scores_flat, img_class_ids_flat, iou_threshold
+                    )
+                img_scores_flat = img_scores_flat[keep]
+                img_boxes_flat = img_boxes_flat[keep]
+                img_class_ids_flat = img_class_ids_flat[keep]
+                if img_boxes3d_flat is not None:
+                    img_boxes3d_flat = img_boxes3d_flat[keep]
+                # Debug: print NMS effect (only for first image of first batch)
+                if img_idx == 0:
+                    n_after_nms = len(img_boxes_flat)
+                    print(f"[NMS DEBUG] img={img_idx}, before={n_before_nms}, after={n_after_nms}, suppressed={n_before_nms - n_after_nms}, iou_thresh={iou_threshold}")
 
             # Rescale 2D boxes from resize space (H, W) to original image space
             # GDino3D does this in RoI2Det3D.__call__ (line 396): det_bboxes /= scales

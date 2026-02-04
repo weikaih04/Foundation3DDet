@@ -93,6 +93,60 @@ def get_train_transforms_cfg(
     return train_preprocess_cfg
 
 
+def get_deterministic_train_transforms_cfg(
+    shape: tuple[int, int] = (800, 1333)
+) -> ConfigDict:
+    """Get deterministic train data transforms (no random augmentation).
+
+    Same as train transforms but without:
+    - Random resize scale (fixed scale=1.0)
+    - Random horizontal flip
+
+    Use this for overfit tests where you need the same data every epoch.
+    """
+    preprocess_transforms = [
+        # Fixed scale (no random resize)
+        class_config(GenResizeParameters, shape=shape, scales=1.0),
+        class_config(ResizeImages),
+        class_config(ResizeBoxes2D),
+        class_config(ResizeIntrinsics),
+        class_config(ResizeDepthMaps),
+    ]
+
+    # Center Crop (deterministic)
+    preprocess_transforms += [
+        class_config(GenCentralCropParameters, shape=shape),
+        class_config(CropImages),
+        class_config(CropBoxes2D),
+        class_config(CropBoxes3D),
+        class_config(CropIntrinsics),
+        class_config(CropDepthMaps),
+    ]
+
+    # No random flip
+
+    preprocess_transforms.append(class_config(NormalizeImages))
+
+    # Center Pad (deterministic)
+    preprocess_transforms += [
+        class_config(
+            CenterPadImages,
+            stride=1,
+            shape=shape,
+            update_input_hw=True,
+        ),
+        class_config(CenterPadBoxes2D),
+        class_config(CenterPadIntrinsics),
+        class_config(CenterPadDepthMaps),
+    ]
+
+    train_preprocess_cfg = class_config(
+        compose, transforms=preprocess_transforms
+    )
+
+    return train_preprocess_cfg
+
+
 def get_test_transforms_cfg(
     shape: tuple[int, int] = (800, 1333)
 ) -> ConfigDict:
