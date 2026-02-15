@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 
 
 class TrainingProfiler:
@@ -79,23 +80,33 @@ class TrainingProfiler:
         return elapsed
 
     def step(self) -> None:
-        """Called at end of each training step."""
+        """Called at end of each training step.
+
+        NOTE: Does NOT clear current_step_timings here.
+        The EnhancedProfilingCallback reads current_step_timings
+        in on_before_backward and clears them in on_train_batch_end.
+        """
         if not self.enabled:
             return
 
-        # Record all timings from this step
+        # Record all timings from this step into history
         for name, elapsed in self.current_step_timings.items():
             self.timings[name].append(elapsed)
 
         self.step_count += 1
-        self.current_step_timings = {}
+        # Do NOT clear current_step_timings or print here.
+        # The callback handles both.
 
-        # Print summary every N steps
-        if self.step_count % self.print_interval == 0:
-            self._print_summary()
+    def _is_rank_zero(self) -> bool:
+        """Check if current process is rank 0."""
+        if not dist.is_initialized():
+            return True
+        return dist.get_rank() == 0
 
     def _print_summary(self) -> None:
-        """Print timing summary."""
+        """Print timing summary (rank 0 only)."""
+        if not self._is_rank_zero():
+            return
         print("\n" + "=" * 80)
         print(f"[TrainingProfiler] Step {self.step_count} - Timing Summary (last {self.print_interval} steps)")
         print("=" * 80)

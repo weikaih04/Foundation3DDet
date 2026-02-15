@@ -31,7 +31,7 @@ from opendet3d.zoo.gdino.base.model import GDINO_MODEL_WEIGHTS
 # Geometry Backend Configuration Helpers
 # ============================================================================
 
-GeometryBackendType = Literal["unidepth_head", "unidepth_head_dino", "detany3d", "unidepth_v2"]
+GeometryBackendType = Literal["unidepth_head", "unidepth_head_dino", "detany3d", "unidepth_v2", "lingbot_depth"]
 DepthMemoryFusionType = Literal["add", "zero_add", "concat", "gating"]
 
 
@@ -207,6 +207,64 @@ def get_unidepth_v2_backend_cfg(
         target_latent_dim=target_latent_dim,
         detach_depth_latents=detach_depth_latents,
     ), None  # UniDepthV2 does not use FPN
+
+
+def get_lingbot_depth_backend_cfg(
+    params: ExperimentParameters,
+    pretrained_model: str = "robbyant/lingbot-depth-postrain-dc-vitl14",
+    num_tokens: int = 2400,
+    target_latent_dim: int = 128,
+    depth_loss_weight: float = 1.0,
+    silog_loss_weight: float = 0.5,
+    monocular_prob: float = 0.7,
+    masked_prob: float = 0.2,
+    mask_ratio_range: tuple[float, float] = (0.6, 0.9),
+    mask_patch_size: int = 14,
+    camera_loss_weight: float = 1.0,
+    detach_depth_latents: bool = True,
+    encoder_freeze_blocks: int = 0,
+) -> tuple[ConfigDict, None]:
+    """Get LingBot-Depth geometry backend config.
+
+    This backend uses a DINOv2 RGB-D encoder with mixed depth input
+    strategy: 70% monocular / 20% patch-masked / 10% copy-through.
+
+    Args:
+        params: Experiment parameters.
+        pretrained_model: HuggingFace repo ID or local path for MDMModel.
+        num_tokens: Number of base tokens for the encoder.
+        target_latent_dim: Target dimension for depth_latents.
+        depth_loss_weight: Weight for L1 depth loss.
+        silog_loss_weight: Weight for SILog depth loss.
+        monocular_prob: Probability of zero depth input (training).
+        masked_prob: Probability of patch-masked depth input (training).
+        mask_ratio_range: (min, max) masking ratio for patch-masked mode.
+        mask_patch_size: Patch size for depth masking grid.
+        camera_loss_weight: Weight for ray-based L2 camera loss.
+        detach_depth_latents: Whether to detach latents from gradient graph.
+
+    Returns:
+        Tuple of (backend_config, None). None because no FPN is used.
+    """
+    from opendet3d.op.detect3d.geometry.lingbot_depth_backend import (
+        LingbotDepthBackend,
+    )
+
+    return class_config(
+        LingbotDepthBackend,
+        pretrained_model=pretrained_model,
+        num_tokens=num_tokens,
+        target_latent_dim=target_latent_dim,
+        depth_loss_weight=depth_loss_weight,
+        silog_loss_weight=silog_loss_weight,
+        monocular_prob=monocular_prob,
+        masked_prob=masked_prob,
+        mask_ratio_range=mask_ratio_range,
+        mask_patch_size=mask_patch_size,
+        camera_loss_weight=camera_loss_weight,
+        detach_depth_latents=detach_depth_latents,
+        encoder_freeze_blocks=encoder_freeze_blocks,
+    ), None
 
 
 def get_gdino3d_hyperparams_cfg() -> ExperimentParameters:
@@ -472,6 +530,17 @@ def get_gdino3d_with_geometry_backend_cfg(
     unidepth_v2_pretrained: str | None = None,
     unidepth_v2_encoder_pretrained: str | None = None,
     unidepth_v2_decoder_pretrained: str | None = None,
+    # LingBot-Depth options
+    lingbot_pretrained_model: str = "robbyant/lingbot-depth-postrain-dc-vitl14",
+    lingbot_num_tokens: int = 2400,
+    lingbot_monocular_prob: float = 0.7,
+    lingbot_masked_prob: float = 0.2,
+    lingbot_mask_ratio_range: tuple[float, float] = (0.6, 0.9),
+    lingbot_mask_patch_size: int = 14,
+    lingbot_depth_loss_weight: float = 1.0,
+    lingbot_silog_loss_weight: float = 0.5,
+    lingbot_camera_loss_weight: float = 1.0,
+    lingbot_encoder_freeze_blocks: int = 0,
     # Depth-Memory Fusion options
     depth_memory_fusion_type: DepthMemoryFusionType | None = None,
     # Ablation options
@@ -484,6 +553,7 @@ def get_gdino3d_with_geometry_backend_cfg(
     - unidepth_head_dino: UniDepthHead + DINOv2 (all blocks, grouped)
     - detany3d: DetAny3D (DINOv2 + Unidepth_Decoder)
     - unidepth_v2: UniDepthV2 (DINOv2 + UniDepthV2 Decoder)
+    - lingbot_depth: LingBot-Depth (DINOv2 RGB-D encoder + ConvStack)
 
     Args:
         params: Experiment parameters.
@@ -581,6 +651,22 @@ def get_gdino3d_with_geometry_backend_cfg(
             freeze_encoder=freeze_encoder,
             detach_depth_latents=detach_depth_latents,
             target_latent_dim=target_latent_dim,
+        )
+    elif geometry_backend_type == "lingbot_depth":
+        geometry_backend, fpn = get_lingbot_depth_backend_cfg(
+            params=params,
+            pretrained_model=lingbot_pretrained_model,
+            num_tokens=lingbot_num_tokens,
+            target_latent_dim=target_latent_dim,
+            depth_loss_weight=lingbot_depth_loss_weight,
+            silog_loss_weight=lingbot_silog_loss_weight,
+            monocular_prob=lingbot_monocular_prob,
+            masked_prob=lingbot_masked_prob,
+            mask_ratio_range=lingbot_mask_ratio_range,
+            mask_patch_size=lingbot_mask_patch_size,
+            camera_loss_weight=lingbot_camera_loss_weight,
+            detach_depth_latents=detach_depth_latents,
+            encoder_freeze_blocks=lingbot_encoder_freeze_blocks,
         )
     else:
         raise ValueError(f"Unknown geometry backend type: {geometry_backend_type}")

@@ -18,6 +18,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Mapping, Union
 
 import torch
+import torch.distributed as dist
 
 # Use vis4d's Callback class, not PyTorch Lightning's
 from vis4d.engine.callbacks.base import Callback
@@ -83,9 +84,15 @@ class EnhancedProfilingCallback(Callback):
             "p95": sorted_vals[int(n * 0.95)] if n >= 2 else sorted_vals[-1],
         }
 
+    def _is_rank_zero(self) -> bool:
+        """Check if current process is rank 0."""
+        if not dist.is_initialized():
+            return True
+        return dist.get_rank() == 0
+
     def _print_summary(self, step: int) -> None:
-        """Print timing summary."""
-        if not self._timings:
+        """Print timing summary (rank 0 only)."""
+        if not self._timings or not self._is_rank_zero():
             return
 
         print("\n" + "=" * 80)
@@ -109,9 +116,12 @@ class EnhancedProfilingCallback(Callback):
             "  sam3_grounding",
             "  3d_head",
             "loss_total",
+            "  loss_targets",
             "  loss_cls",
             "  loss_2d_box",
+            "  loss_o2m",
             "  loss_3d",
+            "  loss_geom",
             "  loss_aux",
             "backward",
             "optimizer_and_sync",
@@ -209,7 +219,9 @@ class EnhancedProfilingCallback(Callback):
                     self._record_timing(key, p.current_step_timings[key] * 1000)
 
             # Loss components
-            for key in ["loss_total", "  loss_cls", "  loss_2d_box", "  loss_3d", "  loss_aux"]:
+            for key in ["loss_total", "  loss_targets", "  loss_cls",
+                        "  loss_2d_box", "  loss_o2m", "  loss_3d",
+                        "  loss_geom", "  loss_aux"]:
                 if key in p.current_step_timings:
                     self._record_timing(key, p.current_step_timings[key] * 1000)
 

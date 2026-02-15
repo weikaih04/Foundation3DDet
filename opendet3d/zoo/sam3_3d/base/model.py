@@ -118,6 +118,8 @@ def get_sam3_3d_cfg(
     sam3_checkpoint: str | None = None,
     sam3_model: ConfigDict | None = None,
     geometry_backend_type: str = "unidepth_v2",
+    lingbot_encoder_freeze_blocks: int = 0,
+    backbone_freeze_blocks: int = 0,
 ) -> tuple[ConfigDict, ConfigDict]:
     """Get SAM3_3D model configuration.
 
@@ -127,6 +129,7 @@ def get_sam3_3d_cfg(
         sam3_model: Pre-built SAM3 model config (e.g., EfficientSAM3).
             If provided, sam3_checkpoint is ignored.
         geometry_backend_type: Type of geometry backend.
+        backbone_freeze_blocks: Number of SAM3 ViT blocks to freeze (0=none, 30=last 2 trainable).
 
     Returns:
         Tuple of (model_cfg, box_coder_cfg).
@@ -153,6 +156,26 @@ def get_sam3_3d_cfg(
         )
         # UniDepthV2-Small outputs 256-dim latents at 1/8 scale, no projection needed
         depth_latent_dim = 256
+    elif geometry_backend_type == "lingbot_depth":
+        from opendet3d.op.detect3d.geometry.lingbot_depth_backend import (
+            LingbotDepthBackend,
+        )
+        geometry_backend = class_config(
+            LingbotDepthBackend,
+            pretrained_model="robbyant/lingbot-depth-postrain-dc-vitl14",
+            num_tokens=2400,
+            target_latent_dim=128,
+            depth_loss_weight=1.0,
+            silog_loss_weight=0.5,
+            monocular_prob=0.7,
+            masked_prob=0.2,
+            mask_ratio_range=(0.6, 0.9),
+            mask_patch_size=14,
+            camera_loss_weight=1.0,
+            detach_depth_latents=True,
+            encoder_freeze_blocks=lingbot_encoder_freeze_blocks,
+        )
+        depth_latent_dim = 128
     else:
         geometry_backend = None
         depth_latent_dim = 128  # Default
@@ -190,6 +213,7 @@ def get_sam3_3d_cfg(
         geometry_backend=geometry_backend,
         roi2det3d=roi2det3d,
         early_depth_fusion=early_depth_fusion,
+        backbone_freeze_blocks=backbone_freeze_blocks,
     )
 
     return model, box_coder

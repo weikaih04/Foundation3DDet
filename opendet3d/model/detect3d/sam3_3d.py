@@ -277,6 +277,9 @@ class SAM3_3D(nn.Module):
 
         # ========== Depth-Memory Fusion ==========
         early_depth_fusion: nn.Module | None = None,
+
+        # ========== Freeze Settings ==========
+        backbone_freeze_blocks: int = 0,
     ) -> None:
         """Initialize SAM3_3D.
 
@@ -290,11 +293,10 @@ class SAM3_3D(nn.Module):
             roi2det3d: Inference post-processor. If None, creates default.
             early_depth_fusion: Early fusion module (Backbone后、Encoder前).
                 If None, no early fusion is performed.
-
-        Note:
-            Learning rate control is handled by param_groups in optimizer config,
-            not by freezing parameters here. See opendet3d/zoo/sam3_3d/base/optim.py
-            for SAM3_3D-specific param_groups.
+            backbone_freeze_blocks: Number of SAM3 ViT backbone blocks to
+                freeze (from the beginning). SAM3 has 32 blocks; e.g. 30
+                freezes blocks[0..29], only training the last 2.
+                0 means no freezing.
         """
         super().__init__()
 
@@ -385,6 +387,31 @@ class SAM3_3D(nn.Module):
                 focal=True,      # SAM3 original
                 alpha=0.25,      # SAM3 original
                 gamma=2.0,       # SAM3 original
+            )
+
+        # Freeze SAM3 ViT backbone blocks (like lingbot encoder_freeze_blocks)
+        # SAM3 ViT has 32 blocks at sam3.backbone.vision_backbone.trunk.blocks
+        if backbone_freeze_blocks > 0:
+            trunk = self.sam3.backbone.vision_backbone.trunk
+            num_blocks = len(trunk.blocks)
+            backbone_freeze_blocks = min(backbone_freeze_blocks, num_blocks)
+
+            # Freeze patch_embed + ln_pre + first N blocks
+            for p in trunk.patch_embed.parameters():
+                p.requires_grad = False
+            for p in trunk.ln_pre.parameters():
+                p.requires_grad = False
+            for i in range(backbone_freeze_blocks):
+                for p in trunk.blocks[i].parameters():
+                    p.requires_grad = False
+
+            frozen_params = sum(
+                p.numel() for p in trunk.parameters() if not p.requires_grad
+            )
+            total_params = sum(p.numel() for p in trunk.parameters())
+            print(
+                f"[SAM3_3D] Backbone freeze: {backbone_freeze_blocks}/{num_blocks}"
+                f" blocks frozen ({frozen_params/1e6:.1f}M/{total_params/1e6:.1f}M params)"
             )
 
     def _xyxy_to_cxcywh(self, boxes: Tensor) -> Tensor:

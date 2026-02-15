@@ -424,25 +424,25 @@ class SAM3_3DCollator:
             if item.get("boxes2d") is not None and len(item["boxes2d"]) > 0
         ]
 
-        if len(batch) < original_batch_size:
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            filtered_count = original_batch_size - len(batch)
-            print(
-                f"[SAM3_3DCollator] Filtered {filtered_count}/{original_batch_size} "
-                f"empty images on rank {rank}"
-            )
+        # if len(batch) < original_batch_size:
+        #     import torch.distributed as dist
+        #     rank = dist.get_rank() if dist.is_initialized() else 0
+        #     filtered_count = original_batch_size - len(batch)
+        #     print(
+        #         f"[SAM3_3DCollator] Filtered {filtered_count}/{original_batch_size} "
+        #         f"empty images on rank {rank}"
+        #     )
 
         B = len(batch)
 
         # Handle completely empty batch (all images filtered out)
         if B == 0:
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            print(
-                f"[SAM3_3DCollator] WARNING: Entire batch empty after filtering "
-                f"({original_batch_size} images all had 0 GT boxes) on rank {rank}"
-            )
+            # import torch.distributed as dist
+            # rank = dist.get_rank() if dist.is_initialized() else 0
+            # print(
+            #     f"[SAM3_3DCollator] WARNING: Entire batch empty after filtering "
+            #     f"({original_batch_size} images all had 0 GT boxes) on rank {rank}"
+            # )
             # Return minimal empty batch - model will handle this gracefully
             return SAM3_3DBatchedInputs(
                 images=torch.zeros(0, 3, 1, 1),  # (0, 3, H, W)

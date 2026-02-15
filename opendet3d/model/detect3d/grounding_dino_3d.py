@@ -35,6 +35,9 @@ class Det3DOut(NamedTuple):
     boxes3d (list[Tensor]): 3D bounding boxes of shape [N, 10].
     scores (list[Tensor]): confidence scores of shape [N,].
     class_ids (list[Tensor]): class ids of shape [N,].
+    depth_maps (list[Tensor] | None): depth maps for each image.
+    categories (list[list[str]] | None): category names for each detection.
+    predicted_intrinsics (Tensor | None): predicted camera intrinsics (B, 3, 3).
     """
 
     boxes: list[Tensor]
@@ -43,6 +46,7 @@ class Det3DOut(NamedTuple):
     class_ids: list[Tensor]
     depth_maps: list[Tensor] | None
     categories: list[list[str]] | None = None
+    predicted_intrinsics: Tensor | None = None
 
 
 class GroundingDINO3DOut(NamedTuple):
@@ -1548,6 +1552,7 @@ class GroundingDINO3D(GroundingDINO):
             class_ids,
             depth_maps=depth_maps,
             categories=categories,
+            predicted_intrinsics=None,
         )
 
     def forward(

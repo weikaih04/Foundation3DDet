@@ -29,6 +29,7 @@ from .unidepth_head_backend import UniDepthHeadBackend
 from .detany3d_backend import DetAny3DGeometryBackend
 from .unidepth_v2_backend import UniDepthV2GeometryBackend
 from .unidepth_decoder_dino_only import UnidepthDecoderDinoOnly
+from .lingbot_depth_backend import LingbotDepthBackend
 
 __all__ = [
     "GeometryBackendBase",
@@ -37,5 +38,6 @@ __all__ = [
     "DetAny3DGeometryBackend",
     "UniDepthV2GeometryBackend",
     "UnidepthDecoderDinoOnly",
+    "LingbotDepthBackend",
 ]
 

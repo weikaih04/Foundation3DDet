@@ -311,11 +311,19 @@ class SAM3_3DLoss(nn.Module):
         # Image size from batch
         image_size = (batch.images.shape[2], batch.images.shape[3])  # (H, W)
 
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _t_targets = time.perf_counter()
+
         targets = self._build_targets_from_batch(batch)
         losses = {}
 
         # Normalize targets to [0, 1] range (for matching and computation)
         normalized_targets = self._normalize_targets(targets)
+
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _loss_targets_time = (time.perf_counter() - _t_targets) * 1000
 
         # Store image_size for pixel coordinate conversion
         if image_size is None and "image_size" in targets:
@@ -399,6 +407,11 @@ class SAM3_3DLoss(nn.Module):
             _loss_2d_box_time = (time.perf_counter() - _t1) * 1000
 
         # ========== O2M Loss (2D scaled by loss_2d_scale, 3D scaled by loss_3d_scale) ==========
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _t_o2m = time.perf_counter()
+            _loss_o2m_time = 0
+
         # Use real O2M outputs from SAM3 DAC mechanism (not O2O outputs)
         if self.config.use_o2m and self.o2m_matcher is not None and out.pred_logits_o2m is not None:
             o2m_losses = self._loss_o2m(
@@ -437,6 +450,10 @@ class SAM3_3DLoss(nn.Module):
                 # Clip O2M loss to prevent gradient explosion
                 losses[f"o2m_{key}"] = torch.clamp(o2m_loss_val, max=self.config.o2m_loss_clip)
 
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _loss_o2m_time = (time.perf_counter() - _t_o2m) * 1000
+
         # ========== 3D Losses (scaled by loss_3d_scale) ==========
         if _PROFILE_LOSS:
             torch.cuda.synchronize()
@@ -457,12 +474,21 @@ class SAM3_3DLoss(nn.Module):
             _loss_3d_time = (time.perf_counter() - _t2) * 1000
 
         # ========== Geometry Backend Losses (scaled by loss_geom_scale) ==========
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _t_geom = time.perf_counter()
+            _loss_geom_time = 0
+
         if geom_losses is not None:
             for key, value in geom_losses.items():
                 weight = getattr(self.config, f"loss_{key}_weight", 1.0)
                 losses[f"loss_{key}"] = (
                     self.config.loss_geom_scale * value * weight
                 )
+
+        if _PROFILE_LOSS:
+            torch.cuda.synchronize()
+            _loss_geom_time = (time.perf_counter() - _t_geom) * 1000
 
         # ========== Auxiliary Losses (Deep Supervision) ==========
         if _PROFILE_LOSS:
@@ -489,9 +515,12 @@ class SAM3_3DLoss(nn.Module):
             from opendet3d.utils.profiler import profiler
             p = profiler()
             p.current_step_timings["loss_total"] = _loss_total_time / 1000
+            p.current_step_timings["  loss_targets"] = _loss_targets_time / 1000
             p.current_step_timings["  loss_cls"] = _loss_cls_time / 1000
             p.current_step_timings["  loss_2d_box"] = _loss_2d_box_time / 1000
+            p.current_step_timings["  loss_o2m"] = _loss_o2m_time / 1000
             p.current_step_timings["  loss_3d"] = _loss_3d_time / 1000
+            p.current_step_timings["  loss_geom"] = _loss_geom_time / 1000
             p.current_step_timings["  loss_aux"] = _loss_aux_time / 1000
             p.current_step_timings["  loss_aux_layers"] = _num_aux_layers
 

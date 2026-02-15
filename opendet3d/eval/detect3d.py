@@ -109,12 +109,30 @@ class Detect3DEvaluator(Evaluator):
         return ["2D", "3D"]
 
     def gather(self, gather_func: GenericFunc) -> None:
-        """Accumulate predictions across processes."""
-        all_preds = all_gather_object_cpu(
-            self._predictions, use_system_tmp=False
-        )
-        if all_preds is not None:
-            self._predictions = list(itertools.chain(*all_preds))
+        """Accumulate predictions across all processes.
+
+        Uses NCCL-based all_gather_object instead of vis4d's file-based
+        all_gather_object_cpu, which fails on weka cross-node due to
+        filesystem cache consistency issues.
+        """
+        import torch.distributed as dist
+
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return
+
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        # Use NCCL-based gathering (avoids cross-node filesystem issues)
+        all_preds = [None] * world_size
+        dist.all_gather_object(all_preds, self._predictions)
+
+        if rank == 0:
+            self._predictions = list(
+                itertools.chain(*all_preds)
+            )
+        else:
+            self._predictions = []
 
     def reset(self) -> None:
         """Reset the saved predictions to start new round of evaluation."""
@@ -1028,7 +1046,7 @@ class Detect3Deval(COCOeval):
                 Na = a0 * I0
 
                 if has_precomputed_evals:
-                    E = evals_per_cat_area[(catId, a)]
+                    E = evals_per_cat_area.get((catId, a), [])
 
                 else:
                     E = [self.evalImgs[Nk + Na + i] for i in i_list]

@@ -26,35 +26,37 @@ from opendet3d.zoo.gdino3d.base.optim import get_optim_cfg
 
 
 def get_sam3_3d_param_groups(
-    backbone_lr_mult: float = 0.1,
-    depth_encoder_lr_mult: float = 0.1,
+    backbone_lr_mult: float = 1.0,
+    depth_encoder_lr_mult: float = 1.0,
 ) -> list[dict]:
-    """Get SAM3_3D default param_groups (like GDino3D).
+    """Get SAM3_3D default param_groups.
 
-    Similar to GDino3D:
-    - GDino3D: backbone 0.1x, language_model 0.1x, encoder/decoder 1.0x
-    - SAM3_3D: sam3.backbone 0.1x, geometry_backend.encoder 0.1x, transformer 1.0x
+    When backbone_freeze_blocks / encoder_freeze_blocks are used,
+    frozen params have requires_grad=False and won't update regardless
+    of lr_mult. The unfrozen blocks get full lr (1.0x) for effective
+    adaptation.
 
     Args:
         backbone_lr_mult: LR multiplier for SAM3 vision backbone.
-        depth_encoder_lr_mult: LR multiplier for depth encoder (UniDepth DINOv2).
+        depth_encoder_lr_mult: LR multiplier for depth encoder.
 
     Returns:
         List of param_group dicts.
 
     Default lr_mult:
-        - sam3.backbone: 0.1x (vision backbone, like GDino3D backbone)
-        - geometry_backend.encoder: 0.1x (depth backbone)
+        - sam3.backbone: 1.0x (frozen blocks won't update; unfrozen get full lr)
+        - geometry_backend.encoder: 1.0x (same logic)
         - Others: 1.0x (sam3.transformer, bbox3d_head, etc.)
     """
     return [
-        # SAM3 vision backbone - pretrained ViT, use low lr (like GDino3D backbone)
+        # SAM3 vision backbone - frozen blocks have requires_grad=False,
+        # unfrozen blocks (last N) get full lr for effective adaptation
         {"custom_keys": ["sam3.backbone"], "lr_mult": backbone_lr_mult},
-        # Depth encoder (UniDepth DINOv2) - pretrained, use low lr
+        # Depth encoder - same: frozen blocks won't update, unfrozen get full lr
         {"custom_keys": ["geometry_backend.encoder"], "lr_mult": depth_encoder_lr_mult},
         # These train with full lr (1.0x) by default:
         # - sam3.geometry_encoder (prompt encoder)
-        # - sam3.transformer (encoder + decoder, like GDino3D encoder/decoder)
+        # - sam3.transformer (encoder + decoder)
         # - bbox3d_head
         # - early_depth_fusion
         # - geometry_backend.decoder
