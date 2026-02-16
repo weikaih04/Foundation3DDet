@@ -1,17 +1,16 @@
-"""Early Depth Fusion Module.
+"""Early Depth Fusion Modules.
 
-Fuses depth latents into visual features before the encoder.
-This allows depth information to participate in encoder's self-attention
-and text cross-attention, enabling better 3D-aware feature learning.
+Two variants for fusing depth latents into visual features before the encoder:
 
-Design follows Concat-Add with Zero-Init:
-- Fusion location: After backbone, before encoder
-- Fusion method: Concat + Zero-Init projection + Residual add
-- Goal: Let depth info participate in full encoder processing
+1. EarlyDepthFusionUniDepthV2 (Concat-Add):
+   Concatenate visual + depth, project back, residual add.
+       delta = W * [P; D]
+       output = P + delta
 
-Math (more expressive than pure ControlNet):
-    delta = W_P * P + W_D * D  (from concat projection)
-    output = P + delta = (I + W_P) * P + W_D * D
+2. EarlyDepthFusionLingbot (ControlNet-style):
+   LayerNorm depth, project depth only, residual add.
+       delta = W_d @ LayerNorm(D)
+       output = P + delta
 """
 
 from __future__ import annotations
@@ -21,37 +20,19 @@ import torch.nn as nn
 from torch import Tensor
 
 
-class EarlyDepthFusion(nn.Module):
-    """Early fusion of depth latents into visual features (before encoder).
+class EarlyDepthFusionUniDepthV2(nn.Module):
+    """Concat-Add fusion for UniDepthV2 backend.
 
-    Fuses depth features from geometry backend into visual features from backbone,
-    before they enter the transformer encoder. This allows depth information to
-    participate in the full encoder processing (self-attention + text cross-attention).
-
-    Architecture:
-        visual_feats [B, C, H, W] ──┐
-                                     ├─→ Concat [B, C+depth_dim, H, W]
-        depth_latents [B, N, C_d] ──┤        ↓
-            └─ reshape & interpolate─┘   Conv1x1 (zero-init) [B, C, H, W]
-                                              ↓
-        visual_feats [B, C, H, W] ──→ Add ───┘
-                                       ↓
-                                  fused [B, C, H, W]
+    Concatenates visual and depth features, projects back to visual dim,
+    then adds as residual. More expressive than depth-only projection:
+        delta = W_P * P + W_D * D  (from concat projection)
+        output = P + delta = (I + W_P) * P + W_D * D
 
     Args:
-        visual_dim: Dimension of visual features (e.g., 256)
-        depth_dim: Dimension of depth latents (e.g., 256)
-        fusion_type: Type of fusion, "concat_add" (default)
-        zero_init: Whether to zero-initialize the projection layer
-
-    Forward Args:
-        visual_feats: List of visual features from backbone FPN
-            For SAM3 single-scale: [Tensor of shape [B, C, H, W]]
-        depth_latents: Depth features [B, N, C_depth]
-        depth_latents_hw: Spatial dimensions (H_d, W_d) of depth latents
-
-    Returns:
-        List of fused visual features with same shapes as input
+        visual_dim: Dimension of visual features (e.g., 256).
+        depth_dim: Dimension of depth latents (e.g., 256).
+        fusion_type: Kept for config compatibility, ignored.
+        zero_init: Whether to zero-initialize the projection layer.
     """
 
     def __init__(
@@ -65,9 +46,8 @@ class EarlyDepthFusion(nn.Module):
 
         self.visual_dim = visual_dim
         self.depth_dim = depth_dim
-        self.fusion_type = fusion_type
 
-        # Projection layer: [C+depth_dim] -> [C]
+        # Projection: [C + C_depth] -> [C]
         self.proj = nn.Conv2d(
             visual_dim + depth_dim,
             visual_dim,
@@ -75,7 +55,6 @@ class EarlyDepthFusion(nn.Module):
             bias=True,
         )
 
-        # Zero initialization - delta=0 at start, preserves pretrained features
         if zero_init:
             nn.init.zeros_(self.proj.weight)
             nn.init.zeros_(self.proj.bias)
@@ -89,13 +68,12 @@ class EarlyDepthFusion(nn.Module):
         """Fuse depth latents into visual features.
 
         Args:
-            visual_feats: List of visual features from FPN
-                For SAM3 (single-scale): [[B, C, H, W]]
-            depth_latents: Depth features [B, N, C_depth] where N = H_d * W_d
-            depth_latents_hw: (H_d, W_d) spatial dimensions of depth latents
+            visual_feats: List of visual features [[B, C, H, W]].
+            depth_latents: Depth features [B, N, C_depth].
+            depth_latents_hw: (H_d, W_d) spatial dims of depth latents.
 
         Returns:
-            List of fused visual features with same structure as input
+            List of fused visual features with same shapes as input.
         """
         if depth_latents is None or len(visual_feats) == 0:
             return visual_feats
@@ -105,17 +83,17 @@ class EarlyDepthFusion(nn.Module):
 
         assert N == H_d * W_d, f"depth_latents N={N} != H_d*W_d={H_d * W_d}"
 
-        # Reshape depth_latents: [B, N, C_depth] -> [B, C_depth, H_d, W_d]
-        depth_2d = depth_latents.permute(0, 2, 1).reshape(B, C_depth, H_d, W_d)
+        # Reshape: [B, N, C_depth] -> [B, C_depth, H_d, W_d]
+        depth_2d = depth_latents.permute(0, 2, 1).reshape(
+            B, C_depth, H_d, W_d
+        )
 
-        # Fuse with each level of visual features
         fused_feats = []
         for visual_feat in visual_feats:
-            # visual_feat: [B, C, H, W]
             B_v, C_v, H_v, W_v = visual_feat.shape
-            assert C_v == self.visual_dim, f"visual_dim mismatch: {C_v} != {self.visual_dim}"
+            assert C_v == self.visual_dim
 
-            # Interpolate depth to match visual feature's spatial size
+            # Interpolate depth to match visual spatial size
             if (H_d, W_d) != (H_v, W_v):
                 depth_resized = torch.nn.functional.interpolate(
                     depth_2d,
@@ -126,15 +104,116 @@ class EarlyDepthFusion(nn.Module):
             else:
                 depth_resized = depth_2d
 
-            # Concat: [B, C, H, W] + [B, C_depth, H, W] -> [B, C+C_depth, H, W]
+            # Concat + project + residual
             concat_feat = torch.cat([visual_feat, depth_resized], dim=1)
-
-            # Project back: [B, C+C_depth, H, W] -> [B, C, H, W]
             proj_feat = self.proj(concat_feat)
-
-            # Residual add
             fused_feat = visual_feat + proj_feat
 
             fused_feats.append(fused_feat)
 
         return fused_feats
+
+
+class EarlyDepthFusionLingbot(nn.Module):
+    """ControlNet-style fusion for Lingbot depth backend.
+
+    LayerNorm on depth latents, project depth only, residual add.
+    Visual features never pass through any trainable layer, preserving
+    the pretrained distribution.
+
+    Args:
+        visual_dim: Dimension of visual features (e.g., 256).
+        depth_dim: Dimension of depth latents (e.g., 256).
+        fusion_type: Kept for config compatibility, ignored.
+        zero_init: Whether to zero-initialize the projection layer.
+    """
+
+    def __init__(
+        self,
+        visual_dim: int = 256,
+        depth_dim: int = 256,
+        fusion_type: str = "concat_add",
+        zero_init: bool = True,
+    ):
+        super().__init__()
+
+        self.visual_dim = visual_dim
+        self.depth_dim = depth_dim
+
+        # Normalize depth_latents to unit scale before projection.
+        # depth_latents (raw neck output, std~4.0) and visual features
+        # (SAM3 FPN, std~0.017) differ by ~230x. LayerNorm brings depth
+        # to mean=0, std=1 so the projection sees consistent input scale.
+        self.depth_norm = nn.LayerNorm(depth_dim)
+
+        # Projection: depth_dim -> visual_dim (depth only)
+        self.proj = nn.Conv2d(
+            depth_dim,
+            visual_dim,
+            kernel_size=1,
+            bias=True,
+        )
+
+        if zero_init:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(
+        self,
+        visual_feats: list[Tensor],
+        depth_latents: Tensor,
+        depth_latents_hw: tuple[int, int],
+    ) -> list[Tensor]:
+        """Fuse depth latents into visual features.
+
+        Args:
+            visual_feats: List of visual features [[B, C, H, W]].
+            depth_latents: Depth features [B, N, C_depth].
+            depth_latents_hw: (H_d, W_d) spatial dims of depth latents.
+
+        Returns:
+            List of fused visual features with same shapes as input.
+        """
+        if depth_latents is None or len(visual_feats) == 0:
+            return visual_feats
+
+        B, N, C_depth = depth_latents.shape
+        H_d, W_d = depth_latents_hw
+
+        assert N == H_d * W_d, f"depth_latents N={N} != H_d*W_d={H_d * W_d}"
+
+        # Normalize depth_latents to unit scale
+        depth_latents = self.depth_norm(depth_latents)
+
+        # Reshape: [B, N, C_depth] -> [B, C_depth, H_d, W_d]
+        depth_2d = depth_latents.permute(0, 2, 1).reshape(
+            B, C_depth, H_d, W_d
+        )
+
+        fused_feats = []
+        for visual_feat in visual_feats:
+            B_v, C_v, H_v, W_v = visual_feat.shape
+            assert C_v == self.visual_dim
+
+            # Interpolate depth to match visual spatial size
+            if (H_d, W_d) != (H_v, W_v):
+                depth_resized = torch.nn.functional.interpolate(
+                    depth_2d,
+                    size=(H_v, W_v),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            else:
+                depth_resized = depth_2d
+
+            # Project depth only + residual add
+            delta = self.proj(depth_resized)
+            fused_feat = visual_feat + delta
+
+            fused_feats.append(fused_feat)
+
+        return fused_feats
+
+
+# Backward compatibility alias
+EarlyDepthFusion = EarlyDepthFusionUniDepthV2

@@ -62,7 +62,7 @@ def generate_rays(
     ray_directions = ray_directions.permute(0, 2, 1)  # (B, H*W, 3)
 
     theta = torch.atan2(ray_directions[..., 0], ray_directions[..., -1])
-    phi = torch.acos(ray_directions[..., 1])
+    phi = torch.acos(ray_directions[..., 1].clamp(-1.0, 1.0))
     # pitch = torch.asin(ray_directions[..., 1])
     # roll = torch.atan2(ray_directions[..., 0], - ray_directions[..., 1])
     angles = torch.stack([theta, phi], dim=-1)

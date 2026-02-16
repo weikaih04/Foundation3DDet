@@ -89,6 +89,14 @@ class SAM3_3DBatchedInputs:
     original_images: Tensor | None = None  # (B_images, 3, H, W) unresized
     original_intrinsics: Tensor | None = None  # (B_images, 3, 3)
 
+    # CenterPad info for correct box rescaling during evaluation
+    # Each element: [pad_left, pad_right, pad_top, pad_bottom]
+    padding: List[List[int]] | None = None  # (B_images,) list of [l, r, t, b]
+
+    # Depth ground truth for geometry backend supervision
+    depth_gt: Tensor | None = None   # (B_images, 1, H, W)
+    depth_mask: Tensor | None = None  # (B_images, 1, H, W)
+
     def to(self, device: torch.device) -> "SAM3_3DBatchedInputs":
         """Move all tensors to specified device."""
         def move(t):
@@ -116,6 +124,9 @@ class SAM3_3DBatchedInputs:
             original_hw=self.original_hw,  # List or Tensor
             original_images=move(self.original_images),
             original_intrinsics=move(self.original_intrinsics),
+            padding=self.padding,  # List, no move
+            depth_gt=move(self.depth_gt),
+            depth_mask=move(self.depth_mask),
         )
     
     @property

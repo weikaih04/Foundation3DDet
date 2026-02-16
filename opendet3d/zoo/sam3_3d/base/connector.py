@@ -455,6 +455,7 @@ class SAM3_3DCollator:
                 original_hw=None,
                 original_images=None,
                 original_intrinsics=None,
+                padding=None,
             )
 
         device = batch[0]["images"].device if batch[0]["images"].is_cuda else "cpu"
@@ -480,7 +481,8 @@ class SAM3_3DCollator:
         original_hw_list = []
         original_images_list = []
         original_intrinsics_list = []
-        for b in batch:
+        padding_list = []
+        for b_idx, b in enumerate(batch):
             # sample_names - image identifier for evaluation
             if "sample_names" in b:
                 sample_names.append(b["sample_names"])
@@ -513,6 +515,12 @@ class SAM3_3DCollator:
             else:
                 original_intrinsics_list.append(None)
 
+            # padding - CenterPad offsets [pad_left, pad_right, pad_top, pad_bottom]
+            if "padding" in b:
+                padding_list.append(b["padding"])
+            else:
+                padding_list.append(None)
+
         # Collect depth maps for geometry backend supervision
         depth_maps_list = []
         for b in batch:
@@ -536,17 +544,38 @@ class SAM3_3DCollator:
         sample_names = sample_names if any(s is not None for s in sample_names) else None
         dataset_name = dataset_name_list if any(d is not None for d in dataset_name_list) else None
         original_hw = original_hw_list if any(h is not None for h in original_hw_list) else None
+        padding = padding_list if any(p is not None for p in padding_list) else None
         original_images = None
         if any(img is not None for img in original_images_list):
-            # Stack only if all images have same shape
-            try:
-                original_images = torch.stack([img for img in original_images_list if img is not None])
-            except (RuntimeError, TypeError):
-                original_images = None
+            # Convert numpy arrays to tensors, then try stacking.
+            # Different-sized images (e.g. cross-dataset) cannot be stacked;
+            # in that case keep as list for the visualizer.
+            imgs = []
+            for img in original_images_list:
+                if img is None:
+                    continue
+                if not isinstance(img, torch.Tensor):
+                    img = torch.as_tensor(img)
+                imgs.append(img)
+            if len(imgs) == 1:
+                original_images = imgs[0].unsqueeze(0) if imgs[0].dim() == 3 else imgs[0]
+            elif len(imgs) > 1:
+                try:
+                    original_images = torch.stack(imgs)
+                except RuntimeError:
+                    # Different shapes across batch - keep first only
+                    original_images = imgs[0].unsqueeze(0) if imgs[0].dim() == 3 else imgs[0]
         original_intrinsics = None
         if any(intr is not None for intr in original_intrinsics_list):
+            intrs = []
+            for intr in original_intrinsics_list:
+                if intr is None:
+                    continue
+                if not isinstance(intr, torch.Tensor):
+                    intr = torch.as_tensor(intr)
+                intrs.append(intr)
             try:
-                original_intrinsics = torch.stack([intr for intr in original_intrinsics_list if intr is not None])
+                original_intrinsics = torch.stack(intrs)
             except (RuntimeError, TypeError):
                 original_intrinsics = None
 
@@ -784,6 +813,7 @@ class SAM3_3DCollator:
                 original_hw=original_hw,
                 original_images=original_images,
                 original_intrinsics=original_intrinsics,
+                padding=padding,
             )
 
         # Stack tensors
@@ -896,6 +926,7 @@ class SAM3_3DCollator:
             original_hw=original_hw,
             original_images=original_images,
             original_intrinsics=original_intrinsics,
+            padding=padding,
             # Depth ground truth for geometry backend supervision
             depth_gt=depth_gt,
             depth_mask=None,  # Not yet implemented
@@ -1025,6 +1056,93 @@ class SAM3_3DLossConnector:
         return {
             "out": predictions,
             "batch": batch,
+        }
+
+
+class SAM3_3DVisConnector:
+    """Vis connector that extracts from SAM3_3DBatchedInputs for visualization.
+
+    vis4d's CallbackConnector uses dict access (data[key]) which doesn't
+    work with SAM3_3DBatchedInputs dataclass. This connector does the
+    extraction manually.
+
+    Args:
+        score_threshold: Only visualize boxes with score >= this value.
+            Separate from model's score_threshold so evaluation AP is unaffected.
+    """
+
+    def __init__(self, score_threshold: float = 0.0):
+        self.score_threshold = score_threshold
+
+    def __call__(self, prediction, data: SAM3_3DBatchedInputs) -> dict:
+        """Extract visualization data from dataclass + prediction.
+
+        Args:
+            prediction: Det3DOut NamedTuple from model.
+            data: SAM3_3DBatchedInputs from collator.
+
+        Returns:
+            Dict with keys expected by BoundingBox3DVisualizer.
+        """
+        # When the collator filters out images with no GT boxes (empty batch),
+        # original_images is None. Return empty tensor so the visualizer's
+        # for-loop iterates 0 times instead of crashing.
+        images = data.original_images
+        if images is None:
+            images = torch.zeros(0, 3, 1, 1)
+
+        boxes3d = prediction.boxes3d
+        class_ids = prediction.class_ids
+        scores = prediction.scores
+
+        # Filter by score threshold per image for cleaner visualization
+        if self.score_threshold > 0.0 and scores is not None:
+            filtered_boxes3d = []
+            filtered_class_ids = []
+            filtered_scores = []
+            for i in range(len(scores)):
+                mask = scores[i] >= self.score_threshold
+                filtered_scores.append(scores[i][mask])
+                filtered_class_ids.append(class_ids[i][mask])
+                filtered_boxes3d.append(boxes3d[i][mask])
+            boxes3d = filtered_boxes3d
+            class_ids = filtered_class_ids
+            scores = filtered_scores
+
+        return {
+            "images": images,
+            "image_names": data.sample_names,
+            "intrinsics": data.original_intrinsics,
+            "boxes3d": boxes3d,
+            "class_ids": class_ids,
+            "scores": scores,
+        }
+
+
+class SAM3_3DEvalConnector:
+    """Eval connector that extracts from SAM3_3DBatchedInputs for evaluator.
+
+    Same issue as SAM3_3DVisConnector: CallbackConnector doesn't work with
+    dataclass. This connector manually extracts fields.
+    """
+
+    def __call__(self, prediction, data: SAM3_3DBatchedInputs) -> dict:
+        """Extract evaluation data from dataclass + prediction.
+
+        Args:
+            prediction: Det3DOut NamedTuple from model.
+            data: SAM3_3DBatchedInputs from collator.
+
+        Returns:
+            Dict with keys expected by Omni3DEvaluator.
+        """
+        return {
+            "coco_image_id": data.sample_names,
+            "dataset_names": data.dataset_name,
+            "pred_boxes": prediction.boxes,
+            "pred_scores": prediction.scores,
+            "pred_classes": prediction.class_ids,
+            "pred_boxes3d": prediction.boxes3d,
         }
 
 

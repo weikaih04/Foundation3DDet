@@ -14,10 +14,7 @@ from vis4d.config.typing import ExperimentConfig
 from vis4d.data.io.hdf5 import HDF5Backend
 from vis4d.zoo.base import get_default_cfg
 
-from opendet3d.zoo.gdino3d.base.callback import (
-    get_callback_cfg,
-    get_omni3d_evaluator_cfg,
-)
+from opendet3d.zoo.gdino3d.base.callback import get_omni3d_evaluator_cfg
 from opendet3d.zoo.gdino3d.base.dataset.omni3d import (
     get_omni3d_test_cfg,
     get_omni3d_train_cfg,
@@ -31,7 +28,11 @@ from opendet3d.zoo.sam3_3d.base.model import (
     get_sam3_3d_hyperparams_cfg,
 )
 from opendet3d.zoo.sam3_3d.base.loss import get_sam3_3d_loss_cfg
-from opendet3d.zoo.sam3_3d.base.connector import get_sam3_3d_data_connector_cfg
+from opendet3d.zoo.sam3_3d.base.connector import (
+    get_sam3_3d_data_connector_cfg,
+    SAM3_3DEvalConnector,
+    SAM3_3DVisConnector,
+)
 from opendet3d.zoo.sam3_3d.base.data import get_sam3_3d_data_cfg
 
 
@@ -152,13 +153,51 @@ def get_config() -> ExperimentConfig:
         omni3d50=True,
         test_datasets=omni3d_test_datasets,
     )
-    
-    callbacks = get_callback_cfg(
-        output_dir=config.output_dir,
-        omni3d_evaluator=omni3d_evaluator_cfg,
-        open_test_datasets=[],
+
+    # SAM3_3D uses custom connectors since SAM3_3DBatchedInputs is a dataclass,
+    # not a dict. vis4d's CallbackConnector (dict access) doesn't work.
+    from vis4d.data.const import AxisMode
+    from vis4d.engine.callbacks import EvaluatorCallback, VisualizerCallback
+    from vis4d.vis.image.bbox3d_visualizer import BoundingBox3DVisualizer
+    from vis4d.vis.image.canvas import PillowCanvasBackend
+    from vis4d.zoo.base import get_default_callbacks_cfg
+
+    callbacks = get_default_callbacks_cfg()
+
+    # Evaluator with SAM3_3D-specific connector
+    callbacks.append(
+        class_config(
+            EvaluatorCallback,
+            evaluator=omni3d_evaluator_cfg,
+            metrics_to_eval=["3D"],
+            save_predictions=True,
+            output_dir=config.output_dir,
+            save_prefix="detection",
+            test_connector=class_config(SAM3_3DEvalConnector),
+        )
     )
-    
+
+    # Visualizer with SAM3_3D-specific connector
+    callbacks.append(
+        class_config(
+            VisualizerCallback,
+            visualizer=class_config(
+                BoundingBox3DVisualizer,
+                axis_mode=AxisMode.OPENCV,
+                width=4,
+                camera_near_clip=0.01,
+                plot_heading=False,
+                vis_freq=1,
+                plot_trajectory=False,
+                canvas=class_config(PillowCanvasBackend, font_size=16),
+                save_boxes3d=True,
+            ),
+            output_dir=config.output_dir,
+            save_prefix="box3d",
+            test_connector=class_config(SAM3_3DVisConnector, score_threshold=0.1),
+        )
+    )
+
     config.callbacks = callbacks
     
     ######################################################

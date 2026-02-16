@@ -48,6 +48,54 @@ from opendet3d.model.detect3d.grounding_dino_3d import Det3DOut
 from opendet3d.op.detect3d.geometry import GeometryBackendBase
 
 
+class Fp32LayerNorm(nn.LayerNorm):
+    """LayerNorm that always computes in fp32.
+
+    In mixed-precision training (bf16/fp16), standard LayerNorm can overflow
+    because the variance computation involves squaring values. bf16 max is
+    ~65504, so values > ~256 squared will overflow.
+
+    This wrapper casts input to fp32, runs LayerNorm, then casts back.
+    The overhead is negligible since LayerNorm is memory-bound.
+    """
+
+    def forward(self, x: Tensor) -> Tensor:
+        orig_dtype = x.dtype
+        x = x.float()
+        x = super().forward(x)
+        return x.to(orig_dtype)
+
+
+def _upgrade_layernorms_to_fp32(module: nn.Module) -> int:
+    """Replace all nn.LayerNorm in a module tree with Fp32LayerNorm.
+
+    Walks the module tree and swaps each nn.LayerNorm with an Fp32LayerNorm
+    that shares the same weight and bias tensors (no copy, no extra memory).
+
+    Args:
+        module: Root module to patch.
+
+    Returns:
+        Number of LayerNorm modules replaced.
+    """
+    count = 0
+    for name, child in module.named_children():
+        if isinstance(child, nn.LayerNorm) and not isinstance(child, Fp32LayerNorm):
+            fp32_ln = Fp32LayerNorm(
+                child.normalized_shape,
+                eps=child.eps,
+                elementwise_affine=child.elementwise_affine,
+            )
+            # Share weight/bias tensors (no copy)
+            fp32_ln.weight = child.weight
+            fp32_ln.bias = child.bias
+            setattr(module, name, fp32_ln)
+            count += 1
+        else:
+            count += _upgrade_layernorms_to_fp32(child)
+    return count
+
+
 class SAM3_3DOut(NamedTuple):
     """Output of SAM3_3D model.
 
@@ -152,6 +200,9 @@ class SAM3_3DBatchedInputs:
     original_hw: List[tuple] | None = None   # (B_images,) - original (H, W) per image
     original_images: Tensor | None = None    # (B_images, 3, H_orig, W_orig) - unresized
     original_intrinsics: Tensor | None = None  # (B_images, 3, 3) - intrinsics before resize
+
+    # CenterPad offsets [pad_left, pad_right, pad_top, pad_bottom]
+    padding: List | None = None               # (B_images,) - padding offsets per image
 
     # Depth Ground Truth (for geometry backend supervision)
     depth_gt: Tensor | None = None            # (B_images, 1, H, W) depth map
@@ -413,6 +464,15 @@ class SAM3_3D(nn.Module):
                 f"[SAM3_3D] Backbone freeze: {backbone_freeze_blocks}/{num_blocks}"
                 f" blocks frozen ({frozen_params/1e6:.1f}M/{total_params/1e6:.1f}M params)"
             )
+
+        # Upgrade ALL LayerNorm in the entire model to fp32.
+        # In bf16 mixed-precision, LayerNorm's variance computation can
+        # overflow (bf16 max ~65504). This covers sam3 (transformer decoder,
+        # backbone, encoder), geometry_backend (DINOv2 encoder, intrinsic
+        # head), early_depth_fusion (depth_norm), and bbox3d_head.
+        # Negligible performance cost -- LayerNorm is memory-bound.
+        n_replaced = _upgrade_layernorms_to_fp32(self)
+        print(f"[SAM3_3D] Upgraded {n_replaced} LayerNorm -> Fp32LayerNorm (entire model)")
 
     def _xyxy_to_cxcywh(self, boxes: Tensor) -> Tensor:
         """Convert boxes from xyxy to cxcywh format.
@@ -784,6 +844,15 @@ class SAM3_3D(nn.Module):
                     backbone_out["backbone_fpn"] = fused_fpn[0]
                 else:
                     backbone_out["backbone_fpn"] = fused_fpn
+
+                # Log fusion delta magnitude (monitoring only)
+                delta_val = getattr(
+                    self.early_depth_fusion, "_last_delta_mean_abs", None
+                )
+                if self.training and geom_losses is not None and delta_val is not None:
+                    geom_losses["metric_fusion_delta"] = torch.tensor(
+                        delta_val, device=device,
+                    )
             else:
                 # Warn user that early depth fusion is configured but cannot run
                 import warnings
@@ -1241,31 +1310,43 @@ class SAM3_3D(nn.Module):
                     n_after_nms = len(img_boxes_flat)
                     print(f"[NMS DEBUG] img={img_idx}, before={n_before_nms}, after={n_after_nms}, suppressed={n_before_nms - n_after_nms}, iou_thresh={iou_threshold}")
 
-            # Rescale 2D boxes from resize space (H, W) to original image space
-            # GDino3D does this in RoI2Det3D.__call__ (line 396): det_bboxes /= scales
-            # This is CRITICAL for correct IoU computation in evaluation!
-            if batch.original_hw is not None and batch.original_hw[img_idx] is not None:
-                orig_h, orig_w = batch.original_hw[img_idx]
-                scale_x = W / orig_w
-                scale_y = H / orig_h
-                img_boxes_flat = img_boxes_flat.clone()  # Don't modify in-place
-                img_boxes_flat[:, 0::2] /= scale_x  # x coordinates
-                img_boxes_flat[:, 1::2] /= scale_y  # y coordinates
-
-            # Decode 3D boxes AFTER filtering (more efficient)
-            # Use original intrinsics for 3D decoding if available
+            # Decode 3D boxes in padded space BEFORE rescaling (matching GDino3D)
+            # Use padded-space intrinsics (batch.intrinsics) since 2D boxes are
+            # still in padded pixel coordinates at this point.
             if img_boxes3d_flat is not None and self.box_coder is not None and len(img_boxes_flat) > 0:
-                if batch.original_intrinsics is not None:
-                    intrinsics_this_img = batch.original_intrinsics[img_idx]  # (3, 3)
-                else:
-                    intrinsics_this_img = batch.intrinsics[img_idx]  # (3, 3)
+                intrinsics_this_img = batch.intrinsics[img_idx]  # (3, 3) padded-space
                 decoded_boxes3d = self.box_coder.decode(
-                    img_boxes_flat,  # pixel xyxy in original image space
+                    img_boxes_flat,  # pixel xyxy in padded space
                     img_boxes3d_flat,
                     intrinsics_this_img,
                 )
             else:
                 decoded_boxes3d = torch.zeros(len(img_boxes_flat), 10, device=device)
+
+            # Rescale 2D boxes from padded space (H, W) to original image space
+            # Must account for CenterPad: first subtract padding offset, then
+            # divide by content_size/original_size (NOT padded_size/original_size).
+            # Matches GDino3D RoI2Det3D.__call__ (head.py:380-396).
+            if batch.original_hw is not None and batch.original_hw[img_idx] is not None:
+                orig_h, orig_w = batch.original_hw[img_idx]
+                img_boxes_flat = img_boxes_flat.clone()  # Don't modify in-place
+
+                if batch.padding is not None and batch.padding[img_idx] is not None:
+                    pad_left, pad_right, pad_top, pad_bottom = batch.padding[img_idx]
+                    # Step 1: subtract CenterPad offset
+                    img_boxes_flat[:, 0::2] -= pad_left
+                    img_boxes_flat[:, 1::2] -= pad_top
+                    # Step 2: scale = content_size / original_size
+                    content_w = W - pad_left - pad_right
+                    content_h = H - pad_top - pad_bottom
+                    scale_x = content_w / orig_w
+                    scale_y = content_h / orig_h
+                else:
+                    # Fallback: no padding info, use full image size
+                    scale_x = W / orig_w
+                    scale_y = H / orig_h
+                img_boxes_flat[:, 0::2] /= scale_x  # x coordinates
+                img_boxes_flat[:, 1::2] /= scale_y  # y coordinates
 
             boxes_list.append(img_boxes_flat)
             boxes3d_list.append(decoded_boxes3d)

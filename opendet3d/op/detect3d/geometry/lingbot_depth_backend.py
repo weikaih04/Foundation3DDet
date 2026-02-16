@@ -36,8 +36,9 @@ class LingbotDepthBackend(GeometryBackendBase):
     - neck: ConvStack (multiscale refinement)
     - depth_head: ConvStack (depth regression)
 
-    depth_latents are extracted from encoder features (before neck)
-    and projected to target_latent_dim via a learned linear layer.
+    depth_latents are extracted from neck level 1 output (after 2 ResBlocks,
+    256-dim, 2x encoder resolution) and pooled to encoder grid size.
+    This matches UniDepthV2's approach of using decoder intermediate features.
 
     During training, each sample independently gets one of three modes:
     - monocular (zero depth): prob = monocular_prob (default 0.7)
@@ -49,6 +50,8 @@ class LingbotDepthBackend(GeometryBackendBase):
         pretrained_model: Path or HuggingFace repo ID for MDMModel.
         num_tokens: Number of base tokens for the encoder.
         target_latent_dim: Target dimension for depth_latents.
+            Neck level 1 outputs 256-dim; if target != 256, a Linear
+            projection is applied. Use 256 to avoid projection.
         depth_loss_weight: Weight for L1 depth loss.
         silog_loss_weight: Weight for SILog depth loss (scale-invariant).
         monocular_prob: Probability of zero depth input (training).
@@ -134,11 +137,17 @@ class LingbotDepthBackend(GeometryBackendBase):
         self.remap_depth_out = mdm_model.remap_depth_out
 
         # Get dimensions from loaded model
-        encoder_dim = self.encoder.output_projections[0].out_channels
         cls_dim = self.encoder.dim_features
 
-        # Latent projection: encoder features -> target_latent_dim
-        self.latent_proj = nn.Linear(encoder_dim, target_latent_dim)
+        # Neck level 1 outputs 256-dim features.
+        # If target_latent_dim != 256, project; otherwise Identity.
+        self._neck_latent_dim = 256
+        if target_latent_dim != self._neck_latent_dim:
+            self.latent_proj = nn.Linear(
+                self._neck_latent_dim, target_latent_dim
+            )
+        else:
+            self.latent_proj = nn.Identity()
 
         # Intrinsic prediction head: cls_token -> camera K
         # Same parameterization as UniDepthV2 CameraHead:
@@ -193,9 +202,9 @@ class LingbotDepthBackend(GeometryBackendBase):
             f" blocks frozen"
         )
         print(
-            f"[LingbotDepth] Initialized: encoder_dim={encoder_dim}, "
+            f"[LingbotDepth] Initialized: "
             f"cls_dim={cls_dim}, num_tokens={num_tokens}, "
-            f"target_latent_dim={target_latent_dim}\n"
+            f"depth_latents=neck[1] (256-dim, pooled)\n"
             f"  remap_depth_in={self.remap_depth_in}, "
             f"remap_depth_out={self.remap_depth_out}\n"
             f"  depth strategy: {monocular_prob:.0%} monocular / "
@@ -363,8 +372,8 @@ class LingbotDepthBackend(GeometryBackendBase):
         params = self.intrinsic_head(cls_token)  # [B, 4]
 
         diagonal = (H**2 + W**2) ** 0.5
-        fx = torch.exp(params[:, 0]) * 0.7 * diagonal
-        fy = torch.exp(params[:, 1]) * 0.7 * diagonal
+        fx = torch.exp(params[:, 0].clamp(-10, 10)) * 0.7 * diagonal
+        fy = torch.exp(params[:, 1].clamp(-10, 10)) * 0.7 * diagonal
         cx = torch.sigmoid(params[:, 2]) * W
         cy = torch.sigmoid(params[:, 3]) * H
 
@@ -442,14 +451,6 @@ class LingbotDepthBackend(GeometryBackendBase):
         # features: [B, encoder_dim, base_h, base_w]
         # cls_token: [B, cls_dim]
 
-        # Extract depth_latents from encoder features (BEFORE neck)
-        depth_latents = features.flatten(2).permute(
-            0, 2, 1
-        )  # [B, N, encoder_dim]
-        depth_latents = self.latent_proj(
-            depth_latents
-        )  # [B, N, target_latent_dim]
-
         # Run neck + depth_head (MDMModel.forward lines 120-148)
         aspect_ratio = W / H
 
@@ -479,6 +480,18 @@ class LingbotDepthBackend(GeometryBackendBase):
         # Shared neck
         neck_out = self.neck(feat_list)
 
+        # Extract depth_latents from neck level 1 (after 2 ResBlocks)
+        # neck_out[1]: [B, 256, base_h*2, base_w*2]
+        # Pool to (base_h, base_w) to keep N = base_h * base_w
+        neck_feat = neck_out[1]  # [B, 256, base_h*2, base_w*2]
+        neck_feat_pooled = F.adaptive_avg_pool2d(
+            neck_feat, (base_h, base_w)
+        )  # [B, 256, base_h, base_w]
+        depth_latents = neck_feat_pooled.flatten(2).permute(
+            0, 2, 1
+        )  # [B, N, 256]
+        depth_latents = self.latent_proj(depth_latents)
+
         # Depth head: take last output
         depth_reg = self.depth_head(neck_out)[-1]  # [B, 1, h, w]
 
@@ -491,8 +504,10 @@ class LingbotDepthBackend(GeometryBackendBase):
         )
 
         # Apply output remapping
+        # Clamp before exp to prevent overflow (float16 overflows at ~11,
+        # float32 at ~88). Range [-10, 10] maps to depth [4.5e-5, 22026] m.
         if self.remap_depth_out == "exp":
-            depth_map = depth_reg.exp()  # [B, 1, H, W]
+            depth_map = depth_reg.clamp(-10, 10).exp()  # [B, 1, H, W]
         elif self.remap_depth_out == "linear":
             depth_map = depth_reg
         else:
@@ -502,6 +517,7 @@ class LingbotDepthBackend(GeometryBackendBase):
 
         return depth_map, depth_latents, cls_token, base_h, base_w
 
+    @torch.autocast(device_type="cuda", enabled=False)
     def _compute_losses(
         self,
         depth_map: Tensor,
@@ -531,6 +547,17 @@ class LingbotDepthBackend(GeometryBackendBase):
             Dictionary of loss tensors.
         """
         losses = {}
+
+        # Cast to float32 for numerical stability under mixed precision
+        depth_map = depth_map.float()
+        K_pred = K_pred.float()
+        intrinsics = intrinsics.float()
+        if depth_gt is not None:
+            depth_gt = depth_gt.float()
+        if depth_mask is not None:
+            depth_mask = depth_mask.float()
+        if images is not None:
+            images = images.float()
 
         # Depth loss: masked L1 on raw metric depth
         if depth_gt is not None:

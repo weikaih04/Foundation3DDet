@@ -26,8 +26,8 @@ from opendet3d.zoo.gdino3d.base.optim import get_optim_cfg
 
 
 def get_sam3_3d_param_groups(
-    backbone_lr_mult: float = 1.0,
-    depth_encoder_lr_mult: float = 1.0,
+    backbone_lr_mult: float = 0.1,
+    depth_encoder_lr_mult: float = 0.1,
 ) -> list[dict]:
     """Get SAM3_3D default param_groups.
 

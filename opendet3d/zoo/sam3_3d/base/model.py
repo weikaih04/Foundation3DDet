@@ -13,7 +13,10 @@ from opendet3d.op.detect3d.grounding_dino_3d import (
     RoI2Det3D,
 )
 from opendet3d.op.detect3d.geometry import UniDepthV2GeometryBackend
-from opendet3d.op.detect3d.early_depth_fusion import EarlyDepthFusion
+from opendet3d.op.detect3d.early_depth_fusion import (
+    EarlyDepthFusionLingbot,
+    EarlyDepthFusionUniDepthV2,
+)
 
 
 def get_sam3_3d_hyperparams_cfg(
@@ -164,7 +167,7 @@ def get_sam3_3d_cfg(
             LingbotDepthBackend,
             pretrained_model="robbyant/lingbot-depth-postrain-dc-vitl14",
             num_tokens=2400,
-            target_latent_dim=128,
+            target_latent_dim=256,
             depth_loss_weight=1.0,
             silog_loss_weight=0.5,
             monocular_prob=0.7,
@@ -175,20 +178,30 @@ def get_sam3_3d_cfg(
             detach_depth_latents=True,
             encoder_freeze_blocks=lingbot_encoder_freeze_blocks,
         )
-        depth_latent_dim = 128
+        # Neck level 1 outputs 256-dim, same as UniDepthV2
+        depth_latent_dim = 256
     else:
         geometry_backend = None
         depth_latent_dim = 128  # Default
 
-    # EarlyDepthFusion (Concat + Zero-init Project + Residual)
-    # More expressive: delta = W_P * P + W_D * D, output = P + delta
-    early_depth_fusion = class_config(
-        EarlyDepthFusion,
-        visual_dim=params.hidden_dim,  # 256 for SAM3
-        depth_dim=depth_latent_dim,    # 256 (no bottleneck)
-        fusion_type="concat_add",
-        zero_init=True,  # delta=0 at start, preserves pretrained features
-    )
+    # EarlyDepthFusion: pick variant based on geometry backend
+    if geometry_backend_type == "lingbot_depth":
+        # ControlNet-style: LayerNorm + depth-only projection
+        early_depth_fusion = class_config(
+            EarlyDepthFusionLingbot,
+            visual_dim=params.hidden_dim,
+            depth_dim=depth_latent_dim,
+            zero_init=True,
+        )
+    else:
+        # Concat-Add: [visual; depth] -> project -> residual add
+        early_depth_fusion = class_config(
+            EarlyDepthFusionUniDepthV2,
+            visual_dim=params.hidden_dim,
+            depth_dim=depth_latent_dim,
+            fusion_type="concat_add",
+            zero_init=True,
+        )
 
     # RoI2Det3D for inference (with NMS support)
     # Note: max_per_img not used - SAM3_3D already limits to 100 proposals per category

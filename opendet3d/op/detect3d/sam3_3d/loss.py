@@ -104,7 +104,7 @@ class SAM3_3DLossConfig:
     use_presence: bool = True  # Enable presence loss (per-category presence detection)
     presence_loss_weight: float = 20.0  # Weight for presence loss (SAM3 original: presence_weight: 20.0)
     presence_alpha: float = 0.5  # SAM3 original presence focal loss alpha
-    presence_gamma: float = 0.0  # SAM3 original presence focal loss gamma
+    presence_gamma: float = 0.0  # SAM3 original (gamma=0 = plain BCE, no focal weighting)
 
     # Box regression loss
     loss_bbox_weight: float = 5.0  # L1 loss weight
@@ -481,10 +481,16 @@ class SAM3_3DLoss(nn.Module):
 
         if geom_losses is not None:
             for key, value in geom_losses.items():
-                weight = getattr(self.config, f"loss_{key}_weight", 1.0)
-                losses[f"loss_{key}"] = (
-                    self.config.loss_geom_scale * value * weight
-                )
+                if key.startswith("metric_"):
+                    # Monitoring-only: log raw value, no scaling
+                    losses[key] = value.detach()
+                else:
+                    weight = getattr(
+                        self.config, f"loss_{key}_weight", 1.0
+                    )
+                    losses[f"loss_{key}"] = (
+                        self.config.loss_geom_scale * value * weight
+                    )
 
         if _PROFILE_LOSS:
             torch.cuda.synchronize()
@@ -724,12 +730,24 @@ class SAM3_3DLoss(nn.Module):
 
         # Sigmoid focal loss (following SAM3 original)
         # SAM3 uses: sigmoid_focal_loss(presence_logits, keep_loss, num_boxes=bs, alpha=0.5, gamma=0.0)
+        #
+        # Safety guards:
+        # 1. Clamp logits to [-30, 30] to prevent extreme sigmoid values
+        # 2. Force triton=False for gamma < 1.0 — triton kernel backward
+        #    computes gamma * p^(gamma-1) which gives 0*inf=NaN when gamma=0
+        #    or inf when gamma<1 and p is small. PyTorch autograd handles
+        #    gamma=0 correctly (pow gradient is optimized away).
+        # 3. gamma >= 1.0 is safe with triton (p^(gamma-1) bounded for p in [0,1])
+        presence_logits = presence_logits.clamp(-30, 30)
+
+        use_triton = self.config.presence_gamma >= 1.0
         loss_presence = sigmoid_focal_loss(
             presence_logits,
             presence_target,
             num_boxes=N_prompts,
             alpha=self.config.presence_alpha,
             gamma=self.config.presence_gamma,
+            triton=use_triton,
         )
 
         return loss_presence
@@ -893,6 +911,7 @@ class SAM3_3DLoss(nn.Module):
             target_boxes_pixel = target_boxes_xyxy
 
         loss_giou = 1 - fast_diag_generalized_box_iou(src_boxes_pixel, target_boxes_pixel)
+        loss_giou = torch.nan_to_num(loss_giou, nan=0.0, posinf=0.0, neginf=0.0)
         loss_giou = loss_giou.sum() / num_boxes
         losses["loss_giou"] = loss_giou
 
@@ -967,6 +986,9 @@ class SAM3_3DLoss(nn.Module):
             target_boxes_pixel = target_boxes
 
         loss_giou = 1 - fast_diag_generalized_box_iou(src_boxes_pixel, target_boxes_pixel)
+        # Guard: GIoU can produce NaN when boxes are degenerate (zero area,
+        # union=0). Replace NaN/Inf with 0 so these pairs don't contribute.
+        loss_giou = torch.nan_to_num(loss_giou, nan=0.0, posinf=0.0, neginf=0.0)
         loss_giou = loss_giou.sum() / num_boxes
 
         return loss_bbox, loss_giou
