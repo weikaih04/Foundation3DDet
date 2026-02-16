@@ -210,6 +210,8 @@ class EarlyDepthFusionLingbot(nn.Module):
             delta = self.proj(depth_resized)
             fused_feat = visual_feat + delta
 
+            self._last_delta_mean_abs = delta.detach().abs().mean().item()
+
             fused_feats.append(fused_feat)
 
         return fused_feats

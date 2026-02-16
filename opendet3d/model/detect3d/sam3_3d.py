@@ -846,12 +846,10 @@ class SAM3_3D(nn.Module):
                     backbone_out["backbone_fpn"] = fused_fpn
 
                 # Log fusion delta magnitude (monitoring only)
-                delta_val = getattr(
-                    self.early_depth_fusion, "_last_delta_mean_abs", None
-                )
-                if self.training and geom_losses is not None and delta_val is not None:
+                if self.training and geom_losses is not None:
                     geom_losses["metric_fusion_delta"] = torch.tensor(
-                        delta_val, device=device,
+                        self.early_depth_fusion._last_delta_mean_abs,
+                        device=device,
                     )
             else:
                 # Warn user that early depth fusion is configured but cannot run

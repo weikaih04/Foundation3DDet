@@ -13,7 +13,7 @@ Key Design Decisions:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import List, NamedTuple
 
 import torch
@@ -129,6 +129,20 @@ class SAM3_3DBatchedInputs:
             depth_mask=move(self.depth_mask),
         )
     
+    # Dict-like access for vis4d CallbackConnector compatibility.
+    # vis4d connectors use data[key] and (key in data) to extract fields.
+    def __getitem__(self, key: str):
+        """Dict-like access for vis4d connector compatibility."""
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        """Dict-like 'in' check for vis4d connector compatibility."""
+        return hasattr(self, key)
+
+    def keys(self):
+        """Dict-like keys() for vis4d connector compatibility."""
+        return [f.name for f in fields(self)]
+
     @property
     def num_images(self) -> int:
         """Number of unique images."""
