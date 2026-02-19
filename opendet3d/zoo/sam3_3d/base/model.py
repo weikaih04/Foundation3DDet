@@ -123,6 +123,7 @@ def get_sam3_3d_cfg(
     geometry_backend_type: str = "unidepth_v2",
     lingbot_encoder_freeze_blocks: int = 0,
     backbone_freeze_blocks: int = 0,
+    oracle_eval: bool = False,
 ) -> tuple[ConfigDict, ConfigDict]:
     """Get SAM3_3D model configuration.
 
@@ -133,6 +134,8 @@ def get_sam3_3d_cfg(
             If provided, sam3_checkpoint is ignored.
         geometry_backend_type: Type of geometry backend.
         backbone_freeze_blocks: Number of SAM3 ViT blocks to freeze (0=none, 30=last 2 trainable).
+        oracle_eval: If True, use oracle evaluation mode (top-1 per prompt,
+            no NMS) for measuring 3D regression with GT box prompts.
 
     Returns:
         Tuple of (model_cfg, box_coder_cfg).
@@ -227,6 +230,7 @@ def get_sam3_3d_cfg(
         roi2det3d=roi2det3d,
         early_depth_fusion=early_depth_fusion,
         backbone_freeze_blocks=backbone_freeze_blocks,
+        oracle_eval=oracle_eval,
     )
 
     return model, box_coder

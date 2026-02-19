@@ -305,6 +305,8 @@ class SAM3_3DCollator:
         # Geometry prompt options (NEW: text + geometry training)
         use_geometry_prompts: bool = False,  # If True, create geometry queries per category
         geometric_query_str: str = "geometric",  # Text for geometry queries (SAM3 convention)
+        # Oracle evaluation mode (GT box as geometry prompt)
+        oracle_eval: bool = False,  # If True, each GT box = one geometry prompt
     ):
         """Initialize collator.
 
@@ -335,6 +337,9 @@ class SAM3_3DCollator:
                 - Each category gets 1 TEXT query (one-to-many targets)
                 - Each category gets 1 GEOMETRY query (one-to-one target)
             geometric_query_str: Text for geometry queries (default "geometric")
+            oracle_eval: If True, each GT 2D box becomes its own geometry
+                prompt (one-to-one). For measuring 3D regression quality
+                in isolation, following DetAny3D's GT prompt evaluation.
         """
         self.max_prompts_per_image = max_prompts_per_image
         self.use_text_prompts = use_text_prompts
@@ -358,6 +363,9 @@ class SAM3_3DCollator:
         # Geometry prompt options (SAM3 style text + geometry training)
         self.use_geometry_prompts = use_geometry_prompts
         self.geometric_query_str = geometric_query_str
+
+        # Oracle evaluation mode
+        self.oracle_eval = oracle_eval
 
     def _sample_num_points(self, num_spec: int | tuple[int, int]) -> int:
         """Sample number of points from spec."""
@@ -601,168 +609,218 @@ class SAM3_3DCollator:
         unique_texts = []
         text_to_id = {}
 
+        # Helper function to normalize box to xyxy [0,1]
+        def normalize_box_xyxy(box_xyxy_raw):
+            if isinstance(box_xyxy_raw, torch.Tensor):
+                gt_box_norm = box_xyxy_raw.clone().float()
+            else:
+                gt_box_norm = torch.tensor(box_xyxy_raw, dtype=torch.float32)
+            gt_box_norm[0::2] /= W
+            gt_box_norm[1::2] /= H
+            return gt_box_norm.to(device)
+
+        # Helper function to convert xyxy to cxcywh
+        def xyxy_to_cxcywh(box_norm_xyxy):
+            cx = (box_norm_xyxy[0] + box_norm_xyxy[2]) / 2
+            cy = (box_norm_xyxy[1] + box_norm_xyxy[3]) / 2
+            w_box = box_norm_xyxy[2] - box_norm_xyxy[0]
+            h_box = box_norm_xyxy[3] - box_norm_xyxy[1]
+            return torch.tensor([cx, cy, w_box, h_box], device=device)
+
         profile_start("  collator_category_group")
-        for img_idx, sample in enumerate(batch):
-            boxes2d = sample.get("boxes2d")  # (N_i, 4) pixel xyxy
-            boxes3d = sample.get("boxes3d")  # (N_i, 7+)
-            class_ids = sample.get("boxes2d_classes")  # (N_i,)
-            class_names = sample.get("boxes2d_names", None)  # List[str] or None
-            masks2d = sample.get("masks2d", None)  # (N_i, H, W) or None
 
-            if boxes2d is None or len(boxes2d) == 0:
-                continue
+        if self.oracle_eval:
+            # ========== Oracle Mode: Each GT box = one geometry prompt ==========
+            # Following DetAny3D's GT prompt evaluation approach.
+            # One-to-one mapping: each GT box becomes a separate geometry
+            # prompt, model predicts 3D for each box independently.
+            geo_text = self.geometric_query_str
+            if geo_text not in text_to_id:
+                text_to_id[geo_text] = len(unique_texts)
+                unique_texts.append(geo_text)
+            geo_text_id = text_to_id[geo_text]
 
-            # ========== SAM3 Original: Group boxes by category ==========
-            # This is the key difference from the old per-box design
-            cat_to_box_indices = defaultdict(list)
-            for box_idx in range(len(boxes2d)):
-                if class_ids is not None:
-                    cat_id = class_ids[box_idx]
-                    if isinstance(cat_id, torch.Tensor):
-                        cat_id = cat_id.item()
+            for img_idx, sample in enumerate(batch):
+                boxes2d = sample.get("boxes2d")
+                boxes3d = sample.get("boxes3d")
+                class_ids = sample.get("boxes2d_classes")
+
+                if boxes2d is None or len(boxes2d) == 0:
+                    continue
+
+                # During test, boxes2d are in original pixel space (test
+                # transforms don't include ResizeBoxes2D / CenterPadBoxes2D).
+                # Transform to padded pixel space using the SAME math as
+                # _forward_test's inverse (subtract pad, divide scale), reversed:
+                #   original -> padded: x * scale_x + pad_left
+                # where scale_x = content_w / orig_w (from _forward_test)
+                original_hw = sample.get("original_hw", None)
+                pad_info = sample.get("padding", None)
+
+                # DEBUG: print once to verify transform is applied
+                if img_idx == 0 and not hasattr(self, '_collator_debug_printed'):
+                    self._collator_debug_printed = True
+                    print(f"[COLLATOR DEBUG] original_hw={original_hw}, "
+                          f"type={type(original_hw)}")
+                    print(f"[COLLATOR DEBUG] padding={pad_info}, "
+                          f"type={type(pad_info)}")
+                    print(f"[COLLATOR DEBUG] condition={(original_hw is not None and pad_info is not None)}")
+                    print(f"[COLLATOR DEBUG] boxes2d[0]={boxes2d[0]}, "
+                          f"type={type(boxes2d[0])}")
+                    print(f"[COLLATOR DEBUG] H={H}, W={W}")
+
+                if original_hw is not None and pad_info is not None:
+                    orig_h, orig_w = original_hw
+                    if isinstance(orig_h, torch.Tensor):
+                        orig_h, orig_w = orig_h.item(), orig_w.item()
+                    pad_left, pad_right, pad_top, pad_bottom = pad_info
+                    if isinstance(pad_left, torch.Tensor):
+                        pad_left = pad_left.item()
+                        pad_right = pad_right.item()
+                        pad_top = pad_top.item()
+                        pad_bottom = pad_bottom.item()
+                    content_w = W - pad_left - pad_right
+                    content_h = H - pad_top - pad_bottom
+                    scale_x = content_w / orig_w
+                    scale_y = content_h / orig_h
+
+                    def transform_box_to_padded(box_raw):
+                        """Transform box: original pixel -> padded pixel."""
+                        if isinstance(box_raw, torch.Tensor):
+                            box = box_raw.clone().float()
+                        else:
+                            box = torch.tensor(box_raw, dtype=torch.float32)
+                        box[0::2] = box[0::2] * scale_x + pad_left
+                        box[1::2] = box[1::2] * scale_y + pad_top
+                        return box
                 else:
-                    cat_id = 0  # Default category if no class info
-                cat_to_box_indices[cat_id].append(box_idx)
+                    def transform_box_to_padded(box_raw):
+                        if isinstance(box_raw, torch.Tensor):
+                            return box_raw.clone().float()
+                        return torch.tensor(box_raw, dtype=torch.float32)
 
-            # Limit number of categories (queries) per image
-            categories = list(cat_to_box_indices.keys())
-            if len(categories) > self.max_prompts_per_image:
-                categories = categories[:self.max_prompts_per_image]
+                for box_idx in range(len(boxes2d)):
+                    img_ids_list.append(img_idx)
 
-            # ========== Create queries per category ==========
-            # If use_geometry_prompts=True: Create TWO queries per category
-            #   - TEXT query (one-to-many targets)
-            #   - GEOMETRY query (one-to-one target)
-            # If use_geometry_prompts=False: Original text/visual random selection
-            for cat_id in categories:
-                box_indices = cat_to_box_indices[cat_id]
-
-                # Get category name for text
-                if self.use_text_prompts and class_names is not None:
-                    cat_name = class_names[cat_id] if cat_id < len(class_names) else self.default_text
-                else:
-                    cat_name = self.default_text
-
-                # Helper function to normalize box to xyxy [0,1]
-                def normalize_box_xyxy(box_xyxy_raw):
-                    if isinstance(box_xyxy_raw, torch.Tensor):
-                        gt_box_norm = box_xyxy_raw.clone().float()
+                    # Category ID
+                    if class_ids is not None:
+                        cat_id = class_ids[box_idx]
+                        if isinstance(cat_id, torch.Tensor):
+                            cat_id = cat_id.item()
                     else:
-                        gt_box_norm = torch.tensor(box_xyxy_raw, dtype=torch.float32)
-                    gt_box_norm[0::2] /= W
-                    gt_box_norm[1::2] /= H
-                    return gt_box_norm.to(device)
-
-                # Helper function to convert xyxy to cxcywh
-                def xyxy_to_cxcywh(box_norm_xyxy):
-                    cx = (box_norm_xyxy[0] + box_norm_xyxy[2]) / 2
-                    cy = (box_norm_xyxy[1] + box_norm_xyxy[3]) / 2
-                    w_box = box_norm_xyxy[2] - box_norm_xyxy[0]
-                    h_box = box_norm_xyxy[3] - box_norm_xyxy[1]
-                    return torch.tensor([cx, cy, w_box, h_box], device=device)
-
-                if self.use_geometry_prompts:
-                    # ========== NEW: Text + Geometry Training ==========
-                    # Create TWO queries per category
-
-                    # ----- Query 1: TEXT query (one-to-many) -----
-                    img_ids_list.append(img_idx)
+                        cat_id = 0
                     gt_category_ids_list.append(cat_id)
-                    query_types_list.append(0)  # TEXT
-                    is_visual_query_list.append(False)
 
-                    # Text = category name
-                    if cat_name not in text_to_id:
-                        text_to_id[cat_name] = len(unique_texts)
-                        unique_texts.append(cat_name)
-                    text_ids_list.append(text_to_id[cat_name])
-
-                    # No geometry prompt for text query
-                    geo_boxes_list.append(None)
-
-                    # Targets: ALL boxes of this category (one-to-many)
-                    query_gt_boxes2d = []
-                    query_gt_boxes3d = []
-                    for box_idx in box_indices:
-                        query_gt_boxes2d.append(normalize_box_xyxy(boxes2d[box_idx]))
-                        if boxes3d is not None and box_idx < len(boxes3d):
-                            query_gt_boxes3d.append(boxes3d[box_idx].to(device))
-                    gt_boxes2d_per_query.append(query_gt_boxes2d)
-                    gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
-
-                    # ----- Query 2: GEOMETRY query (one-to-one) -----
-                    img_ids_list.append(img_idx)
-                    gt_category_ids_list.append(cat_id)
+                    # Geometry query type
                     query_types_list.append(2)  # GEOMETRY
                     is_visual_query_list.append(True)
+                    text_ids_list.append(geo_text_id)
 
-                    # Text = "geometric" (SAM3 convention)
-                    if self.geometric_query_str not in text_to_id:
-                        text_to_id[self.geometric_query_str] = len(unique_texts)
-                        unique_texts.append(self.geometric_query_str)
-                    text_ids_list.append(text_to_id[self.geometric_query_str])
-
-                    # Randomly select ONE box as geometry prompt
-                    selected_idx = random.choice(box_indices)
-                    box_xyxy = boxes2d[selected_idx]
-                    box_xyxy_np = box_xyxy.cpu().numpy() if isinstance(box_xyxy, torch.Tensor) else box_xyxy
-
-                    # Optionally add noise (using SAM3's noise_box logic)
-                    if self.box_noise_std > 0:
-                        box_xyxy_np = noise_box(
-                            box_xyxy_np,
-                            im_size=(H, W),
-                            box_noise_std=self.box_noise_std,
-                            box_noise_max=self.box_noise_max,
-                        )
-
-                    # Convert to normalized cxcywh for geometry encoder
-                    box_norm_xyxy = torch.tensor([
-                        box_xyxy_np[0] / W,
-                        box_xyxy_np[1] / H,
-                        box_xyxy_np[2] / W,
-                        box_xyxy_np[3] / H,
-                    ], dtype=torch.float32, device=device)
+                    # Transform box to padded pixel space, then normalize
+                    box_padded = transform_box_to_padded(boxes2d[box_idx])
+                    # DEBUG: print first box transform
+                    if img_idx == 0 and box_idx == 0 and hasattr(self, '_collator_debug_printed'):
+                        print(f"[COLLATOR DEBUG] orig={boxes2d[box_idx]}, "
+                              f"padded={box_padded}")
+                    box_norm_xyxy = normalize_box_xyxy(box_padded)
                     geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
 
-                    # Target: ONLY the selected box (one-to-one)
-                    query_gt_boxes2d = [normalize_box_xyxy(boxes2d[selected_idx])]
-                    query_gt_boxes3d = []
-                    if boxes3d is not None and selected_idx < len(boxes3d):
-                        query_gt_boxes3d.append(boxes3d[selected_idx].to(device))
-                    gt_boxes2d_per_query.append(query_gt_boxes2d)
-                    gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
-
-                else:
-                    # ========== Original: Text/Visual random selection ==========
-                    img_ids_list.append(img_idx)
-                    gt_category_ids_list.append(cat_id)
-
-                    # Decide query type: text-only or visual
-                    is_text_query = random.random() < self.text_query_prob
-                    is_visual_query = not is_text_query
-
-                    # Track query type (0=TEXT for both text and visual in original mode)
-                    query_types_list.append(0 if is_text_query else 1)  # 1=VISUAL
-                    is_visual_query_list.append(is_visual_query)
-
-                    # Determine text for this query
-                    if is_visual_query and not self.keep_text_for_visual:
-                        text = "visual"
+                    # Target = this single box (one-to-one)
+                    gt_boxes2d_per_query.append(
+                        [normalize_box_xyxy(boxes2d[box_idx])]
+                    )
+                    if boxes3d is not None and box_idx < len(boxes3d):
+                        gt_boxes3d_per_query.append(
+                            [boxes3d[box_idx].to(device)]
+                        )
                     else:
-                        text = cat_name
+                        gt_boxes3d_per_query.append(None)
 
-                    if text not in text_to_id:
-                        text_to_id[text] = len(unique_texts)
-                        unique_texts.append(text)
-                    text_ids_list.append(text_to_id[text])
+        else:
+            # ========== Standard Mode: Group by category ==========
+            for img_idx, sample in enumerate(batch):
+                boxes2d = sample.get("boxes2d")  # (N_i, 4) pixel xyxy
+                boxes3d = sample.get("boxes3d")  # (N_i, 7+)
+                class_ids = sample.get("boxes2d_classes")  # (N_i,)
+                class_names = sample.get("boxes2d_names", None)  # List[str] or None
+                masks2d = sample.get("masks2d", None)  # (N_i, H, W) or None
 
-                    # Visual query: pick one target as geo_box
-                    if is_visual_query and self.use_box_prompts:
+                if boxes2d is None or len(boxes2d) == 0:
+                    continue
+
+                # ========== SAM3 Original: Group boxes by category ==========
+                cat_to_box_indices = defaultdict(list)
+                for box_idx in range(len(boxes2d)):
+                    if class_ids is not None:
+                        cat_id = class_ids[box_idx]
+                        if isinstance(cat_id, torch.Tensor):
+                            cat_id = cat_id.item()
+                    else:
+                        cat_id = 0
+                    cat_to_box_indices[cat_id].append(box_idx)
+
+                # Limit number of categories (queries) per image
+                categories = list(cat_to_box_indices.keys())
+                if len(categories) > self.max_prompts_per_image:
+                    categories = categories[:self.max_prompts_per_image]
+
+                # ========== Create queries per category ==========
+                for cat_id in categories:
+                    box_indices = cat_to_box_indices[cat_id]
+
+                    # Get category name for text
+                    if self.use_text_prompts and class_names is not None:
+                        cat_name = class_names[cat_id] if cat_id < len(class_names) else self.default_text
+                    else:
+                        cat_name = self.default_text
+
+                    if self.use_geometry_prompts:
+                        # ========== Text + Geometry Training ==========
+                        # Create TWO queries per category
+
+                        # ----- Query 1: TEXT query (one-to-many) -----
+                        img_ids_list.append(img_idx)
+                        gt_category_ids_list.append(cat_id)
+                        query_types_list.append(0)  # TEXT
+                        is_visual_query_list.append(False)
+
+                        # Text = category name
+                        if cat_name not in text_to_id:
+                            text_to_id[cat_name] = len(unique_texts)
+                            unique_texts.append(cat_name)
+                        text_ids_list.append(text_to_id[cat_name])
+
+                        # No geometry prompt for text query
+                        geo_boxes_list.append(None)
+
+                        # Targets: ALL boxes of this category (one-to-many)
+                        query_gt_boxes2d = []
+                        query_gt_boxes3d = []
+                        for box_idx in box_indices:
+                            query_gt_boxes2d.append(normalize_box_xyxy(boxes2d[box_idx]))
+                            if boxes3d is not None and box_idx < len(boxes3d):
+                                query_gt_boxes3d.append(boxes3d[box_idx].to(device))
+                        gt_boxes2d_per_query.append(query_gt_boxes2d)
+                        gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+
+                        # ----- Query 2: GEOMETRY query (one-to-one) -----
+                        img_ids_list.append(img_idx)
+                        gt_category_ids_list.append(cat_id)
+                        query_types_list.append(2)  # GEOMETRY
+                        is_visual_query_list.append(True)
+
+                        # Text = "geometric" (SAM3 convention)
+                        if self.geometric_query_str not in text_to_id:
+                            text_to_id[self.geometric_query_str] = len(unique_texts)
+                            unique_texts.append(self.geometric_query_str)
+                        text_ids_list.append(text_to_id[self.geometric_query_str])
+
+                        # Randomly select ONE box as geometry prompt
                         selected_idx = random.choice(box_indices)
                         box_xyxy = boxes2d[selected_idx]
                         box_xyxy_np = box_xyxy.cpu().numpy() if isinstance(box_xyxy, torch.Tensor) else box_xyxy
 
+                        # Optionally add noise (using SAM3's noise_box logic)
                         if self.box_noise_std > 0:
                             box_xyxy_np = noise_box(
                                 box_xyxy_np,
@@ -771,6 +829,7 @@ class SAM3_3DCollator:
                                 box_noise_max=self.box_noise_max,
                             )
 
+                        # Convert to normalized cxcywh for geometry encoder
                         box_norm_xyxy = torch.tensor([
                             box_xyxy_np[0] / W,
                             box_xyxy_np[1] / H,
@@ -778,18 +837,72 @@ class SAM3_3DCollator:
                             box_xyxy_np[3] / H,
                         ], dtype=torch.float32, device=device)
                         geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
-                    else:
-                        geo_boxes_list.append(None)
 
-                    # Multi-instance targets: ALL boxes of this category
-                    query_gt_boxes2d = []
-                    query_gt_boxes3d = []
-                    for box_idx in box_indices:
-                        query_gt_boxes2d.append(normalize_box_xyxy(boxes2d[box_idx]))
-                        if boxes3d is not None and box_idx < len(boxes3d):
-                            query_gt_boxes3d.append(boxes3d[box_idx].to(device))
-                    gt_boxes2d_per_query.append(query_gt_boxes2d)
-                    gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+                        # Target: ONLY the selected box (one-to-one)
+                        query_gt_boxes2d = [normalize_box_xyxy(boxes2d[selected_idx])]
+                        query_gt_boxes3d = []
+                        if boxes3d is not None and selected_idx < len(boxes3d):
+                            query_gt_boxes3d.append(boxes3d[selected_idx].to(device))
+                        gt_boxes2d_per_query.append(query_gt_boxes2d)
+                        gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+
+                    else:
+                        # ========== Original: Text/Visual random selection ==========
+                        img_ids_list.append(img_idx)
+                        gt_category_ids_list.append(cat_id)
+
+                        # Decide query type: text-only or visual
+                        is_text_query = random.random() < self.text_query_prob
+                        is_visual_query = not is_text_query
+
+                        # Track query type (0=TEXT for both text and visual in original mode)
+                        query_types_list.append(0 if is_text_query else 1)  # 1=VISUAL
+                        is_visual_query_list.append(is_visual_query)
+
+                        # Determine text for this query
+                        if is_visual_query and not self.keep_text_for_visual:
+                            text = "visual"
+                        else:
+                            text = cat_name
+
+                        if text not in text_to_id:
+                            text_to_id[text] = len(unique_texts)
+                            unique_texts.append(text)
+                        text_ids_list.append(text_to_id[text])
+
+                        # Visual query: pick one target as geo_box
+                        if is_visual_query and self.use_box_prompts:
+                            selected_idx = random.choice(box_indices)
+                            box_xyxy = boxes2d[selected_idx]
+                            box_xyxy_np = box_xyxy.cpu().numpy() if isinstance(box_xyxy, torch.Tensor) else box_xyxy
+
+                            if self.box_noise_std > 0:
+                                box_xyxy_np = noise_box(
+                                    box_xyxy_np,
+                                    im_size=(H, W),
+                                    box_noise_std=self.box_noise_std,
+                                    box_noise_max=self.box_noise_max,
+                                )
+
+                            box_norm_xyxy = torch.tensor([
+                                box_xyxy_np[0] / W,
+                                box_xyxy_np[1] / H,
+                                box_xyxy_np[2] / W,
+                                box_xyxy_np[3] / H,
+                            ], dtype=torch.float32, device=device)
+                            geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
+                        else:
+                            geo_boxes_list.append(None)
+
+                        # Multi-instance targets: ALL boxes of this category
+                        query_gt_boxes2d = []
+                        query_gt_boxes3d = []
+                        for box_idx in box_indices:
+                            query_gt_boxes2d.append(normalize_box_xyxy(boxes2d[box_idx]))
+                            if boxes3d is not None and box_idx < len(boxes3d):
+                                query_gt_boxes3d.append(boxes3d[box_idx].to(device))
+                        gt_boxes2d_per_query.append(query_gt_boxes2d)
+                        gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
 
         profile_stop("  collator_category_group")
 

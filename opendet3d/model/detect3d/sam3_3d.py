@@ -28,7 +28,7 @@ from typing import List, NamedTuple, Optional
 
 import torch
 from torch import Tensor, nn
-from torchvision.ops import nms, batched_nms
+from torchvision.ops import nms, batched_nms, box_iou
 
 from opendet3d.utils.profiler import profile_start, profile_stop, profile_step
 
@@ -331,6 +331,9 @@ class SAM3_3D(nn.Module):
 
         # ========== Freeze Settings ==========
         backbone_freeze_blocks: int = 0,
+
+        # ========== Oracle Evaluation ==========
+        oracle_eval: bool = False,
     ) -> None:
         """Initialize SAM3_3D.
 
@@ -348,6 +351,9 @@ class SAM3_3D(nn.Module):
                 freeze (from the beginning). SAM3 has 32 blocks; e.g. 30
                 freezes blocks[0..29], only training the last 2.
                 0 means no freezing.
+            oracle_eval: If True, use oracle evaluation mode where each
+                prompt gets top-1 prediction (no NMS, no score filtering).
+                For measuring 3D regression quality with GT box prompts.
         """
         super().__init__()
 
@@ -379,6 +385,7 @@ class SAM3_3D(nn.Module):
 
         self.sam3 = sam3_model
         self.hidden_dim = sam3_model.hidden_dim
+        self.oracle_eval = oracle_eval
 
         # 3D-MOOD components
         self.box_coder = box_coder or GroundingDINO3DCoder()
@@ -1256,57 +1263,106 @@ class SAM3_3D(nn.Module):
             else:
                 img_class_ids = torch.zeros(n_prompts_this_img, dtype=torch.long, device=device)
 
-            # Flatten all predictions: (n_prompts, S) -> (n_prompts * S,)
-            # Each prompt outputs S=100 predictions, we want ALL of them for multi-instance detection
-            img_scores_flat = img_scores.flatten()  # (n_prompts * S,)
-            img_boxes_flat = img_boxes.reshape(-1, 4)  # (n_prompts * S, 4)
+            if self.oracle_eval:
+                # Oracle mode: IoU top-K + highest confidence
+                # 1. Compute 2D IoU between each proposal and its GT box
+                # 2. Take top-K proposals by IoU (well-localized candidates)
+                # 3. Among top-K, pick highest confidence (best quality)
+                oracle_topk = int(os.environ.get("SAM3_ORACLE_TOPK", "10"))
+                prompt_indices = torch.arange(n_prompts_this_img, device=device)
+                best_indices = torch.zeros(n_prompts_this_img, dtype=torch.long, device=device)
 
-            # Expand class_ids to match flattened shape
-            # Each prompt has S predictions, all with the same class_id
-            img_class_ids_flat = img_class_ids.unsqueeze(1).expand(-1, S).flatten()  # (n_prompts * S,)
+                if batch.geo_boxes is not None:
+                    # geo_boxes is in padded-normalized cxcywh (correct space)
+                    img_geo_boxes = batch.geo_boxes[prompt_mask]  # (n_prompts, max_K, 4)
+                    gt_cxcywh = img_geo_boxes[:, 0, :]  # (n_prompts, 4)
+                    gt_xyxy_norm = box_cxcywh_to_xyxy(gt_cxcywh)
+                    gt_boxes_pixel = gt_xyxy_norm.clone()
+                    gt_boxes_pixel[:, 0::2] *= W
+                    gt_boxes_pixel[:, 1::2] *= H
 
-            # Get 3D boxes if available (flattened)
-            if pred_boxes_3d is not None:
-                img_boxes3d = pred_boxes_3d[prompt_mask]  # (n_prompts, S, 12)
-                img_boxes3d_flat = img_boxes3d.reshape(-1, 12)  # (n_prompts * S, 12)
-            else:
-                img_boxes3d_flat = None
+                    K = min(oracle_topk, S)
+                    for p_idx in range(n_prompts_this_img):
+                        ious = box_iou(
+                            img_boxes[p_idx], gt_boxes_pixel[p_idx].unsqueeze(0)
+                        ).squeeze(-1)  # (S,)
+                        # Top-K by IoU
+                        _, topk_iou_indices = ious.topk(K)
+                        # Among top-K, pick highest confidence
+                        topk_scores = img_scores[p_idx][topk_iou_indices]
+                        best_in_topk = topk_scores.argmax()
+                        best_indices[p_idx] = topk_iou_indices[best_in_topk]
 
-            # No topk filtering here - keep all 100 proposals per category
-            # SAM3_3D outputs S=100 proposals per prompt, each prompt is one category
-            # Evaluator does per-category matching anyway, so no need to limit here
-            # This ensures fair evaluation across all categories
-
-            # Score threshold filter
-            if score_threshold > 0:
-                keep = img_scores_flat > score_threshold
-                img_scores_flat = img_scores_flat[keep]
-                img_boxes_flat = img_boxes_flat[keep]
-                img_class_ids_flat = img_class_ids_flat[keep]
-                if img_boxes3d_flat is not None:
-                    img_boxes3d_flat = img_boxes3d_flat[keep]
-
-            # NMS based on 2D boxes (following 3D-MOOD's RoI2Det3D design)
-            # NMS is applied in resize space before rescaling to original space
-            if use_nms and len(img_boxes_flat) > 0:
-                n_before_nms = len(img_boxes_flat)
-                if class_agnostic_nms:
-                    # Class-agnostic NMS: treat all boxes as same class
-                    keep = nms(img_boxes_flat, img_scores_flat, iou_threshold)
+                    if img_idx == 0 and not hasattr(self, '_oracle_debug_printed'):
+                        self._oracle_debug_printed = True
+                        p0_ious = box_iou(
+                            img_boxes[0], gt_boxes_pixel[0].unsqueeze(0)
+                        ).squeeze(-1)
+                        sel = best_indices[0].item()
+                        print(
+                            f"[ORACLE] topK={K}, "
+                            f"GT={gt_boxes_pixel[0].tolist()}, "
+                            f"sel={img_boxes[0][sel].tolist()}, "
+                            f"IoU={p0_ious[sel]:.4f}, "
+                            f"score={img_scores[0][sel]:.4f}, "
+                            f"maxIoU={p0_ious.max():.4f}"
+                        )
                 else:
-                    # Class-aware NMS: only suppress within same class
-                    keep = batched_nms(
-                        img_boxes_flat, img_scores_flat, img_class_ids_flat, iou_threshold
-                    )
-                img_scores_flat = img_scores_flat[keep]
-                img_boxes_flat = img_boxes_flat[keep]
-                img_class_ids_flat = img_class_ids_flat[keep]
-                if img_boxes3d_flat is not None:
-                    img_boxes3d_flat = img_boxes3d_flat[keep]
-                # Debug: print NMS effect (only for first image of first batch)
-                if img_idx == 0:
-                    n_after_nms = len(img_boxes_flat)
-                    print(f"[NMS DEBUG] img={img_idx}, before={n_before_nms}, after={n_after_nms}, suppressed={n_before_nms - n_after_nms}, iou_thresh={iou_threshold}")
+                    # Fallback: pure argmax
+                    best_indices = img_scores.argmax(dim=1)
+
+                img_scores_flat = img_scores[prompt_indices, best_indices]
+                img_boxes_flat = img_boxes[prompt_indices, best_indices]
+                img_class_ids_flat = img_class_ids
+
+                if pred_boxes_3d is not None:
+                    img_boxes3d = pred_boxes_3d[prompt_mask]
+                    img_boxes3d_flat = img_boxes3d[prompt_indices, best_indices]
+                else:
+                    img_boxes3d_flat = None
+
+            else:
+                # Standard mode: flatten all proposals + NMS
+                # Flatten all predictions: (n_prompts, S) -> (n_prompts * S,)
+                img_scores_flat = img_scores.flatten()  # (n_prompts * S,)
+                img_boxes_flat = img_boxes.reshape(-1, 4)  # (n_prompts * S, 4)
+
+                # Expand class_ids to match flattened shape
+                img_class_ids_flat = img_class_ids.unsqueeze(1).expand(-1, S).flatten()  # (n_prompts * S,)
+
+                # Get 3D boxes if available (flattened)
+                if pred_boxes_3d is not None:
+                    img_boxes3d = pred_boxes_3d[prompt_mask]  # (n_prompts, S, 12)
+                    img_boxes3d_flat = img_boxes3d.reshape(-1, 12)  # (n_prompts * S, 12)
+                else:
+                    img_boxes3d_flat = None
+
+                # Score threshold filter
+                if score_threshold > 0:
+                    keep = img_scores_flat > score_threshold
+                    img_scores_flat = img_scores_flat[keep]
+                    img_boxes_flat = img_boxes_flat[keep]
+                    img_class_ids_flat = img_class_ids_flat[keep]
+                    if img_boxes3d_flat is not None:
+                        img_boxes3d_flat = img_boxes3d_flat[keep]
+
+                # NMS based on 2D boxes (following 3D-MOOD's RoI2Det3D design)
+                if use_nms and len(img_boxes_flat) > 0:
+                    n_before_nms = len(img_boxes_flat)
+                    if class_agnostic_nms:
+                        keep = nms(img_boxes_flat, img_scores_flat, iou_threshold)
+                    else:
+                        keep = batched_nms(
+                            img_boxes_flat, img_scores_flat, img_class_ids_flat, iou_threshold
+                        )
+                    img_scores_flat = img_scores_flat[keep]
+                    img_boxes_flat = img_boxes_flat[keep]
+                    img_class_ids_flat = img_class_ids_flat[keep]
+                    if img_boxes3d_flat is not None:
+                        img_boxes3d_flat = img_boxes3d_flat[keep]
+                    if img_idx == 0:
+                        n_after_nms = len(img_boxes_flat)
+                        print(f"[NMS DEBUG] img={img_idx}, before={n_before_nms}, after={n_after_nms}, suppressed={n_before_nms - n_after_nms}, iou_thresh={iou_threshold}")
 
             # Decode 3D boxes in padded space BEFORE rescaling (matching GDino3D)
             # Use padded-space intrinsics (batch.intrinsics) since 2D boxes are

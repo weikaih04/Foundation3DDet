@@ -23,8 +23,11 @@ from vis4d.zoo.base import (
 from .connector import SAM3_3DCollator
 
 
-# Default collator instance (module-level for vis4d compatibility)
+# Default collator instances (module-level for vis4d compatibility).
+# vis4d's DelayedInstantiator resolves functions by module path + __name__,
+# so module-level functions must exist for each variant.
 _default_collator = None
+_oracle_collator = None
 
 
 def sam3_3d_collate_fn(batch: List[dict], **kwargs):
@@ -54,6 +57,29 @@ def sam3_3d_collate_fn(batch: List[dict], **kwargs):
     return _default_collator(batch)
 
 
+def sam3_3d_oracle_collate_fn(batch: List[dict], **kwargs):
+    """Oracle SAM3_3D collate function (module-level for vis4d).
+
+    Each GT 2D box becomes its own geometry prompt (one-to-one mapping).
+    Used for measuring pure 3D regression quality with GT box prompts.
+
+    Args:
+        batch: List of data samples
+        **kwargs: Additional arguments from vis4d (e.g., collate_keys)
+
+    Returns:
+        Collated batch data
+    """
+    global _oracle_collator
+    if _oracle_collator is None:
+        _oracle_collator = SAM3_3DCollator(
+            max_prompts_per_image=50,
+            use_text_prompts=True,
+            oracle_eval=True,
+        )
+    return _oracle_collator(batch)
+
+
 def create_sam3_3d_collate_fn(
     max_prompts_per_image: int = 50,
     use_text_prompts: bool = True,
@@ -64,6 +90,8 @@ def create_sam3_3d_collate_fn(
     geometric_query_str: str = "geometric",
     box_noise_std: float = 0.0,
     box_noise_max: float | None = 20.0,
+    # Oracle evaluation mode
+    oracle_eval: bool = False,
 ):
     """Create a configured SAM3_3D collate function.
 
@@ -87,6 +115,8 @@ def create_sam3_3d_collate_fn(
         geometric_query_str: Text for geometry queries (default "geometric")
         box_noise_std: Noise std for box jittering (0 = no noise)
         box_noise_max: Max noise in pixels
+        oracle_eval: If True, each GT 2D box becomes its own geometry
+            prompt for measuring 3D regression quality in isolation.
 
     Returns:
         Configured collate function
@@ -100,14 +130,20 @@ def create_sam3_3d_collate_fn(
         geometric_query_str=geometric_query_str,
         box_noise_std=box_noise_std,
         box_noise_max=box_noise_max,
+        oracle_eval=oracle_eval,
     )
 
-    def collate_fn(batch: List[dict]):
+    def collate_fn(batch: List[dict], **kwargs):
         """Collate function for SAM3_3D."""
         return collator(batch)
 
-    # Set name for vis4d compatibility
-    collate_fn.__name__ = "sam3_3d_collate_fn"
+    # Set name for vis4d compatibility.
+    # vis4d's DelayedInstantiator resolves by module path + __name__,
+    # so the name must match a module-level function.
+    if oracle_eval:
+        collate_fn.__name__ = "sam3_3d_oracle_collate_fn"
+    else:
+        collate_fn.__name__ = "sam3_3d_collate_fn"
     collate_fn.__module__ = __name__
 
     return collate_fn
@@ -133,6 +169,8 @@ def get_sam3_3d_data_cfg(
     # Test-specific collator options (for pure text evaluation like GDino3D)
     test_text_query_prob: float = 1.0,
     test_use_geometry_prompts: bool = False,
+    # Oracle evaluation mode
+    oracle_eval: bool = False,
 ) -> DataConfig:
     """Get the data config for SAM3_3D with custom collator.
 
@@ -169,6 +207,9 @@ def get_sam3_3d_data_cfg(
             1.0 = pure text evaluation (like GDino3D)
         test_use_geometry_prompts: Whether to use geometry prompts during test
             False = pure text evaluation (like GDino3D)
+        oracle_eval: If True, test collator uses oracle mode where each GT
+            2D box becomes its own geometry prompt (one-to-one). Only
+            affects test collator; training is unchanged.
 
     Returns:
         DataConfig with train and test dataloaders
@@ -197,6 +238,7 @@ def get_sam3_3d_data_cfg(
         geometric_query_str=geometric_query_str,
         box_noise_std=0.0,  # No noise during test
         box_noise_max=None,
+        oracle_eval=oracle_eval,  # Oracle mode for GT box prompting
     )
 
     # Train dataloader
