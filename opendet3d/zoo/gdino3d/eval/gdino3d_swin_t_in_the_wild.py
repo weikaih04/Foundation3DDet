@@ -74,7 +74,7 @@ def get_config() -> ExperimentConfig:
             cache_as_binary=True,
             cached_file_path="data/in_the_wild/val.pkl",
         ),
-        preprocess_fn=get_test_transforms_cfg(shape=gdino3d_image_shape),
+        preprocess_fn=get_test_transforms_cfg(shape=gdino3d_image_shape, with_depth=False),
     )
 
     config.data = get_data_cfg(
