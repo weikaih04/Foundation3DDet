@@ -182,6 +182,7 @@ class GeometryBackendBase(nn.Module, ABC):
             depth_feats=depth_feats,
             intrinsics=intrinsics,
             image_hw=image_hw,
+            depth_gt=depth_gt,
             **kwargs,
         )
 

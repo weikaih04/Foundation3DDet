@@ -334,6 +334,9 @@ class SAM3_3D(nn.Module):
 
         # ========== Oracle Evaluation ==========
         oracle_eval: bool = False,
+
+        # ========== Depth Input at Test Time ==========
+        use_depth_input_test: bool = False,
     ) -> None:
         """Initialize SAM3_3D.
 
@@ -386,6 +389,7 @@ class SAM3_3D(nn.Module):
         self.sam3 = sam3_model
         self.hidden_dim = sam3_model.hidden_dim
         self.oracle_eval = oracle_eval
+        self.use_depth_input_test = use_depth_input_test
 
         # 3D-MOOD components
         self.box_coder = box_coder or GroundingDINO3DCoder()
@@ -772,8 +776,9 @@ class SAM3_3D(nn.Module):
             intrinsics_per_image = batch.intrinsics
             depth_gt = None
             depth_mask = None
-            if self.training:
+            if self.training or self.use_depth_input_test:
                 depth_gt = getattr(batch, 'depth_gt', None)
+            if self.training:
                 depth_mask = getattr(batch, 'depth_mask', None)
 
             # Run backbone on stream 1
@@ -1301,8 +1306,6 @@ class SAM3_3D(nn.Module):
                         sel = best_indices[0].item()
                         print(
                             f"[ORACLE] topK={K}, "
-                            f"GT={gt_boxes_pixel[0].tolist()}, "
-                            f"sel={img_boxes[0][sel].tolist()}, "
                             f"IoU={p0_ious[sel]:.4f}, "
                             f"score={img_scores[0][sel]:.4f}, "
                             f"maxIoU={p0_ious.max():.4f}"
@@ -1381,12 +1384,35 @@ class SAM3_3D(nn.Module):
             # Must account for CenterPad: first subtract padding offset, then
             # divide by content_size/original_size (NOT padded_size/original_size).
             # Matches GDino3D RoI2Det3D.__call__ (head.py:380-396).
-            if batch.original_hw is not None and batch.original_hw[img_idx] is not None:
-                orig_h, orig_w = batch.original_hw[img_idx]
+            if batch.original_hw is not None:
+                # original_hw may be List[tuple] or a single tuple
+                # (Lightning's transfer_batch_to_device can unwrap
+                # single-element lists for batch_size=1)
+                hw = batch.original_hw
+                if isinstance(hw, (tuple, list)) and len(hw) == 2 and isinstance(hw[0], (int, float)):
+                    # Direct tuple (h, w) - single image batch
+                    orig_h, orig_w = hw
+                elif isinstance(hw, (tuple, list)) and img_idx < len(hw):
+                    orig_h, orig_w = hw[img_idx]
+                else:
+                    orig_h, orig_w = None, None
+
+                if orig_h is None:
+                    continue
+
                 img_boxes_flat = img_boxes_flat.clone()  # Don't modify in-place
 
-                if batch.padding is not None and batch.padding[img_idx] is not None:
-                    pad_left, pad_right, pad_top, pad_bottom = batch.padding[img_idx]
+                # padding may also be unwrapped for batch_size=1
+                pad_info = batch.padding
+                if pad_info is not None:
+                    if isinstance(pad_info, (tuple, list)) and len(pad_info) == 4 and isinstance(pad_info[0], (int, float)):
+                        # Direct [L,R,T,B] - single image batch
+                        pad_left, pad_right, pad_top, pad_bottom = pad_info
+                    elif isinstance(pad_info, (tuple, list)) and img_idx < len(pad_info) and pad_info[img_idx] is not None:
+                        pad_left, pad_right, pad_top, pad_bottom = pad_info[img_idx]
+                    else:
+                        pad_left = pad_right = pad_top = pad_bottom = 0
+
                     # Step 1: subtract CenterPad offset
                     img_boxes_flat[:, 0::2] -= pad_left
                     img_boxes_flat[:, 1::2] -= pad_top

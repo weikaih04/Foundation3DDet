@@ -724,24 +724,29 @@ class LingbotDepthBackend(GeometryBackendBase):
         depth_feats: list[Tensor] | None,
         intrinsics: Tensor,
         image_hw: tuple[int, int],
+        depth_gt: Tensor | None = None,
         **kwargs,
     ) -> GeometryBackendOutput:
-        """Forward pass for inference (monocular mode, zero depth input).
+        """Forward pass for inference.
 
         Args:
             images: [B, 3, H, W] 3D-MOOD normalized images.
             depth_feats: Ignored.
             intrinsics: [B, 3, 3] camera intrinsics.
             image_hw: (H, W) image dimensions.
+            depth_gt: [B, 1, H, W] depth map input (optional). If None, uses
+                zero depth (monocular mode). If provided, uses depth as input
+                (oracle/GT-depth mode).
 
         Returns:
             GeometryBackendOutput.
         """
         H, W = image_hw
 
-        # Always zero depth input for inference
+        # Use provided depth_gt if available, otherwise zero (monocular)
+        depth_input = depth_gt if depth_gt is not None else None
         depth_map, depth_latents, cls_token, base_h, base_w = (
-            self._run_encoder_and_decoder(images, None, image_hw)
+            self._run_encoder_and_decoder(images, depth_input, image_hw)
         )
 
         depth_latents = self._maybe_detach_latents(depth_latents)

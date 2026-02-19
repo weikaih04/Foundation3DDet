@@ -124,6 +124,7 @@ def get_sam3_3d_cfg(
     lingbot_encoder_freeze_blocks: int = 0,
     backbone_freeze_blocks: int = 0,
     oracle_eval: bool = False,
+    use_depth_input_test: bool = False,
 ) -> tuple[ConfigDict, ConfigDict]:
     """Get SAM3_3D model configuration.
 
@@ -231,6 +232,7 @@ def get_sam3_3d_cfg(
         early_depth_fusion=early_depth_fusion,
         backbone_freeze_blocks=backbone_freeze_blocks,
         oracle_eval=oracle_eval,
+        use_depth_input_test=use_depth_input_test,
     )
 
     return model, box_coder

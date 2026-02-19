@@ -165,6 +165,37 @@ def get_callback_cfg(
     return callbacks
 
 
+def get_in_the_wild_evaluator_cfg(
+    data_root: str = "data/in_the_wild",
+) -> ConfigDict:
+    """Get InTheWild evaluator config.
+
+    Uses Detect3DEvaluator with 3D bounding box IoU for the 800+ category
+    human-annotated in-the-wild dataset (COCO/LVIS/Objects365).
+
+    Args:
+        data_root: Root directory for in-the-wild data.
+
+    Returns:
+        ConfigDict: Evaluator configuration.
+    """
+    from opendet3d.data.datasets.in_the_wild import load_in_the_wild_class_map
+
+    annotation = os.path.join(data_root, "annotations/InTheWild_val.json")
+    class_map = load_in_the_wild_class_map(annotation)
+    det_map = {name: i for i, name in enumerate(sorted(class_map.keys()))}
+
+    return class_config(
+        Detect3DEvaluator,
+        det_map=det_map,
+        cat_map=class_map,
+        eval_prox=False,
+        iou_type="bbox",
+        num_columns=4,
+        annotation=annotation,
+    )
+
+
 def get_omni3d_evaluator_cfg(
     data_root: str,
     omni3d50: bool,

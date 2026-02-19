@@ -657,18 +657,6 @@ class SAM3_3DCollator:
                 original_hw = sample.get("original_hw", None)
                 pad_info = sample.get("padding", None)
 
-                # DEBUG: print once to verify transform is applied
-                if img_idx == 0 and not hasattr(self, '_collator_debug_printed'):
-                    self._collator_debug_printed = True
-                    print(f"[COLLATOR DEBUG] original_hw={original_hw}, "
-                          f"type={type(original_hw)}")
-                    print(f"[COLLATOR DEBUG] padding={pad_info}, "
-                          f"type={type(pad_info)}")
-                    print(f"[COLLATOR DEBUG] condition={(original_hw is not None and pad_info is not None)}")
-                    print(f"[COLLATOR DEBUG] boxes2d[0]={boxes2d[0]}, "
-                          f"type={type(boxes2d[0])}")
-                    print(f"[COLLATOR DEBUG] H={H}, W={W}")
-
                 if original_hw is not None and pad_info is not None:
                     orig_h, orig_w = original_hw
                     if isinstance(orig_h, torch.Tensor):
@@ -718,10 +706,6 @@ class SAM3_3DCollator:
 
                     # Transform box to padded pixel space, then normalize
                     box_padded = transform_box_to_padded(boxes2d[box_idx])
-                    # DEBUG: print first box transform
-                    if img_idx == 0 and box_idx == 0 and hasattr(self, '_collator_debug_printed'):
-                        print(f"[COLLATOR DEBUG] orig={boxes2d[box_idx]}, "
-                              f"padded={box_padded}")
                     box_norm_xyxy = normalize_box_xyxy(box_padded)
                     geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
 
@@ -1252,6 +1236,32 @@ class SAM3_3DEvalConnector:
         return {
             "coco_image_id": data.sample_names,
             "dataset_names": data.dataset_name,
+            "pred_boxes": prediction.boxes,
+            "pred_scores": prediction.scores,
+            "pred_classes": prediction.class_ids,
+            "pred_boxes3d": prediction.boxes3d,
+        }
+
+
+class SAM3_3DDetect3DEvalConnector:
+    """Eval connector for Detect3DEvaluator with SAM3_3DBatchedInputs.
+
+    Unlike SAM3_3DEvalConnector, this connector does not include dataset_names
+    since Detect3DEvaluator.process_batch does not accept that argument.
+    """
+
+    def __call__(self, prediction, data: SAM3_3DBatchedInputs) -> dict:
+        """Extract evaluation data from dataclass + prediction.
+
+        Args:
+            prediction: Det3DOut NamedTuple from model.
+            data: SAM3_3DBatchedInputs from collator.
+
+        Returns:
+            Dict with keys expected by Detect3DEvaluator.process_batch.
+        """
+        return {
+            "coco_image_id": data.sample_names,
             "pred_boxes": prediction.boxes,
             "pred_scores": prediction.scores,
             "pred_classes": prediction.class_ids,
