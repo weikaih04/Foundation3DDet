@@ -1535,8 +1535,24 @@ class GroundingDINO3D(GroundingDINO):
 
                 boxes.append(det_bboxes)
                 scores.append(det_scores)
-                class_ids.append(det_labels)
                 boxes3d.append(det_bboxes3d)
+
+                # Remap local indices to global category IDs if cat_mapping is set.
+                # Without cat_mapping, det_labels are local 0-based indices into
+                # the text prompt (works for Omni3D where det_map is 0-indexed).
+                # With cat_mapping, we convert category name -> global ID, which
+                # is required when per-image categories are used as text prompt
+                # (e.g., InTheWild evaluation with 800+ categories).
+                if self.cat_mapping is not None and len(det_labels) > 0:
+                    remapped = det_labels.new_tensor(
+                        [
+                            self.cat_mapping[entities[i][label.item()]]
+                            for label in det_labels
+                        ]
+                    )
+                    class_ids.append(remapped)
+                else:
+                    class_ids.append(det_labels)
 
                 # Get the categories text
                 cur_categories = []

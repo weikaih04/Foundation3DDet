@@ -307,6 +307,8 @@ class SAM3_3DCollator:
         geometric_query_str: str = "geometric",  # Text for geometry queries (SAM3 convention)
         # Oracle evaluation mode (GT box as geometry prompt)
         oracle_eval: bool = False,  # If True, each GT box = one geometry prompt
+        # Training vs inference filtering
+        filter_empty_boxes: bool = True,  # Set False at test time to keep 0-GT-box images
     ):
         """Initialize collator.
 
@@ -367,6 +369,9 @@ class SAM3_3DCollator:
         # Oracle evaluation mode
         self.oracle_eval = oracle_eval
 
+        # Training vs inference filtering
+        self.filter_empty_boxes = filter_empty_boxes
+
     def _sample_num_points(self, num_spec: int | tuple[int, int]) -> int:
         """Sample number of points from spec."""
         if isinstance(num_spec, int):
@@ -424,13 +429,17 @@ class SAM3_3DCollator:
         """
         profile_start("  collator_total")
 
-        # Filter out images with no GT boxes to avoid empty prompts
-        # This reduces the probability of empty batches during training
+        # Filter out images with no GT boxes to avoid empty prompts.
+        # Only applied during training; at test time we keep all images so
+        # that the evaluator receives predictions for every image (even ones
+        # with 0 valid 3D GT boxes).  _forward_test already handles the
+        # n_prompts_this_img==0 case by returning empty tensors.
         original_batch_size = len(batch)
-        batch = [
-            item for item in batch
-            if item.get("boxes2d") is not None and len(item["boxes2d"]) > 0
-        ]
+        if self.filter_empty_boxes:
+            batch = [
+                item for item in batch
+                if item.get("boxes2d") is not None and len(item["boxes2d"]) > 0
+            ]
 
         # if len(batch) < original_batch_size:
         #     import torch.distributed as dist

@@ -91,6 +91,7 @@ def get_config() -> ExperimentConfig:
         params=params,
         pretrained=None,
         use_checkpoint=config.use_checkpoint,
+        cat_mapping=class_map,
     )
 
     config.loss = get_loss_cfg(params, box_coder, aux_depth_loss=True)

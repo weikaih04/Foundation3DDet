@@ -26,7 +26,12 @@ from .connector import SAM3_3DCollator
 # Default collator instances (module-level for vis4d compatibility).
 # vis4d's DelayedInstantiator resolves functions by module path + __name__,
 # so module-level functions must exist for each variant.
+# IMPORTANT: create_sam3_3d_collate_fn() creates closures with __name__ set
+# to one of these module-level function names. At runtime vis4d resolves the
+# stored class_path back to the actual module-level function, so the closure
+# parameters are IGNORED. Parameters must be baked into each module-level fn.
 _default_collator = None
+_test_collator = None
 _oracle_collator = None
 
 
@@ -57,6 +62,30 @@ def sam3_3d_collate_fn(batch: List[dict], **kwargs):
     return _default_collator(batch)
 
 
+def sam3_3d_test_collate_fn(batch: List[dict], **kwargs):
+    """Test-time SAM3_3D collate function (module-level for vis4d).
+
+    Pure text queries, no filtering of empty-box images.
+    Used for standard test-time evaluation (non-oracle).
+
+    Args:
+        batch: List of data samples
+        **kwargs: Additional arguments from vis4d (e.g., collate_keys)
+
+    Returns:
+        Collated batch data
+    """
+    global _test_collator
+    if _test_collator is None:
+        _test_collator = SAM3_3DCollator(
+            max_prompts_per_image=50,
+            use_text_prompts=True,
+            text_query_prob=1.0,  # Pure text at test time
+            filter_empty_boxes=False,  # Keep all images at test time
+        )
+    return _test_collator(batch)
+
+
 def sam3_3d_oracle_collate_fn(batch: List[dict], **kwargs):
     """Oracle SAM3_3D collate function (module-level for vis4d).
 
@@ -76,6 +105,7 @@ def sam3_3d_oracle_collate_fn(batch: List[dict], **kwargs):
             max_prompts_per_image=50,
             use_text_prompts=True,
             oracle_eval=True,
+            filter_empty_boxes=False,  # Oracle eval is always test-time
         )
     return _oracle_collator(batch)
 
@@ -92,6 +122,8 @@ def create_sam3_3d_collate_fn(
     box_noise_max: float | None = 20.0,
     # Oracle evaluation mode
     oracle_eval: bool = False,
+    # Training vs inference filtering
+    filter_empty_boxes: bool = True,
 ):
     """Create a configured SAM3_3D collate function.
 
@@ -131,6 +163,7 @@ def create_sam3_3d_collate_fn(
         box_noise_std=box_noise_std,
         box_noise_max=box_noise_max,
         oracle_eval=oracle_eval,
+        filter_empty_boxes=filter_empty_boxes,
     )
 
     def collate_fn(batch: List[dict], **kwargs):
@@ -216,30 +249,18 @@ def get_sam3_3d_data_cfg(
     """
     data = DataConfig()
 
-    # Create TRAIN collate function with configured parameters
-    train_collate_fn = create_sam3_3d_collate_fn(
-        max_prompts_per_image=max_prompts_per_image,
-        use_text_prompts=use_text_prompts,
-        text_query_prob=text_query_prob,
-        keep_text_for_visual=keep_text_for_visual,
-        use_geometry_prompts=use_geometry_prompts,
-        geometric_query_str=geometric_query_str,
-        box_noise_std=box_noise_std,
-        box_noise_max=box_noise_max,
-    )
+    # Training collate function: resolves to module-level sam3_3d_collate_fn
+    # via vis4d's DelayedInstantiator (text_query_prob=0.7, filter_empty_boxes=True).
+    train_collate_fn = sam3_3d_collate_fn
 
-    # Create TEST collate function (pure text by default, like GDino3D)
-    test_collate_fn = create_sam3_3d_collate_fn(
-        max_prompts_per_image=max_prompts_per_image,
-        use_text_prompts=True,  # Always use text for test
-        text_query_prob=test_text_query_prob,  # 1.0 = pure text
-        keep_text_for_visual=False,  # Not relevant with pure text
-        use_geometry_prompts=test_use_geometry_prompts,  # False = no geometry
-        geometric_query_str=geometric_query_str,
-        box_noise_std=0.0,  # No noise during test
-        box_noise_max=None,
-        oracle_eval=oracle_eval,  # Oracle mode for GT box prompting
-    )
+    # Test collate function: use a module-level function so vis4d resolves it
+    # correctly.  create_sam3_3d_collate_fn() closures do NOT work because
+    # vis4d's DelayedInstantiator resolves by __module__ + __name__ back to
+    # the module-level function, ignoring the closure parameters.
+    if oracle_eval:
+        test_collate_fn = sam3_3d_oracle_collate_fn
+    else:
+        test_collate_fn = sam3_3d_test_collate_fn
 
     # Train dataloader
     train_batchprocess_cfg = class_config(
