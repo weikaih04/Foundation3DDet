@@ -73,6 +73,10 @@ class GroundingDINO3DHead(nn.Module):
         reg_branch = self._get_reg_branch(num_reg_fcs, self.box_coder.reg_dims)
         self.reg_branches = get_clones(reg_branch, self.num_pred_layer)
 
+        # 3D confidence branch (predicts 3D-aware objectness score)
+        conf_branch = self._get_conf_branch(num_reg_fcs)
+        self.conf_branches = get_clones(conf_branch, self.num_pred_layer)
+
         # Camera prompt branch (only created if use_camera_prompt is True)
         if self.use_camera_prompt:
             project_rays, prompt_camera = self._get_condition_branch(
@@ -113,6 +117,15 @@ class GroundingDINO3DHead(nn.Module):
         reg_branch.append(nn.Linear(self.embed_dims, reg_dims))
         return nn.Sequential(*reg_branch)
 
+    def _get_conf_branch(self, num_reg_fcs: int) -> nn.Sequential:
+        """Get the 3D confidence branch (output dim = 1)."""
+        conf_branch = []
+        for _ in range(num_reg_fcs):
+            conf_branch.append(nn.Linear(self.embed_dims, self.embed_dims))
+            conf_branch.append(nn.ReLU())
+        conf_branch.append(nn.Linear(self.embed_dims, 1))
+        return nn.Sequential(*conf_branch)
+
     def _get_condition_branch(
         self, input_dims: int, expansion: int, embed_dims: int
     ) -> tuple[nn.Module, nn.Module]:
@@ -128,6 +141,8 @@ class GroundingDINO3DHead(nn.Module):
     def _init_weights(self) -> None:
         """Initialize weights of the Deformable DETR head."""
         for m in self.reg_branches:
+            xavier_init(m, distribution="uniform")
+        for m in self.conf_branches:
             xavier_init(m, distribution="uniform")
 
     def get_camera_embeddings(
@@ -167,7 +182,7 @@ class GroundingDINO3DHead(nn.Module):
         hidden_state: Tensor,
         ray_embeddings: Tensor | None,
         depth_latents: Tensor | None = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         """Single layer forward pass of the 3D Grounding DINO head.
 
         Args:
@@ -177,7 +192,9 @@ class GroundingDINO3DHead(nn.Module):
             depth_latents: Depth latent features [B, H*W, depth_embed_dims].
 
         Returns:
-            Regression output for 3D box prediction.
+            Tuple of (reg_output, conf_output):
+            - reg_output: 3D box regression [B, num_queries, reg_dims]
+            - conf_output: 3D confidence logits [B, num_queries, 1]
         """
         # Camera-aware 3D queries (only if use_camera_prompt is True)
         if self.use_camera_prompt and ray_embeddings is not None:
@@ -194,15 +211,16 @@ class GroundingDINO3DHead(nn.Module):
             )
 
         reg_output = self.reg_branches[layer_id](hidden_state)
+        conf_output = self.conf_branches[layer_id](hidden_state)
 
-        return reg_output
+        return reg_output, conf_output
 
     def forward(
         self,
         hidden_states: Tensor,
         ray_embeddings: Tensor | None,
         depth_latents: Tensor | None = None,
-    ) -> list[Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Forward pass of the 3D Grounding DINO head.
 
         Args:
@@ -211,20 +229,24 @@ class GroundingDINO3DHead(nn.Module):
             depth_latents: Depth latent features [B, H*W, depth_embed_dims].
 
         Returns:
-            Stacked regression outputs for all layers.
+            Tuple of (stacked_reg, stacked_conf):
+            - stacked_reg: [num_layers, B, num_queries, reg_dims]
+            - stacked_conf: [num_layers, B, num_queries, 1]
         """
         all_layers_outputs_3d = []
+        all_layers_conf_3d = []
 
         for layer_id in range(hidden_states.shape[0]):
             hidden_state = hidden_states[layer_id]
 
-            reg_output = self.single_forward(
+            reg_output, conf_output = self.single_forward(
                 layer_id, hidden_state, ray_embeddings, depth_latents
             )
 
             all_layers_outputs_3d.append(reg_output)
+            all_layers_conf_3d.append(conf_output)
 
-        return torch.stack(all_layers_outputs_3d)
+        return torch.stack(all_layers_outputs_3d), torch.stack(all_layers_conf_3d)
 
 
 class Prompt3DQueryLayer(nn.Module):

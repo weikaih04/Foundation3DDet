@@ -136,6 +136,14 @@ class SAM3_3DLossConfig:
     loss_mask_weight: float = 0.0  # Set > 0 to enable mask loss
     loss_dice_weight: float = 0.0  # Set > 0 to enable dice loss
 
+    # ========== 3D Confidence Head ==========
+    # Only supervised on positive (matched) samples. No negative loss.
+    # Inference: final_score = pred_logits.sigmoid() * pred_conf_3d.sigmoid()
+    use_3d_conf: bool = False  # Enable 3D confidence head loss
+    loss_3d_conf_weight: float = 20.0  # Weight for 3D confidence loss
+    conf_depth_weight: float = 0.3  # Weight for depth quality in quality target
+    conf_iou_3d_weight: float = 0.7  # Weight for 3D IoU in quality target
+
 
 class SAM3_3DLoss(nn.Module):
     """Loss function for SAM3_3D.
@@ -436,11 +444,18 @@ class SAM3_3DLoss(nn.Module):
         losses["loss_cls"] = (
             self.config.loss_2d_scale * cls_losses["loss_ce"] * self.config.loss_cls_weight
         )
-        if cls_losses.get("presence_loss", 0.0) != 0.0:
+        # Metrics from SAM3's IABCEMdetr (not losses, just for wandb logging)
+        if "ce_f1" in cls_losses:
+            losses["metric_ce_f1"] = cls_losses["ce_f1"].detach()
+        # Presence loss (computed inside IABCEMdetr when use_presence=True)
+        presence_val = cls_losses.get("presence_loss")
+        if presence_val is not None and isinstance(presence_val, Tensor):
             losses["loss_presence"] = (
-                self.config.loss_2d_scale * cls_losses["presence_loss"]
+                self.config.loss_2d_scale * presence_val
                 * self.config.presence_loss_weight
             )
+            if "presence_dec_acc" in cls_losses:
+                losses["metric_presence_acc"] = cls_losses["presence_dec_acc"].detach()
 
         if _PROFILE_LOSS:
             torch.cuda.synchronize()
@@ -532,6 +547,24 @@ class SAM3_3DLoss(nn.Module):
         if _PROFILE_LOSS:
             torch.cuda.synchronize()
             _loss_3d_time = (time.perf_counter() - _t2) * 1000
+
+        # ========== 3D Confidence Loss (positive samples only) ==========
+        # DEBUG: check conditions
+        if not hasattr(self, '_3d_conf_debug_printed'):
+            self._3d_conf_debug_printed = True
+            print(f"[3D Conf Debug] use_3d_conf={self.config.use_3d_conf}, "
+                  f"pred_conf_3d={'not None' if out.pred_conf_3d is not None else 'None'}, "
+                  f"pred_boxes_3d={'not None' if pred_boxes_3d is not None else 'None'}, "
+                  f"intrinsics={'not None' if intrinsics is not None else 'None'}")
+        if (self.config.use_3d_conf
+                and out.pred_conf_3d is not None
+                and pred_boxes_3d is not None
+                and intrinsics is not None):
+            loss_3d_cls = self._loss_3d_classification(
+                out.pred_conf_3d, pred_boxes_2d, pred_boxes_3d,
+                indices, normalized_targets, intrinsics, num_boxes, image_size,
+            )
+            losses["loss_3d_cls"] = self.config.loss_3d_conf_weight * loss_3d_cls
 
         # ========== Geometry Backend Losses (scaled by loss_geom_scale) ==========
         if _PROFILE_LOSS:
@@ -875,6 +908,94 @@ class SAM3_3DLoss(nn.Module):
 
         return losses
 
+    def _loss_3d_classification(
+        self,
+        pred_conf_3d: Tensor,  # (B, S, 1)
+        pred_boxes_2d: Tensor,  # (B, S, 4) normalized xyxy
+        pred_boxes_3d: Tensor,  # (B, S, 12) encoded
+        indices: tuple[Tensor, Tensor, Tensor | None],
+        targets: dict,
+        intrinsics: Tensor,  # (N_prompts, 3, 3)
+        num_boxes: Tensor,
+        image_size: tuple[int, int],
+    ) -> Tensor:
+        """Compute 3D confidence loss (positive samples only).
+
+        Only supervised on matched (positive) queries. No negative sample loss.
+        The 2D confidence head already handles foreground/background.
+        This head only learns 3D quality: how accurate is the 3D prediction.
+
+        Quality target = conf_depth_weight * depth_quality
+                       + conf_iou_3d_weight * iou_3d
+
+        At inference: final_score = pred_logits.sigmoid() * pred_conf_3d.sigmoid()
+        """
+        batch_idx, src_idx, tgt_idx = indices
+        B, S, _ = pred_conf_3d.shape
+        device = pred_conf_3d.device
+        M = len(batch_idx)
+
+        if M == 0:
+            return pred_conf_3d.sum() * 0.0
+
+        with torch.no_grad():
+            # 1. Depth quality - directly from encoded params, no decode needed
+            src_boxes_3d = pred_boxes_3d[(batch_idx, src_idx)]
+            target_boxes_3d_raw = (
+                targets["boxes_3d"][tgt_idx] if tgt_idx is not None
+                else targets["boxes_3d"]
+            )
+            depth_scale = self.box_coder.depth_scale
+            pred_log_z = src_boxes_3d[:, 2] / depth_scale  # = log(pred_z)
+            gt_z = target_boxes_3d_raw[:, 2].clamp(min=0.1)
+            gt_log_z = torch.log(gt_z)
+            depth_quality = torch.exp(-torch.abs(pred_log_z - gt_log_z))
+
+            # 2. 3D IoU - requires decode + corners
+            H, W = image_size
+            factors = pred_boxes_2d.new_tensor([[W, H, W, H]])
+            src_boxes_2d_pixel = pred_boxes_2d[(batch_idx, src_idx)] * factors
+
+            pred_decoded_list = []
+            for i in range(M):
+                single_decoded = self.box_coder.decode(
+                    src_boxes_2d_pixel[i:i+1],
+                    src_boxes_3d[i:i+1],
+                    intrinsics[batch_idx[i]],
+                )
+                pred_decoded_list.append(single_decoded)
+            pred_decoded = torch.cat(pred_decoded_list, dim=0)  # (M, 10)
+
+            from vis4d.data.const import AxisMode
+            from vis4d.op.box.box3d import boxes3d_to_corners
+            from opendet3d.op.box.box3d import box3d_overlap
+
+            pred_corners = boxes3d_to_corners(
+                pred_decoded, AxisMode.OPENCV
+            )  # (M, 8, 3)
+            gt_corners = boxes3d_to_corners(
+                target_boxes_3d_raw[:, :10], AxisMode.OPENCV
+            )  # (M, 8, 3)
+            iou_matrix = box3d_overlap(pred_corners, gt_corners)  # (M, M)
+            iou_3d = iou_matrix.diagonal().clamp(0, 1)  # (M,)
+
+            # 3. Combined quality (only 3D components, no 2D IoU)
+            quality = (
+                self.config.conf_depth_weight * depth_quality
+                + self.config.conf_iou_3d_weight * iou_3d
+            )  # in [0, 1] since weights sum to 1.0
+
+        # BCE loss on positive samples only
+        # Target: quality score for matched queries
+        src_conf = pred_conf_3d[(batch_idx, src_idx)]  # (M, 1)
+        target_quality = quality.unsqueeze(-1)  # (M, 1)
+        loss = F.binary_cross_entropy_with_logits(
+            src_conf, target_quality, reduction="sum"
+        )
+        loss = loss / num_boxes.clamp(min=1)
+
+        return loss
+
     def _compute_aux_loss(
         self,
         aux_out: dict,
@@ -944,12 +1065,12 @@ class SAM3_3DLoss(nn.Module):
             )
 
         # 3D box loss (our own, scaled by loss_3d_scale)
+        pred_boxes_2d_aux = aux_out.get(
+            "pred_boxes_2d", aux_out.get("pred_boxes_xyxy")
+        )
         if "pred_boxes_3d" in aux_out and intrinsics is not None:
-            pred_boxes_2d = aux_out.get(
-                "pred_boxes_2d", aux_out.get("pred_boxes_xyxy")
-            )
             loss_3d = self._loss_boxes_3d(
-                pred_boxes_2d,
+                pred_boxes_2d_aux,
                 aux_out["pred_boxes_3d"],
                 indices,
                 targets,
@@ -959,6 +1080,19 @@ class SAM3_3DLoss(nn.Module):
             )
             for key, value in loss_3d.items():
                 losses[key] = self.config.loss_3d_scale * value
+
+        # 3D confidence loss (deep supervision)
+        if (self.config.use_3d_conf
+                and "pred_conf_3d" in aux_out
+                and "pred_boxes_3d" in aux_out
+                and intrinsics is not None):
+            loss_3d_cls = self._loss_3d_classification(
+                aux_out["pred_conf_3d"],
+                pred_boxes_2d_aux,
+                aux_out["pred_boxes_3d"],
+                indices, targets, intrinsics, num_boxes, image_size,
+            )
+            losses["loss_3d_cls"] = self.config.loss_3d_conf_weight * loss_3d_cls
 
         return losses
 

@@ -35,6 +35,11 @@ def get_sam3_3d_loss_cfg(
     loss_opt_ssi_weight: float = 0.5,  # SSI loss weight (UniDepthV2)
     # Auxiliary loss
     aux_loss_weight: float = 1.0,
+    # 3D Confidence Head (positive-only, no fg/bg task)
+    use_3d_conf: bool = False,
+    loss_3d_conf_weight: float = 20.0,
+    conf_depth_weight: float = 0.3,
+    conf_iou_3d_weight: float = 0.7,
 ) -> ConfigDict:
     """Get SAM3_3D loss configuration.
 
@@ -81,6 +86,11 @@ def get_sam3_3d_loss_cfg(
         loss_opt_ssi_weight=loss_opt_ssi_weight,
         # Auxiliary loss
         aux_loss_weight=aux_loss_weight,
+        # 3D Confidence Head
+        use_3d_conf=use_3d_conf,
+        loss_3d_conf_weight=loss_3d_conf_weight,
+        conf_depth_weight=conf_depth_weight,
+        conf_iou_3d_weight=conf_iou_3d_weight,
     )
     
     loss = class_config(
@@ -97,5 +107,15 @@ def get_sam3_3d_loss_cfg(
         "connector": class_config(SAM3_3DLossConnector),
     }
 
-    return class_config(LossModule, losses=[loss_dict])
+    # Metrics (metric_* keys) are logged to wandb but excluded from
+    # total_loss so they don't affect optimization or loss scale.
+    return class_config(
+        LossModule,
+        losses=[loss_dict],
+        exclude_attributes=[
+            "SAM3_3DLoss.metric_ce_f1",
+            "SAM3_3DLoss.metric_presence_acc",
+            "SAM3_3DLoss.metric_fusion_delta",
+        ],
+    )
 

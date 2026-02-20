@@ -140,6 +140,10 @@ class SAM3_3DOut(NamedTuple):
     pred_boxes_2d_cxcywh_o2m: Tensor | None = None  # (N_prompts, num_queries, 4) - normalized cxcywh
     pred_boxes_3d_o2m: Tensor | None = None  # (N_prompts, num_queries, 12) - encoded 3D params
 
+    # 3D confidence head outputs (camera+depth conditioned)
+    pred_conf_3d: Tensor | None = None  # (N_prompts, num_queries, 1)
+    pred_conf_3d_o2m: Tensor | None = None  # (N_prompts, num_queries, 1)
+
     def __getitem__(self, key: str):
         """Support dict-like access for vis4d data connector compatibility."""
         return getattr(self, key)
@@ -436,6 +440,16 @@ class SAM3_3D(nn.Module):
                 depth_latent_dim=depth_latent_dim,
             )
             print(f"[SAM3_3D] Created bbox3d_head with use_camera_prompt={use_camera_prompt}, depth_latent_dim={depth_latent_dim}")
+
+        # Initialize 3D confidence head from SAM3's 2D class_embed (warm start)
+        if self.bbox3d_head is not None and hasattr(self.sam3, 'class_embed'):
+            src_linear = self.sam3.class_embed  # nn.Linear(hidden_dim, 1)
+            for conf_branch in self.bbox3d_head.conf_branches:
+                # Copy weights to the last linear layer (output layer)
+                last_linear = conf_branch[-1]  # nn.Linear(embed_dims, 1)
+                last_linear.weight.data.copy_(src_linear.weight.data)
+                last_linear.bias.data.copy_(src_linear.bias.data)
+            print("[SAM3_3D] Initialized 3D conf_branches from SAM3 class_embed")
 
         # Load geometry backend pretrained weights
         # This is called during __init__ to ensure weights are loaded for first training
@@ -969,6 +983,7 @@ class SAM3_3D(nn.Module):
         # ========== Step 6: 3D Head ==========
         profile_start("  3d_head")
         pred_boxes_3d = None
+        pred_conf_3d = None
         aux_outputs = None
 
         if self.bbox3d_head is not None and queries is not None:
@@ -1074,8 +1089,8 @@ class SAM3_3D(nn.Module):
                 hidden_states = queries.unsqueeze(0)  # (1, N_prompts, S, C)
 
             # Call 3D head with all layers
-            # Returns: (L, N_prompts, S, 12) if L > 1, else (N_prompts, S, 12)
-            all_layers_boxes_3d = self.bbox3d_head(
+            # Returns: (L, N_prompts, S, 12), (L, N_prompts, S, 1)
+            all_layers_boxes_3d, all_layers_conf_3d = self.bbox3d_head(
                 hidden_states=hidden_states,
                 ray_embeddings=ray_embeddings,
                 depth_latents=depth_latents,
@@ -1084,9 +1099,10 @@ class SAM3_3D(nn.Module):
             # Extract final layer output
             if len(all_layers_queries) > 1:
                 pred_boxes_3d = all_layers_boxes_3d[-1]  # (N_prompts, S, 12)
+                pred_conf_3d = all_layers_conf_3d[-1]  # (N_prompts, S, 1)
             else:
-                # bbox3d_head always returns (L, N_prompts, S, 12), squeeze L dim when L=1
                 pred_boxes_3d = all_layers_boxes_3d.squeeze(0)  # (N_prompts, S, 12)
+                pred_conf_3d = all_layers_conf_3d.squeeze(0)  # (N_prompts, S, 1)
 
             # Build auxiliary outputs for deep supervision
             # Only include layers that have queries (tracked by aux_indices_with_queries)
@@ -1106,15 +1122,17 @@ class SAM3_3D(nn.Module):
 
         # Compute 3D boxes for O2M queries (if available, only during training)
         pred_boxes_3d_o2m = None
+        pred_conf_3d_o2m = None
         if self.bbox3d_head is not None and queries_o2m is not None and self.training:
             # O2M queries use the same 3D head but only compute final layer (no aux)
             o2m_hidden_states = queries_o2m.unsqueeze(0)  # (1, N_prompts, S, C)
-            o2m_boxes_3d = self.bbox3d_head(
+            o2m_boxes_3d, o2m_conf_3d = self.bbox3d_head(
                 hidden_states=o2m_hidden_states,
                 ray_embeddings=ray_embeddings,
                 depth_latents=depth_latents,
             )
             pred_boxes_3d_o2m = o2m_boxes_3d.squeeze(0)  # (N_prompts, S, 12)
+            pred_conf_3d_o2m = o2m_conf_3d.squeeze(0)  # (N_prompts, S, 1)
 
         profile_stop("  3d_head")
 
@@ -1144,6 +1162,9 @@ class SAM3_3D(nn.Module):
                 pred_boxes_2d_o2m=pred_boxes_xyxy_o2m,
                 pred_boxes_2d_cxcywh_o2m=pred_boxes_cxcywh_o2m,
                 pred_boxes_3d_o2m=pred_boxes_3d_o2m,
+                # 3D confidence head outputs
+                pred_conf_3d=pred_conf_3d,
+                pred_conf_3d_o2m=pred_conf_3d_o2m,
             )
 
         # Test mode: forward_test returns Det3DOut for evaluation
@@ -1151,6 +1172,7 @@ class SAM3_3D(nn.Module):
             pred_logits=pred_logits,
             pred_boxes_2d=pred_boxes_xyxy,
             pred_boxes_3d=pred_boxes_3d,
+            pred_conf_3d=pred_conf_3d,
             presence_logits=presence_logits,
             batch=batch,
             geom_out=geom_out,
@@ -1198,9 +1220,10 @@ class SAM3_3D(nn.Module):
         pred_logits: Tensor,
         pred_boxes_2d: Tensor,
         pred_boxes_3d: Tensor | None,
-        presence_logits: Tensor | None,
-        batch: SAM3_3DBatchedInputs,
-        geom_out: dict | None,
+        pred_conf_3d: Tensor | None = None,
+        presence_logits: Tensor | None = None,
+        batch: SAM3_3DBatchedInputs | None = None,
+        geom_out: dict | None = None,
     ) -> Det3DOut:
         """Forward pass for test/inference mode.
 
@@ -1214,6 +1237,7 @@ class SAM3_3D(nn.Module):
             pred_logits: (N_prompts, S, 1) objectness logits
             pred_boxes_2d: (N_prompts, S, 4) normalized xyxy boxes
             pred_boxes_3d: (N_prompts, S, 12) encoded 3D params or None
+            pred_conf_3d: (N_prompts, S, 1) 3D confidence logits or None
             presence_logits: (N_prompts, 1) presence logits (category exists in image)
             batch: Input batch with img_ids, intrinsics, etc.
             geom_out: Geometry backend output (may contain depth_maps)
@@ -1225,8 +1249,14 @@ class SAM3_3D(nn.Module):
         device = pred_logits.device
         B_images = batch.images.shape[0]
 
-        # Get scores from logits
+        # 2D confidence (foreground/background)
         scores_all = pred_logits.sigmoid().squeeze(-1)  # (N_prompts, S)
+
+        # Multiply by 3D quality score if available
+        # 2D head handles "is there an object?", 3D head handles "is the 3D accurate?"
+        if pred_conf_3d is not None:
+            conf_3d = pred_conf_3d.sigmoid().squeeze(-1)  # (N_prompts, S)
+            scores_all = scores_all * conf_3d
 
         # Apply presence score if available (following SAM3 original postprocessors.py)
         # Presence score indicates whether a category has objects in the image

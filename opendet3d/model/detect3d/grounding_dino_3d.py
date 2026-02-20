@@ -853,7 +853,7 @@ class GroundingDINO3D(GroundingDINO):
             output_memory, 1, topk_indices.unsqueeze(-1).repeat(1, 1, 256)
         )
 
-        topk_output_3d = self.bbox3d_head.single_forward(
+        topk_output_3d, _ = self.bbox3d_head.single_forward(
             self.decoder.num_layers,
             topk_output_memory,
             ray_embeddings,
@@ -1178,7 +1178,7 @@ class GroundingDINO3D(GroundingDINO):
             :, :, dn_meta["num_denoising_queries"] :, :
         ]
 
-        all_layers_outputs_3d = self.bbox3d_head(
+        all_layers_outputs_3d, _ = self.bbox3d_head(
             hidden_states_3d, ray_embeddings, depth_latents
         )
 
@@ -1360,7 +1360,7 @@ class GroundingDINO3D(GroundingDINO):
                     hidden_states, references, memory_text, text_token_mask
                 )
 
-                all_layers_outputs_3d = self.bbox3d_head(
+                all_layers_outputs_3d, _ = self.bbox3d_head(
                     hidden_states, ray_embeddings, depth_latents=depth_latents
                 )
 
@@ -1505,7 +1505,7 @@ class GroundingDINO3D(GroundingDINO):
                 hidden_states, references, memory_text, text_token_mask
             )
 
-            all_layers_outputs_3d = self.bbox3d_head(
+            all_layers_outputs_3d, _ = self.bbox3d_head(
                 hidden_states, ray_embeddings, depth_latents=depth_latents
             )
 
