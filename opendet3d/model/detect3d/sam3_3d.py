@@ -130,10 +130,14 @@ class SAM3_3DOut(NamedTuple):
     # Format: (batch_idx, src_idx, tgt_idx) from Hungarian matching
     indices: tuple | None = None
 
+    # Normalized cxcywh boxes (needed by SAM3's Boxes loss for L1)
+    pred_boxes_2d_cxcywh: Tensor | None = None  # (N_prompts, num_queries, 4) - normalized cxcywh
+
     # O2M (One-to-Many) outputs from SAM3 DAC mechanism
     # These are separate outputs from the second half of queries in DAC mode
     pred_logits_o2m: Tensor | None = None  # (N_prompts, num_queries, 1)
     pred_boxes_2d_o2m: Tensor | None = None  # (N_prompts, num_queries, 4) - normalized xyxy
+    pred_boxes_2d_cxcywh_o2m: Tensor | None = None  # (N_prompts, num_queries, 4) - normalized cxcywh
     pred_boxes_3d_o2m: Tensor | None = None  # (N_prompts, num_queries, 12) - encoded 3D params
 
     def __getitem__(self, key: str):
@@ -190,8 +194,12 @@ class SAM3_3DBatchedInputs:
     num_gts: Tensor | None = None            # (N_prompts,) - number of GTs per prompt
     gt_category_ids: Tensor | None = None    # (N_prompts, max_gt)
 
-    # Query type tracking (following SAM3 TEXT_ID convention)
-    # 0 = TEXT (one-to-many), 2 = GEOMETRY (one-to-one)
+    # Query type tracking (collator-level label, does NOT control SAM3 internal matching).
+    # 0=TEXT, 1=VISUAL, 2=GEOMETRY, 3=VISUAL+LABEL, 4=GEOMETRY+LABEL
+    # "multi-target" (0,1,3): num_gts can be > 1 (all instances of a category)
+    # "single-target" (2,4): num_gts = 1 (one selected instance)
+    # NOTE: SAM3's DAC mechanism (internal o2o/o2m matcher) always runs
+    # both branches regardless of this field.
     query_types: Tensor | None = None        # (N_prompts,) int
 
     # Metadata for evaluation/visualization
@@ -595,10 +603,38 @@ class SAM3_3D(nn.Module):
             segments=None,
             semantic_segments=None,
             is_valid_segment=None,
-            is_exhaustive=torch.ones(N_prompts, dtype=torch.bool, device=device),
+            # is_exhaustive: controls negative loss masking in SAM3's IABCEMdetr.
+            # Multi-target queries (TEXT=0, VISUAL=1, VISUAL+LABEL=3) are exhaustive:
+            #   all instances of the category are annotated as targets.
+            # Single-target queries (GEOMETRY=2, GEOMETRY+LABEL=4) are NOT exhaustive:
+            #   only 1 selected instance is the target, other instances of the
+            #   same category exist but are not annotated for this query.
+            is_exhaustive=self._get_is_exhaustive(batch, N_prompts, device),
             object_ids=object_ids,
             object_ids_padded=object_ids_padded,
         )
+
+    def _get_is_exhaustive(
+        self,
+        batch: SAM3_3DBatchedInputs,
+        N_prompts: int,
+        device: torch.device,
+    ) -> Tensor:
+        """Determine is_exhaustive per query based on query_types.
+
+        Multi-target queries (TEXT=0, VISUAL=1, VISUAL+LABEL=3) are exhaustive:
+        all instances of the category are annotated as targets, so unmatched
+        predictions should receive negative loss.
+
+        Single-target queries (GEOMETRY=2, GEOMETRY+LABEL=4) are NOT exhaustive:
+        only 1 selected instance is the target. Other instances of the same
+        category exist but are not annotated for this query, so unmatched
+        predictions should NOT receive negative loss.
+        """
+        if batch.query_types is not None:
+            qt = batch.query_types.to(device)
+            return (qt == 0) | (qt == 1) | (qt == 3)
+        return torch.ones(N_prompts, dtype=torch.bool, device=device)
 
     def on_load_checkpoint(self, checkpoint):
         """
@@ -915,6 +951,7 @@ class SAM3_3D(nn.Module):
         # O2O outputs (one-to-one matching)
         pred_logits = sam3_out["pred_logits"]  # (N_prompts, S, 1)
         pred_boxes_xyxy = sam3_out["pred_boxes_xyxy"]  # (N_prompts, S, 4)
+        pred_boxes_cxcywh = sam3_out["pred_boxes"]  # (N_prompts, S, 4)
         queries = sam3_out.get("queries")  # (N_prompts, S, d_model)
         encoder_hidden_states = sam3_out.get("encoder_hidden_states")
         presence_logits = sam3_out.get("presence_logit_dec")
@@ -923,6 +960,7 @@ class SAM3_3D(nn.Module):
         # These are separate outputs from the second half of queries in DAC mode
         pred_logits_o2m = sam3_out.get("pred_logits_o2m")  # (N_prompts, S, 1)
         pred_boxes_xyxy_o2m = sam3_out.get("pred_boxes_xyxy_o2m")  # (N_prompts, S, 4)
+        pred_boxes_cxcywh_o2m = sam3_out.get("pred_boxes_o2m")  # (N_prompts, S, 4)
         queries_o2m = sam3_out.get("queries_o2m")  # (N_prompts, S, d_model)
 
         # Extract auxiliary outputs from SAM3 for deep supervision
@@ -1100,9 +1138,11 @@ class SAM3_3D(nn.Module):
                 queries=queries,
                 encoder_hidden_states=encoder_hidden_states,
                 indices=sam3_indices,
+                pred_boxes_2d_cxcywh=pred_boxes_cxcywh,
                 # O2M outputs from SAM3 DAC mechanism
                 pred_logits_o2m=pred_logits_o2m,
                 pred_boxes_2d_o2m=pred_boxes_xyxy_o2m,
+                pred_boxes_2d_cxcywh_o2m=pred_boxes_cxcywh_o2m,
                 pred_boxes_3d_o2m=pred_boxes_3d_o2m,
             )
 

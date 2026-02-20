@@ -302,9 +302,16 @@ class SAM3_3DCollator:
         # Text/Visual query ratio (SAM3 original design)
         text_query_prob: float = 0.7,  # 70% text, 30% visual (SAM3 recommended)
         keep_text_for_visual: bool = False,  # If True, visual queries keep category text
-        # Geometry prompt options (NEW: text + geometry training)
-        use_geometry_prompts: bool = False,  # If True, create geometry queries per category
-        geometric_query_str: str = "geometric",  # Text for geometry queries (SAM3 convention)
+        # Geometry prompt options (text + geometry training)
+        use_geometry_prompts: bool = False,  # If True, create 2 queries per category
+        geometric_query_str: str = "geometric",  # Text for geometry queries
+        visual_query_str: str = "visual",  # Text for visual queries
+        # 5-mode training: Branch 1 and Branch 2 probabilities
+        # Branch 1 (o2m): TEXT (text_only_prob) / VISUAL or VISUAL+LABEL (1-text_only_prob)
+        # Branch 2 (o2o): GEOMETRY or GEOMETRY+LABEL
+        # use_label_prob controls +LABEL variants for both branches
+        text_only_prob: float = 0.5,  # Branch 1: P(TEXT) vs P(box-based query)
+        use_label_prob: float = 1/3,  # P(+LABEL) when query has a box prompt
         # Oracle evaluation mode (GT box as geometry prompt)
         oracle_eval: bool = False,  # If True, each GT box = one geometry prompt
         # Training vs inference filtering
@@ -329,16 +336,20 @@ class SAM3_3DCollator:
             box_noise_std: Noise std for box jittering (0 = no noise)
             box_noise_max: Max noise in pixels
             text_query_prob: Probability of text-only queries (SAM3 recommended: 0.7)
-                1.0 = all text queries (pure text training)
-                0.7 = 70% text, 30% visual (SAM3 mixed training)
-                0.0 = all visual queries (DetAny3D style)
+                Only used when use_geometry_prompts=False (legacy 2-mode).
             keep_text_for_visual: If True, visual queries keep category text
-                If False (default), visual queries use "visual" as text
-            use_geometry_prompts: If True, create geometry queries per category
-                This implements text + geometry training (SAM3 style):
-                - Each category gets 1 TEXT query (one-to-many targets)
-                - Each category gets 1 GEOMETRY query (one-to-one target)
+                If False (default), visual queries use "visual" as text.
+                Only used when use_geometry_prompts=False (legacy 2-mode).
+            use_geometry_prompts: If True, 5-mode training with 2 queries
+                per category (Branch 1 o2m + Branch 2 o2o).
             geometric_query_str: Text for geometry queries (default "geometric")
+            visual_query_str: Text for visual queries (default "visual")
+            text_only_prob: Branch 1 probability of TEXT mode (no box).
+                Remaining (1-text_only_prob) is box-based (VISUAL or VISUAL+LABEL).
+            use_label_prob: Probability of +LABEL variant when query has a box.
+                Controls both Branch 1 (VISUAL vs VISUAL+LABEL) and
+                Branch 2 (GEOMETRY vs GEOMETRY+LABEL).
+                +LABEL format: "visual: car" / "geometric: car".
             oracle_eval: If True, each GT 2D box becomes its own geometry
                 prompt (one-to-one). For measuring 3D regression quality
                 in isolation, following DetAny3D's GT prompt evaluation.
@@ -362,9 +373,12 @@ class SAM3_3DCollator:
         self.text_query_prob = text_query_prob
         self.keep_text_for_visual = keep_text_for_visual
 
-        # Geometry prompt options (SAM3 style text + geometry training)
+        # Geometry prompt options (5-mode training)
         self.use_geometry_prompts = use_geometry_prompts
         self.geometric_query_str = geometric_query_str
+        self.visual_query_str = visual_query_str
+        self.text_only_prob = text_only_prob
+        self.use_label_prob = use_label_prob
 
         # Oracle evaluation mode
         self.oracle_eval = oracle_eval
@@ -606,7 +620,9 @@ class SAM3_3DCollator:
         geo_boxes_list = []  # normalized cxcywh (for visual/geometry queries)
         geo_points_list = []  # normalized xy with labels
         is_visual_query_list = []  # Track which queries have visual prompts
-        query_types_list = []  # Track query types: 0=TEXT, 2=GEOMETRY
+        # Query types (collator-level label only, does NOT control SAM3 internal matching):
+        # 0=TEXT, 1=VISUAL, 2=GEOMETRY, 3=VISUAL+LABEL, 4=GEOMETRY+LABEL
+        query_types_list = []
 
         # Multi-instance targets: list of lists
         # gt_boxes2d_per_query[i] = list of normalized xyxy boxes for query i
@@ -768,25 +784,80 @@ class SAM3_3DCollator:
                         cat_name = self.default_text
 
                     if self.use_geometry_prompts:
-                        # ========== Text + Geometry Training ==========
-                        # Create TWO queries per category
+                        # ========== 5-Mode Training ==========
+                        # Creates 2 queries per category:
+                        #
+                        # Branch 1 ("multi-target"): target = ALL instances of this category
+                        #   - TEXT:         text="car",          no box
+                        #   - VISUAL:       text="visual",       geo_box
+                        #   - VISUAL+LABEL: text="visual: car",  geo_box
+                        #
+                        # Branch 2 ("single-target"): target = 1 selected instance only
+                        #   - GEOMETRY:       text="geometric",       geo_box
+                        #   - GEOMETRY+LABEL: text="geometric: car",  geo_box
+                        #
+                        # NOTE on "multi-target" vs "single-target":
+                        # This refers to how many GT boxes are assigned as
+                        # targets in this collator (num_gts). This is DIFFERENT
+                        # from SAM3's internal o2o/o2m matching (DAC mechanism).
+                        # SAM3's DAC always runs both Hungarian (o2o) and
+                        # one-to-many (o2m) matchers in the decoder regardless
+                        # of how many GT targets we assign here.
 
-                        # ----- Query 1: TEXT query (one-to-many) -----
+                        # Helper: add text to unique_texts and return its id
+                        def _get_text_id(text_str):
+                            if text_str not in text_to_id:
+                                text_to_id[text_str] = len(unique_texts)
+                                unique_texts.append(text_str)
+                            return text_to_id[text_str]
+
+                        # Helper: select a random GT box and return its
+                        # normalized cxcywh (with optional noise)
+                        def _make_geo_box(box_indices_inner):
+                            sel_idx = random.choice(box_indices_inner)
+                            bx = boxes2d[sel_idx]
+                            bx_np = bx.cpu().numpy() if isinstance(bx, torch.Tensor) else bx
+                            if self.box_noise_std > 0:
+                                bx_np = noise_box(
+                                    bx_np,
+                                    im_size=(H, W),
+                                    box_noise_std=self.box_noise_std,
+                                    box_noise_max=self.box_noise_max,
+                                )
+                            norm_xyxy = torch.tensor([
+                                bx_np[0] / W, bx_np[1] / H,
+                                bx_np[2] / W, bx_np[3] / H,
+                            ], dtype=torch.float32, device=device)
+                            return sel_idx, xyxy_to_cxcywh(norm_xyxy)
+
+                        # ----- Branch 1 (multi-target): TEXT / VISUAL / VISUAL+LABEL -----
                         img_ids_list.append(img_idx)
                         gt_category_ids_list.append(cat_id)
-                        query_types_list.append(0)  # TEXT
-                        is_visual_query_list.append(False)
 
-                        # Text = category name
-                        if cat_name not in text_to_id:
-                            text_to_id[cat_name] = len(unique_texts)
-                            unique_texts.append(cat_name)
-                        text_ids_list.append(text_to_id[cat_name])
+                        is_text_only = random.random() < self.text_only_prob
+                        if is_text_only:
+                            # TEXT: text="car", no box, all targets
+                            query_types_list.append(0)  # TEXT
+                            is_visual_query_list.append(False)
+                            text_ids_list.append(_get_text_id(cat_name))
+                            geo_boxes_list.append(None)
+                        else:
+                            # Box-based o2m query
+                            has_label = random.random() < self.use_label_prob
+                            if has_label:
+                                # VISUAL+LABEL: text="visual: car", box, all targets
+                                query_types_list.append(3)  # VISUAL+LABEL
+                                vl_text = f"{self.visual_query_str}: {cat_name}"
+                                text_ids_list.append(_get_text_id(vl_text))
+                            else:
+                                # VISUAL: text="visual", box, all targets
+                                query_types_list.append(1)  # VISUAL
+                                text_ids_list.append(_get_text_id(self.visual_query_str))
+                            is_visual_query_list.append(True)
+                            _, geo_cxcywh = _make_geo_box(box_indices)
+                            geo_boxes_list.append(geo_cxcywh)
 
-                        # No geometry prompt for text query
-                        geo_boxes_list.append(None)
-
-                        # Targets: ALL boxes of this category (one-to-many)
+                        # Targets: ALL boxes of this category (multi-target)
                         query_gt_boxes2d = []
                         query_gt_boxes3d = []
                         for box_idx in box_indices:
@@ -796,42 +867,26 @@ class SAM3_3DCollator:
                         gt_boxes2d_per_query.append(query_gt_boxes2d)
                         gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
 
-                        # ----- Query 2: GEOMETRY query (one-to-one) -----
+                        # ----- Branch 2 (single-target): GEOMETRY / GEOMETRY+LABEL -----
                         img_ids_list.append(img_idx)
                         gt_category_ids_list.append(cat_id)
-                        query_types_list.append(2)  # GEOMETRY
+
+                        has_label_b2 = random.random() < self.use_label_prob
+                        if has_label_b2:
+                            # GEOMETRY+LABEL: text="geometric: car", box, 1 target
+                            query_types_list.append(4)  # GEOMETRY+LABEL
+                            gl_text = f"{self.geometric_query_str}: {cat_name}"
+                            text_ids_list.append(_get_text_id(gl_text))
+                        else:
+                            # GEOMETRY: text="geometric", box, 1 target
+                            query_types_list.append(2)  # GEOMETRY
+                            text_ids_list.append(_get_text_id(self.geometric_query_str))
                         is_visual_query_list.append(True)
 
-                        # Text = "geometric" (SAM3 convention)
-                        if self.geometric_query_str not in text_to_id:
-                            text_to_id[self.geometric_query_str] = len(unique_texts)
-                            unique_texts.append(self.geometric_query_str)
-                        text_ids_list.append(text_to_id[self.geometric_query_str])
+                        selected_idx, geo_cxcywh = _make_geo_box(box_indices)
+                        geo_boxes_list.append(geo_cxcywh)
 
-                        # Randomly select ONE box as geometry prompt
-                        selected_idx = random.choice(box_indices)
-                        box_xyxy = boxes2d[selected_idx]
-                        box_xyxy_np = box_xyxy.cpu().numpy() if isinstance(box_xyxy, torch.Tensor) else box_xyxy
-
-                        # Optionally add noise (using SAM3's noise_box logic)
-                        if self.box_noise_std > 0:
-                            box_xyxy_np = noise_box(
-                                box_xyxy_np,
-                                im_size=(H, W),
-                                box_noise_std=self.box_noise_std,
-                                box_noise_max=self.box_noise_max,
-                            )
-
-                        # Convert to normalized cxcywh for geometry encoder
-                        box_norm_xyxy = torch.tensor([
-                            box_xyxy_np[0] / W,
-                            box_xyxy_np[1] / H,
-                            box_xyxy_np[2] / W,
-                            box_xyxy_np[3] / H,
-                        ], dtype=torch.float32, device=device)
-                        geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
-
-                        # Target: ONLY the selected box (one-to-one)
+                        # Target: ONLY the selected box (single-target)
                         query_gt_boxes2d = [normalize_box_xyxy(boxes2d[selected_idx])]
                         query_gt_boxes3d = []
                         if boxes3d is not None and selected_idx < len(boxes3d):

@@ -33,6 +33,7 @@ from .connector import SAM3_3DCollator
 _default_collator = None
 _test_collator = None
 _oracle_collator = None
+_5mode_collator = None
 
 
 def sam3_3d_collate_fn(batch: List[dict], **kwargs):
@@ -108,6 +109,32 @@ def sam3_3d_oracle_collate_fn(batch: List[dict], **kwargs):
             filter_empty_boxes=False,  # Oracle eval is always test-time
         )
     return _oracle_collator(batch)
+
+
+def sam3_3d_5mode_collate_fn(batch: List[dict], **kwargs):
+    """5-mode SAM3_3D collate function (module-level for vis4d).
+
+    Per category creates 2 queries:
+      Branch 1 (o2m): TEXT / VISUAL / VISUAL+LABEL
+      Branch 2 (o2o): GEOMETRY / GEOMETRY+LABEL
+
+    Args:
+        batch: List of data samples
+        **kwargs: Additional arguments from vis4d
+
+    Returns:
+        Collated batch data
+    """
+    global _5mode_collator
+    if _5mode_collator is None:
+        _5mode_collator = SAM3_3DCollator(
+            max_prompts_per_image=50,
+            use_text_prompts=True,
+            use_geometry_prompts=True,
+            text_only_prob=0.5,
+            use_label_prob=1/3,
+        )
+    return _5mode_collator(batch)
 
 
 def create_sam3_3d_collate_fn(
@@ -192,9 +219,11 @@ def get_sam3_3d_data_cfg(
     # Text/Visual query ratio (SAM3 original design)
     text_query_prob: float = 0.7,
     keep_text_for_visual: bool = False,
-    # Geometry prompt options (NEW: text + geometry training)
+    # Geometry prompt options (5-mode training)
     use_geometry_prompts: bool = False,
     geometric_query_str: str = "geometric",
+    text_only_prob: float = 0.5,
+    use_label_prob: float = 1/3,
     box_noise_std: float = 0.0,
     box_noise_max: float | None = 20.0,
     # Dataloader options
@@ -211,8 +240,8 @@ def get_sam3_3d_data_cfg(
     to convert per-image data to per-prompt batch (SAM3_3DBatchedInputs).
 
     IMPORTANT: Training and test use SEPARATE collators by default:
-    - Training: Uses configured text_query_prob and use_geometry_prompts
-    - Testing: Uses test_text_query_prob=1.0 (pure text) for fair evaluation
+    - Training: Uses configured use_geometry_prompts with 5-mode training
+    - Testing: Uses pure text for fair evaluation
 
     Args:
         train_datasets: Training dataset configuration
@@ -221,37 +250,31 @@ def get_sam3_3d_data_cfg(
         workers_per_gpu: Number of data loading workers per GPU
         max_prompts_per_image: Max prompts (categories) per image
         use_text_prompts: Whether to include text with geometric prompts
-        text_query_prob: Probability of text-only queries (SAM3 recommended: 0.7)
-            1.0 = all text queries (pure text training)
-            0.7 = 70% text, 30% visual (SAM3 mixed training)
-            0.0 = all visual queries (DetAny3D style)
+        text_query_prob: Probability of text-only queries (legacy 2-mode)
         keep_text_for_visual: If True, visual queries keep category text
-            If False (default), visual queries use "visual" as text
-        use_geometry_prompts: If True, create geometry queries per category
-            This implements text + geometry training (SAM3 style):
-            - Each category gets 1 TEXT query (one-to-many targets)
-            - Each category gets 1 GEOMETRY query (one-to-one target)
+        use_geometry_prompts: If True, 5-mode training with 2 queries per
+            category (Branch 1 o2m + Branch 2 o2o)
         geometric_query_str: Text for geometry queries (default "geometric")
+        text_only_prob: Branch 1 P(TEXT) (only when use_geometry_prompts=True)
+        use_label_prob: P(+LABEL) for box-based queries (both branches)
         box_noise_std: Noise std for box jittering (0 = no noise)
         box_noise_max: Max noise in pixels
         shuffle: Whether to shuffle training data (default True)
-            Set to False for deterministic overfit tests
-        test_text_query_prob: Probability of text queries during test (default 1.0)
-            1.0 = pure text evaluation (like GDino3D)
+        test_text_query_prob: Probability of text queries during test
         test_use_geometry_prompts: Whether to use geometry prompts during test
-            False = pure text evaluation (like GDino3D)
-        oracle_eval: If True, test collator uses oracle mode where each GT
-            2D box becomes its own geometry prompt (one-to-one). Only
-            affects test collator; training is unchanged.
+        oracle_eval: If True, test collator uses oracle mode
 
     Returns:
         DataConfig with train and test dataloaders
     """
     data = DataConfig()
 
-    # Training collate function: resolves to module-level sam3_3d_collate_fn
-    # via vis4d's DelayedInstantiator (text_query_prob=0.7, filter_empty_boxes=True).
-    train_collate_fn = sam3_3d_collate_fn
+    # Training collate function: select based on use_geometry_prompts.
+    # Use module-level functions so vis4d's DelayedInstantiator can resolve.
+    if use_geometry_prompts:
+        train_collate_fn = sam3_3d_5mode_collate_fn
+    else:
+        train_collate_fn = sam3_3d_collate_fn
 
     # Test collate function: use a module-level function so vis4d resolves it
     # correctly.  create_sam3_3d_collate_fn() closures do NOT work because

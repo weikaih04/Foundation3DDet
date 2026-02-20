@@ -27,7 +27,11 @@ from vis4d.op.loss.reducer import SumWeightedLoss
 from opendet3d.op.detect3d.grounding_dino_3d.coder import GroundingDINO3DCoder
 from sam3.model.box_ops import fast_diag_box_iou, fast_diag_generalized_box_iou
 from sam3.train.matcher import BinaryOneToManyMatcher
-from sam3.train.loss.loss_fns import sigmoid_focal_loss
+from sam3.train.loss.loss_fns import (
+    IABCEMdetr,
+    Boxes as SAM3Boxes,
+    sigmoid_focal_loss,
+)
 
 
 def _packed_to_padded(boxes_packed: Tensor, num_boxes: Tensor, fill_value: float = 0.0) -> Tensor:
@@ -161,10 +165,21 @@ class SAM3_3DLoss(nn.Module):
         self.box_coder = box_coder or GroundingDINO3DCoder()
         self.reg_dims = self.box_coder.reg_dims
 
-        # Note: O2O matcher is configured in sam3_3d.py (self.sam3.matcher)
-        # We only need O2M matcher here for O2M loss computation
+        # SAM3's 2D loss classes (directly imported from sam3.train.loss.loss_fns)
+        # weak_loss=False follows SAM3's own training configs — all unmatched
+        # predictions receive negative loss regardless of is_exhaustive.
+        self.cls_loss = IABCEMdetr(
+            pos_weight=self.config.pos_weight,
+            gamma=self.config.gamma,
+            alpha=self.config.alpha,
+            weak_loss=False,
+            use_presence=self.config.use_presence,
+            presence_alpha=self.config.presence_alpha,
+            presence_gamma=self.config.presence_gamma,
+        )
+        self.box_loss = SAM3Boxes()
 
-        # Initialize O2M matcher if enabled
+        # O2M matcher for DAC one-to-many loss
         if self.config.use_o2m:
             self.o2m_matcher = BinaryOneToManyMatcher(
                 alpha=self.config.o2m_alpha,
@@ -260,12 +275,49 @@ class SAM3_3DLoss(nn.Module):
         # Get per-prompt intrinsics
         intrinsics = batch.intrinsics[batch.img_ids]  # (N_prompts, 3, 3)
 
+        # SAM3's IABCEMdetr and Boxes loss classes need additional formats:
+        # - boxes (cxcywh packed) for L1 loss
+        # - boxes_padded (cxcywh padded) for presence keep_loss
+        # - object_ids_padded for presence keep_loss
+        # - is_exhaustive for weak loss masking
+        boxes_cxcywh = self._xyxy_to_cxcywh(boxes_xyxy)
+
+        # Padded format (B, max_N, 4) for presence loss keep_loss computation
+        boxes_padded = _packed_to_padded(boxes_cxcywh, num_gts)
+        max_N = boxes_padded.shape[1]
+
+        # Object IDs: sequential within each prompt's targets
+        object_ids_padded = torch.full(
+            (N_prompts, max_N), -1, dtype=torch.long, device=device
+        )
+        offset = 0
+        for i in range(N_prompts):
+            n = int(num_gts[i].item())
+            if n > 0:
+                object_ids_padded[i, :n] = torch.arange(
+                    offset, offset + n, device=device
+                )
+                offset += n
+
+        # is_exhaustive: multi-target queries are exhaustive, single-target are not
+        # query_types: 0=TEXT, 1=VISUAL, 3=VISUAL+LABEL → exhaustive (True)
+        # query_types: 2=GEOMETRY, 4=GEOMETRY+LABEL → not exhaustive (False)
+        if batch.query_types is not None:
+            qt = batch.query_types.to(device)
+            is_exhaustive = (qt == 0) | (qt == 1) | (qt == 3)
+        else:
+            is_exhaustive = torch.ones(N_prompts, dtype=torch.bool, device=device)
+
         return {
             "boxes_xyxy": boxes_xyxy,
+            "boxes": boxes_cxcywh,
+            "boxes_padded": boxes_padded,
             "boxes_3d": boxes_3d,
             "classes": classes,
-            "num_boxes": num_gts,  # (N_prompts,) - can be > 1 for multi-instance
+            "num_boxes": num_gts,
             "intrinsics": intrinsics,
+            "object_ids_padded": object_ids_padded,
+            "is_exhaustive": is_exhaustive,
         }
 
     def forward(
@@ -363,43 +415,50 @@ class SAM3_3DLoss(nn.Module):
         # Get number of boxes for normalization
         num_boxes = self._get_num_boxes(normalized_targets)
         
-        # ========== 2D Losses (scaled by loss_2d_scale) ==========
+        # ========== 2D Losses via SAM3's loss classes (scaled by loss_2d_scale) ==========
         if _PROFILE_LOSS:
             torch.cuda.synchronize()
             _t0 = time.perf_counter()
 
-        loss_cls = self._loss_classification(
-            pred_logits, pred_boxes_2d, indices, normalized_targets, num_boxes
+        # Build SAM3-format outputs dict for loss classes
+        sam3_outputs = {
+            "pred_logits": pred_logits,
+            "pred_boxes_xyxy": pred_boxes_2d,
+            "pred_boxes": out.pred_boxes_2d_cxcywh,
+        }
+        if out.presence_logits is not None:
+            sam3_outputs["presence_logit_dec"] = out.presence_logits
+
+        # Classification + presence via SAM3's IABCEMdetr
+        cls_losses = self.cls_loss.get_loss(
+            sam3_outputs, normalized_targets, indices, num_boxes
         )
         losses["loss_cls"] = (
-            self.config.loss_2d_scale * loss_cls * self.config.loss_cls_weight
+            self.config.loss_2d_scale * cls_losses["loss_ce"] * self.config.loss_cls_weight
         )
+        if cls_losses.get("presence_loss", 0.0) != 0.0:
+            losses["loss_presence"] = (
+                self.config.loss_2d_scale * cls_losses["presence_loss"]
+                * self.config.presence_loss_weight
+            )
 
         if _PROFILE_LOSS:
             torch.cuda.synchronize()
             _loss_cls_time = (time.perf_counter() - _t0) * 1000
 
-        # Presence loss (per-category presence detection, following SAM3 original)
-        # Uses presence_logit_dec to predict whether each category exists in the image
-        if self.config.use_presence and out.presence_logits is not None:
-            loss_presence = self._loss_presence(out.presence_logits, normalized_targets)
-            losses["loss_presence"] = (
-                self.config.loss_2d_scale * loss_presence * self.config.presence_loss_weight
-            )
-
-        # 2D box losses (L1 in normalized cxcywh, GIoU in pixel xyxy - following SAM3/GDino3D)
+        # 2D box losses (L1 + GIoU) via SAM3's Boxes class
         if _PROFILE_LOSS:
             torch.cuda.synchronize()
             _t1 = time.perf_counter()
 
-        loss_bbox, loss_giou = self._loss_boxes_2d(
-            pred_boxes_2d, indices, normalized_targets, num_boxes, image_size
+        box_losses = self.box_loss.get_loss(
+            sam3_outputs, normalized_targets, indices, num_boxes
         )
         losses["loss_bbox"] = (
-            self.config.loss_2d_scale * loss_bbox * self.config.loss_bbox_weight
+            self.config.loss_2d_scale * box_losses["loss_bbox"] * self.config.loss_bbox_weight
         )
         losses["loss_giou"] = (
-            self.config.loss_2d_scale * loss_giou * self.config.loss_giou_weight
+            self.config.loss_2d_scale * box_losses["loss_giou"] * self.config.loss_giou_weight
         )
 
         if _PROFILE_LOSS:
@@ -417,6 +476,7 @@ class SAM3_3DLoss(nn.Module):
             o2m_losses = self._loss_o2m(
                 pred_logits=out.pred_logits_o2m,
                 pred_boxes_2d=out.pred_boxes_2d_o2m,
+                pred_boxes_2d_cxcywh=out.pred_boxes_2d_cxcywh_o2m,
                 pred_boxes_3d=out.pred_boxes_3d_o2m,
                 targets=normalized_targets,
                 num_boxes=num_boxes,
@@ -559,203 +619,14 @@ class SAM3_3DLoss(nn.Module):
 
         return num_boxes
 
-    def _loss_classification(
-        self,
-        pred_logits: Tensor,  # (B, S, 1)
-        pred_boxes_2d: Tensor,  # (B, S, 4)
-        indices: tuple[Tensor, Tensor, Tensor | None],
-        targets: dict,
-        num_boxes: Tensor,
-    ) -> Tensor:
-        """Compute IABCEMdetr-style classification loss.
-
-        This follows SAM3's IoU-aware BCE loss with soft targets.
-        Includes weak supervision for non-exhaustive annotations.
-        """
-        batch_idx, src_idx, tgt_idx = indices
-        device = pred_logits.device
-        B = pred_logits.shape[0]
-
-        src_logits = pred_logits.squeeze(-1)  # (B, S)
-        prob = src_logits.sigmoid()
-
-        # Create target classes (0 for background, 1 for foreground)
-        target_classes = torch.zeros_like(src_logits)
-        target_classes[(batch_idx, src_idx)] = 1.0
-
-        # Get matched boxes for IoU computation
-        src_boxes_xyxy = pred_boxes_2d[(batch_idx, src_idx)]
-        target_boxes_xyxy = (
-            targets["boxes_xyxy"][tgt_idx] if tgt_idx is not None
-            else targets["boxes_xyxy"]
-        )
-
-        # Compute IoU for soft targets
-        with torch.no_grad():
-            iou = fast_diag_box_iou(src_boxes_xyxy, target_boxes_xyxy)
-            # Soft target: prob^alpha * iou^(1-alpha)
-            t = prob[(batch_idx, src_idx)] ** self.config.alpha * iou ** (1 - self.config.alpha)
-            t = torch.clamp(t, 0.01).detach()
-
-            positive_target_classes = target_classes.clone()
-            positive_target_classes[(batch_idx, src_idx)] = t.to(positive_target_classes.dtype)
-
-        # Compute weak loss mask if enabled
-        weak_mask = torch.ones_like(src_logits)
-        if self.config.use_weak_loss:
-            weak_mask = self._compute_weak_loss_mask(
-                pred_boxes_2d, targets, batch_idx, src_idx
-            )
-
-        # BCE loss on positives with soft targets
-        loss_pos = F.binary_cross_entropy_with_logits(
-            src_logits, positive_target_classes, reduction="none"
-        )
-        loss_pos = loss_pos * target_classes * self.config.pos_weight
-
-        # BCE loss on negatives with focal weighting and weak mask
-        loss_neg = F.binary_cross_entropy_with_logits(
-            src_logits, target_classes, reduction="none"
-        )
-        loss_neg = loss_neg * (1 - target_classes) * (prob ** self.config.gamma) * weak_mask
-
-        loss_bce = loss_pos + loss_neg
-
-        # Apply keep_loss mask if use_presence is enabled (following SAM3 original)
-        # For prompts with no GT boxes, set classification loss to 0
-        # Only presence loss supervises these prompts (to predict presence = 0)
-        if self.config.use_presence:
-            num_gts = targets.get("num_boxes", torch.zeros(B, dtype=torch.long, device=device))
-            keep_loss = (num_gts > 0).float().unsqueeze(-1)  # (B, 1)
-            loss_bce = loss_bce * keep_loss
-
-        # SAM3 original: use mean() over all B×S logits (not sum()/num_boxes)
-        # This is different from bbox/giou which use sum()/num_boxes
-        # That's why loss_cls_weight=20 is needed to compensate
-        loss_bce = loss_bce.mean()
-
-        return loss_bce
-
-    def _compute_weak_loss_mask(
-        self,
-        pred_boxes_2d: Tensor,  # (B, S, 4)
-        targets: dict,
-        batch_idx: Tensor,
-        src_idx: Tensor,
-    ) -> Tensor:
-        """Compute weak loss mask for non-exhaustive annotations.
-
-        For unmatched predictions, compute max IoU with all GT boxes.
-        If max IoU > threshold, mask out the negative loss (might be unlabeled positive).
-
-        Args:
-            pred_boxes_2d: Predicted boxes (B, S, 4) normalized xyxy
-            targets: Ground truth targets
-            batch_idx: Matched prediction batch indices
-            src_idx: Matched prediction query indices
-
-        Returns:
-            Weak mask (B, S): 1.0 for normal negatives, 0.0 for weak negatives
-        """
-        device = pred_boxes_2d.device
-        B, S = pred_boxes_2d.shape[:2]
-
-        # Create mask: 1 for unmatched, 0 for matched
-        is_unmatched = torch.ones(B, S, dtype=torch.bool, device=device)
-        is_unmatched[(batch_idx, src_idx)] = False
-
-        weak_mask = torch.ones(B, S, dtype=torch.float32, device=device)
-
-        if not is_unmatched.any():
-            return weak_mask
-
-        # For each unmatched prediction, compute max IoU with GT
-        gt_boxes = targets["boxes_xyxy"]  # (N_total_gt, 4) normalized xyxy
-
-        if gt_boxes.numel() == 0:
-            return weak_mask
-
-        # Reshape for batch-wise processing
-        unmatched_boxes = pred_boxes_2d[is_unmatched]  # (N_unmatched, 4)
-
-        # Compute IoU between all unmatched boxes and all GT boxes
-        # This is expensive but necessary for weak supervision
-        from sam3.model.box_ops import box_iou
-
-        iou_matrix, _ = box_iou(unmatched_boxes, gt_boxes)  # (N_unmatched, N_total_gt)
-        max_iou = iou_matrix.max(dim=1)[0]  # (N_unmatched,)
-
-        # Threshold: if max IoU > 0.5, consider it a potential unlabeled positive
-        weak_threshold = 0.5
-        is_weak_negative = max_iou > weak_threshold
-
-        # Update mask: set to 0 for weak negatives
-        weak_mask_flat = torch.ones(B * S, dtype=torch.float32, device=device)
-        unmatched_indices = is_unmatched.view(-1).nonzero(as_tuple=True)[0]
-        weak_mask_flat[unmatched_indices[is_weak_negative]] = 0.0
-        weak_mask = weak_mask_flat.view(B, S)
-
-        return weak_mask
-
-    def _loss_presence(
-        self,
-        presence_logits: Tensor,  # (N_prompts, 1) from presence_logit_dec
-        targets: dict,
-    ) -> Tensor:
-        """Compute presence loss for per-category presence detection.
-
-        Following SAM3 original: presence_logit_dec predicts whether each
-        category/prompt has any visible objects in the image.
-
-        This is different from empty image detection - it's per-category:
-        - If category "car" has GT boxes -> target = 1
-        - If category "bicycle" has no GT boxes -> target = 0
-
-        Args:
-            presence_logits: Predicted presence logits (N_prompts, 1) from presence_logit_dec
-            targets: Ground truth targets with num_boxes field
-
-        Returns:
-            Presence loss scalar (sigmoid focal loss)
-        """
-        device = presence_logits.device
-        N_prompts = presence_logits.shape[0]
-
-        # Get number of GT boxes per prompt
-        num_gts = targets.get("num_boxes", torch.zeros(N_prompts, dtype=torch.long, device=device))
-
-        # Target: 1 if prompt has GT boxes, 0 otherwise (following SAM3 original)
-        # SAM3 uses: keep_loss = (gt_padded_is_visible.sum(dim=-1)[..., None] != 0).float()
-        presence_target = (num_gts > 0).float().unsqueeze(-1)  # (N_prompts, 1)
-
-        # Sigmoid focal loss (following SAM3 original)
-        # SAM3 uses: sigmoid_focal_loss(presence_logits, keep_loss, num_boxes=bs, alpha=0.5, gamma=0.0)
-        #
-        # Safety guards:
-        # 1. Clamp logits to [-30, 30] to prevent extreme sigmoid values
-        # 2. Force triton=False for gamma < 1.0 — triton kernel backward
-        #    computes gamma * p^(gamma-1) which gives 0*inf=NaN when gamma=0
-        #    or inf when gamma<1 and p is small. PyTorch autograd handles
-        #    gamma=0 correctly (pow gradient is optimized away).
-        # 3. gamma >= 1.0 is safe with triton (p^(gamma-1) bounded for p in [0,1])
-        presence_logits = presence_logits.clamp(-30, 30)
-
-        use_triton = self.config.presence_gamma >= 1.0
-        loss_presence = sigmoid_focal_loss(
-            presence_logits,
-            presence_target,
-            num_boxes=N_prompts,
-            alpha=self.config.presence_alpha,
-            gamma=self.config.presence_gamma,
-            triton=use_triton,
-        )
-
-        return loss_presence
+    # 2D classification and box losses are now handled by SAM3's
+    # IABCEMdetr (self.cls_loss) and Boxes (self.box_loss) classes.
 
     def _loss_o2m(
         self,
         pred_logits: Tensor,  # (B, S, 1)
-        pred_boxes_2d: Tensor,  # (B, S, 4)
+        pred_boxes_2d: Tensor,  # (B, S, 4) normalized xyxy
+        pred_boxes_2d_cxcywh: Tensor | None,  # (B, S, 4) normalized cxcywh
         pred_boxes_3d: Tensor | None,  # (B, S, reg_dims)
         targets: dict,
         num_boxes: Tensor,
@@ -764,72 +635,56 @@ class SAM3_3DLoss(nn.Module):
     ) -> dict[str, Tensor]:
         """Compute O2M (One-to-Many) auxiliary loss.
 
-        O2M matching allows multiple predictions to match the same GT,
-        which helps improve recall and stabilize training.
-
-        Following SAM3 original design, O2M computes ALL loss components
-        (classification, 2D boxes, AND 3D boxes) for matched predictions.
-        Normalization uses num_boxes (GT count), same as O2O.
-
-        Args:
-            pred_logits: Predicted objectness logits
-            pred_boxes_2d: Predicted 2D boxes (normalized xyxy)
-            pred_boxes_3d: Predicted 3D box parameters (optional)
-            targets: Ground truth targets
-            num_boxes: Number of boxes for normalization (GT count)
-            intrinsics: Camera intrinsics for 3D loss (optional)
-            image_size: (H, W) for converting to pixel coordinates
-
-        Returns:
-            Dictionary with O2M losses (loss_cls, loss_bbox, loss_giou,
-            and optionally loss_delta_2d, loss_depth, loss_dim, loss_rot)
+        Uses SAM3's IABCEMdetr and Boxes classes for 2D losses,
+        plus our own 3D loss for matched predictions.
         """
         losses = {}
         device = pred_logits.device
         B, S = pred_logits.shape[:2]
 
         # Prepare targets in padded format for O2M matcher
-        boxes_cxcywh = self._xyxy_to_cxcywh(targets["boxes_xyxy"])
-        num_boxes_per_image = targets.get("num_boxes", torch.tensor([len(targets["boxes_xyxy"])], device=device))
+        num_boxes_per_image = targets.get(
+            "num_boxes",
+            torch.tensor([len(targets["boxes_xyxy"])], device=device),
+        )
+        boxes_padded = targets.get("boxes_padded")
+        if boxes_padded is None:
+            boxes_cxcywh = self._xyxy_to_cxcywh(targets["boxes_xyxy"])
+            boxes_padded = _packed_to_padded(boxes_cxcywh, num_boxes_per_image)
 
-        # Convert packed boxes to padded format (B, max_N, 4)
-        boxes_padded = _packed_to_padded(boxes_cxcywh, num_boxes_per_image)
-
-        # Create validity mask (B, max_N) - True for valid boxes, False for padding
         max_N = boxes_padded.shape[1]
-        target_is_valid_padded = torch.zeros(B, max_N, dtype=torch.bool, device=device)
+        target_is_valid_padded = torch.zeros(
+            B, max_N, dtype=torch.bool, device=device
+        )
         for i in range(B):
             target_is_valid_padded[i, :num_boxes_per_image[i]] = True
 
-        # Compute O2M matching
+        # O2M matching
+        if pred_boxes_2d_cxcywh is None:
+            pred_boxes_2d_cxcywh = self._xyxy_to_cxcywh(pred_boxes_2d)
+
         outputs_dict = {
             "pred_logits": pred_logits,
-            "pred_boxes": self._xyxy_to_cxcywh(pred_boxes_2d),
+            "pred_boxes": pred_boxes_2d_cxcywh,
         }
-
         targets_dict = {
-            "boxes_padded": boxes_padded,  # Use padded format for O2M
+            "boxes_padded": boxes_padded,
             "labels": targets["classes"],
             "num_boxes": num_boxes_per_image,
         }
-
-        # Call O2M matcher with validity mask
         batch_idx, src_idx, tgt_idx = self.o2m_matcher(
             outputs_dict,
             targets_dict,
             target_is_valid_padded=target_is_valid_padded,
         )
 
-        # Handle empty matching case
         if batch_idx.numel() == 0:
-            # No matches, return zero losses (2D + 3D if applicable)
             zero_losses = {
                 "loss_cls": torch.tensor(0.0, device=device),
                 "loss_bbox": torch.tensor(0.0, device=device),
                 "loss_giou": torch.tensor(0.0, device=device),
             }
-            # Add 3D zero losses if 3D data is available
-            if pred_boxes_3d is not None and intrinsics is not None and "boxes_3d" in targets:
+            if pred_boxes_3d is not None and intrinsics is not None:
                 zero_losses.update({
                     "loss_delta_2d": torch.tensor(0.0, device=device),
                     "loss_depth": torch.tensor(0.0, device=device),
@@ -838,160 +693,42 @@ class SAM3_3DLoss(nn.Module):
                 })
             return zero_losses
 
-        # O2M Classification Loss (following SAM3 original IABCEMdetr)
-        src_logits = pred_logits.squeeze(-1)  # (B, S)
-        prob = src_logits.sigmoid()
+        o2m_indices = (batch_idx, src_idx, tgt_idx)
 
-        # Create target classes
-        target_classes = torch.zeros_like(src_logits)
-        target_classes[(batch_idx, src_idx)] = 1.0
-
-        # Get matched boxes for IoU computation (use tgt_idx to index into packed targets)
-        src_boxes_xyxy = pred_boxes_2d[(batch_idx, src_idx)]
-        target_boxes_xyxy = targets["boxes_xyxy"][tgt_idx]
-
-        # Compute IoU for soft targets
-        with torch.no_grad():
-            iou = fast_diag_box_iou(src_boxes_xyxy, target_boxes_xyxy)
-            t = prob[(batch_idx, src_idx)] ** self.config.alpha * iou ** (1 - self.config.alpha)
-            t = torch.clamp(t, 0.01).detach()
-
-            positive_target_classes = target_classes.clone()
-            positive_target_classes[(batch_idx, src_idx)] = t.to(positive_target_classes.dtype)
-
-        # Positive loss: BCE with soft target (same as main IABCEMdetr)
-        loss_pos = F.binary_cross_entropy_with_logits(
-            src_logits, positive_target_classes, reduction="none"
+        # 2D losses via SAM3 classes
+        o2m_outputs = {
+            "pred_logits": pred_logits,
+            "pred_boxes_xyxy": pred_boxes_2d,
+            "pred_boxes": pred_boxes_2d_cxcywh,
+        }
+        cls_losses = self.cls_loss.get_loss(
+            o2m_outputs, targets, o2m_indices, num_boxes
         )
-        loss_pos = loss_pos * target_classes * self.config.pos_weight
+        losses["loss_cls"] = cls_losses["loss_ce"]
 
-        # Negative loss: focal BCE (same as main IABCEMdetr)
-        loss_neg = F.binary_cross_entropy_with_logits(
-            src_logits, target_classes, reduction="none"
+        box_losses = self.box_loss.get_loss(
+            o2m_outputs, targets, o2m_indices, num_boxes
         )
-        loss_neg = loss_neg * (1 - target_classes) * (prob ** self.config.gamma)
+        losses["loss_bbox"] = box_losses["loss_bbox"]
+        losses["loss_giou"] = box_losses["loss_giou"]
 
-        # Total cls loss: positive + negative (following SAM3 original)
-        loss_bce = loss_pos + loss_neg
-
-        # Apply keep_loss mask if use_presence is enabled (following SAM3 original)
-        # For prompts with no GT boxes, set classification loss to 0
-        # This is applied to O2M as well (SAM3 original: loss_bce = loss_bce * keep_loss)
-        if self.config.use_presence:
-            num_gts = targets.get("num_boxes", torch.zeros(B, dtype=torch.long, device=device))
-            keep_loss = (num_gts > 0).float().unsqueeze(-1)  # (B, 1)
-            loss_bce = loss_bce * keep_loss
-
-        # SAM3 original: use mean() for cls (same as main loss)
-        loss_cls = loss_bce.mean()
-
-        losses["loss_cls"] = loss_cls
-
-        # O2M Box Losses
-        # Following SAM3 and GDino3D's design (consistent with _loss_boxes_2d):
-        # - L1 loss: computed in normalized cxcywh space [0, 1]
-        # - GIoU loss: computed in pixel xyxy space
-
-        # L1 loss in normalized cxcywh space
-        src_boxes_cxcywh = self._xyxy_to_cxcywh(src_boxes_xyxy)
-        target_boxes_cxcywh = self._xyxy_to_cxcywh(target_boxes_xyxy)
-        loss_bbox = F.l1_loss(src_boxes_cxcywh, target_boxes_cxcywh, reduction="none")
-        loss_bbox = loss_bbox.sum() / num_boxes
-        losses["loss_bbox"] = loss_bbox
-
-        # GIoU loss in pixel xyxy space
-        if image_size is not None:
-            H, W = image_size
-            factors = src_boxes_xyxy.new_tensor([W, H, W, H])
-            src_boxes_pixel = src_boxes_xyxy * factors
-            target_boxes_pixel = target_boxes_xyxy * factors
-        else:
-            # Fallback to normalized coordinates
-            src_boxes_pixel = src_boxes_xyxy
-            target_boxes_pixel = target_boxes_xyxy
-
-        loss_giou = 1 - fast_diag_generalized_box_iou(src_boxes_pixel, target_boxes_pixel)
-        loss_giou = torch.nan_to_num(loss_giou, nan=0.0, posinf=0.0, neginf=0.0)
-        loss_giou = loss_giou.sum() / num_boxes
-        losses["loss_giou"] = loss_giou
-
-        # O2M 3D Loss - same logic as O2O, just more matched pairs
-        # Following SAM3 original design: O2M computes ALL loss components
-        if pred_boxes_3d is not None and intrinsics is not None and "boxes_3d" in targets:
-            o2m_indices = (batch_idx, src_idx, tgt_idx)
+        # 3D losses (our own, not in SAM3)
+        if (pred_boxes_3d is not None and intrinsics is not None
+                and "boxes_3d" in targets):
             loss_3d = self._loss_boxes_3d(
                 pred_boxes_2d=pred_boxes_2d,
                 pred_boxes_3d=pred_boxes_3d,
                 indices=o2m_indices,
                 targets=targets,
                 intrinsics=intrinsics,
-                num_boxes=num_boxes,  # Same normalization as 2D (GT count)
+                num_boxes=num_boxes,
                 image_size=image_size,
             )
             losses.update(loss_3d)
 
         return losses
 
-    def _loss_boxes_2d(
-        self,
-        pred_boxes_2d: Tensor,  # (B, S, 4) normalized xyxy
-        indices: tuple[Tensor, Tensor, Tensor | None],
-        targets: dict,
-        num_boxes: Tensor,
-        image_size: tuple[int, int] | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Compute 2D box regression losses (L1 + GIoU).
-
-        Following SAM3 and GDino3D's design:
-        - L1 loss: computed in normalized cxcywh space [0, 1]
-        - GIoU loss: computed in pixel xyxy space
-
-        This allows direct use of GDino3D loss weights (bbox_loss_weight=5.0,
-        iou_loss_weight=2.0).
-
-        Args:
-            pred_boxes_2d: Predicted boxes (normalized xyxy [0, 1])
-            indices: Matching indices
-            targets: Ground truth targets (normalized xyxy [0, 1])
-            num_boxes: Number of boxes for normalization
-            image_size: (H, W) for converting to pixel coordinates (for GIoU)
-
-        Returns:
-            (loss_bbox, loss_giou) tuple
-        """
-        batch_idx, src_idx, tgt_idx = indices
-
-        src_boxes = pred_boxes_2d[(batch_idx, src_idx)]
-        target_boxes = (
-            targets["boxes_xyxy"][tgt_idx] if tgt_idx is not None
-            else targets["boxes_xyxy"]
-        )
-
-        # L1 loss in normalized cxcywh space (following SAM3 and GDino3D)
-        # Convert xyxy -> cxcywh for L1 loss computation
-        src_boxes_cxcywh = self._xyxy_to_cxcywh(src_boxes)
-        target_boxes_cxcywh = self._xyxy_to_cxcywh(target_boxes)
-        loss_bbox = F.l1_loss(src_boxes_cxcywh, target_boxes_cxcywh, reduction="none")
-        loss_bbox = loss_bbox.sum() / num_boxes
-
-        # GIoU loss in pixel xyxy space (following GDino3D)
-        if image_size is not None:
-            H, W = image_size
-            factors = src_boxes.new_tensor([W, H, W, H])
-            src_boxes_pixel = src_boxes * factors
-            target_boxes_pixel = target_boxes * factors
-        else:
-            # Fallback to normalized coordinates
-            src_boxes_pixel = src_boxes
-            target_boxes_pixel = target_boxes
-
-        loss_giou = 1 - fast_diag_generalized_box_iou(src_boxes_pixel, target_boxes_pixel)
-        # Guard: GIoU can produce NaN when boxes are degenerate (zero area,
-        # union=0). Replace NaN/Inf with 0 so these pairs don't contribute.
-        loss_giou = torch.nan_to_num(loss_giou, nan=0.0, posinf=0.0, neginf=0.0)
-        loss_giou = loss_giou.sum() / num_boxes
-
-        return loss_bbox, loss_giou
+    # _loss_boxes_2d replaced by SAM3's Boxes class (self.box_loss).
 
     def _loss_boxes_3d(
         self,
@@ -1064,11 +801,25 @@ class SAM3_3DLoss(nn.Module):
         factors = target_boxes_2d.new_tensor([W, H, W, H])
 
         for i in range(len(batch_idx)):
-            # Use GT 2D box (normalized xyxy) and convert to pixel
-            single_gt_box_2d = target_boxes_2d[i:i+1]  # GT 2D, normalized xyxy [0,1]
-            single_gt_box_2d_pixel = single_gt_box_2d * factors  # Convert to pixel
-
             single_box_3d = target_boxes_3d[i:i+1]
+
+            # Skip entries with invalid (all-zero) 3D boxes: set weight=0
+            # so they don't contribute to 3D loss. This handles the case
+            # where GT has a valid 2D box but no 3D annotation.
+            if single_box_3d.abs().sum() < 1e-6:
+                reg_dims = pred_boxes_3d.shape[-1]
+                target_boxes_3d_encoded_list.append(
+                    torch.zeros(1, reg_dims, device=pred_boxes_3d.device)
+                )
+                weights_3d_list.append(
+                    torch.zeros(1, reg_dims, device=pred_boxes_3d.device)
+                )
+                continue
+
+            # Use GT 2D box (normalized xyxy) and convert to pixel
+            single_gt_box_2d = target_boxes_2d[i:i+1]
+            single_gt_box_2d_pixel = single_gt_box_2d * factors
+
             single_intrinsic = intrinsics[batch_idx[i]]  # (3, 3)
 
             encoded, weights = self.box_coder.encode(
@@ -1151,35 +902,52 @@ class SAM3_3DLoss(nn.Module):
         """
         losses = {}
 
-        # Classification loss (scaled by loss_2d_scale)
-        if "pred_logits" in aux_out:
-            loss_cls = self._loss_classification(
-                aux_out["pred_logits"],
-                aux_out.get("pred_boxes_2d", aux_out.get("pred_boxes")),
-                indices,
-                targets,
-                num_boxes,
+        # Build SAM3-format outputs for aux layer
+        sam3_aux = {
+            "pred_logits": aux_out.get("pred_logits"),
+            "pred_boxes_xyxy": aux_out.get(
+                "pred_boxes_xyxy", aux_out.get("pred_boxes_2d")
+            ),
+            "pred_boxes": aux_out.get("pred_boxes"),
+        }
+        # If pred_boxes (cxcywh) not available, convert from xyxy
+        if sam3_aux["pred_boxes"] is None and sam3_aux["pred_boxes_xyxy"] is not None:
+            sam3_aux["pred_boxes"] = self._xyxy_to_cxcywh(
+                sam3_aux["pred_boxes_xyxy"]
+            )
+
+        # Classification loss via SAM3's IABCEMdetr (scaled by loss_2d_scale)
+        if sam3_aux["pred_logits"] is not None:
+            cls_losses = self.cls_loss.get_loss(
+                sam3_aux, targets, indices, num_boxes
             )
             losses["loss_cls"] = (
-                self.config.loss_2d_scale * loss_cls * self.config.loss_cls_weight
+                self.config.loss_2d_scale
+                * cls_losses["loss_ce"]
+                * self.config.loss_cls_weight
             )
 
-        # 2D box loss (L1 in normalized cxcywh, GIoU in pixel xyxy, scaled by loss_2d_scale)
-        if "pred_boxes_2d" in aux_out or "pred_boxes" in aux_out:
-            pred_boxes = aux_out.get("pred_boxes_2d", aux_out.get("pred_boxes"))
-            loss_bbox, loss_giou = self._loss_boxes_2d(
-                pred_boxes, indices, targets, num_boxes, image_size
+        # 2D box losses via SAM3's Boxes class (scaled by loss_2d_scale)
+        if sam3_aux["pred_boxes"] is not None:
+            box_losses = self.box_loss.get_loss(
+                sam3_aux, targets, indices, num_boxes
             )
             losses["loss_bbox"] = (
-                self.config.loss_2d_scale * loss_bbox * self.config.loss_bbox_weight
+                self.config.loss_2d_scale
+                * box_losses["loss_bbox"]
+                * self.config.loss_bbox_weight
             )
             losses["loss_giou"] = (
-                self.config.loss_2d_scale * loss_giou * self.config.loss_giou_weight
+                self.config.loss_2d_scale
+                * box_losses["loss_giou"]
+                * self.config.loss_giou_weight
             )
 
-        # 3D box loss (scaled by loss_3d_scale, following GDino3D's deep supervision design)
+        # 3D box loss (our own, scaled by loss_3d_scale)
         if "pred_boxes_3d" in aux_out and intrinsics is not None:
-            pred_boxes_2d = aux_out.get("pred_boxes_2d", aux_out.get("pred_boxes"))
+            pred_boxes_2d = aux_out.get(
+                "pred_boxes_2d", aux_out.get("pred_boxes_xyxy")
+            )
             loss_3d = self._loss_boxes_3d(
                 pred_boxes_2d,
                 aux_out["pred_boxes_3d"],
@@ -1189,7 +957,6 @@ class SAM3_3DLoss(nn.Module):
                 num_boxes,
                 image_size=image_size,
             )
-            # Apply loss_3d_scale to all 3D losses
             for key, value in loss_3d.items():
                 losses[key] = self.config.loss_3d_scale * value
 
