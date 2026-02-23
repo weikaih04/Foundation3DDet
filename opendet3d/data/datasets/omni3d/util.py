@@ -68,6 +68,12 @@ def get_dataset_det_map(
         det_map = (
             omni3d_arkitscenes_det_map if omni3d50 else arkitscenes_det_map
         )
+    elif "CubifyAnything" in dataset_name:
+        from opendet3d.data.datasets.cubifyanything import (
+            get_cubifyanything_det_map,
+        )
+
+        det_map = get_cubifyanything_det_map(dataset_name)
     else:
         raise ValueError(f"Unknown dataset_name: {dataset_name}")
 
