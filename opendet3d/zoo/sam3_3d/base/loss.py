@@ -35,11 +35,14 @@ def get_sam3_3d_loss_cfg(
     loss_opt_ssi_weight: float = 0.5,  # SSI loss weight (UniDepthV2)
     # Auxiliary loss
     aux_loss_weight: float = 1.0,
-    # 3D Confidence Head (positive-only, no fg/bg task)
+    # 3D Confidence Head (positive + negative)
     use_3d_conf: bool = False,
     loss_3d_conf_weight: float = 20.0,
-    conf_depth_weight: float = 0.3,
-    conf_iou_3d_weight: float = 0.7,
+    conf_depth_weight: float = 0.7,
+    conf_iou_3d_weight: float = 0.3,
+    # Ignore box negative loss suppression
+    use_ignore_suppress: bool = False,
+    ignore_iou_threshold: float = 0.5,
 ) -> ConfigDict:
     """Get SAM3_3D loss configuration.
 
@@ -91,6 +94,9 @@ def get_sam3_3d_loss_cfg(
         loss_3d_conf_weight=loss_3d_conf_weight,
         conf_depth_weight=conf_depth_weight,
         conf_iou_3d_weight=conf_iou_3d_weight,
+        # Ignore box negative loss suppression
+        use_ignore_suppress=use_ignore_suppress,
+        ignore_iou_threshold=ignore_iou_threshold,
     )
     
     loss = class_config(

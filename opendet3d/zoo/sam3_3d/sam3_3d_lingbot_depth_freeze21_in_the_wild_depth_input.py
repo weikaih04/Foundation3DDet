@@ -15,7 +15,7 @@ from vis4d.data.data_pipe import DataPipe
 from vis4d.data.io.hdf5 import HDF5Backend
 from vis4d.zoo.base import get_default_cfg
 
-from opendet3d.zoo.gdino3d.base.callback import get_in_the_wild_evaluator_cfg
+from opendet3d.zoo.gdino3d.base.callback import get_in_the_wild_eval_callbacks
 from opendet3d.zoo.gdino3d.base.dataset.omni3d import get_omni3d_train_cfg
 from opendet3d.zoo.gdino3d.base.dataset.transform import get_test_transforms_cfg
 from opendet3d.zoo.gdino3d.base.pl import get_pl_cfg
@@ -133,23 +133,17 @@ def get_config() -> ExperimentConfig:
     ##                     CALLBACKS                    ##
     ######################################################
     from vis4d.data.const import AxisMode
-    from vis4d.engine.callbacks import EvaluatorCallback, VisualizerCallback
+    from vis4d.engine.callbacks import VisualizerCallback
     from vis4d.vis.image.bbox3d_visualizer import BoundingBox3DVisualizer
     from vis4d.vis.image.canvas import PillowCanvasBackend
     from vis4d.zoo.base import get_default_callbacks_cfg
 
     callbacks = get_default_callbacks_cfg()
 
-    callbacks.append(
-        class_config(
-            EvaluatorCallback,
-            evaluator=get_in_the_wild_evaluator_cfg(
-                data_root=in_the_wild_data_root
-            ),
-            metrics_to_eval=["3D"],
-            save_predictions=True,
+    callbacks.extend(
+        get_in_the_wild_eval_callbacks(
+            data_root=in_the_wild_data_root,
             output_dir=config.output_dir,
-            save_prefix="detection",
             test_connector=class_config(SAM3_3DDetect3DEvalConnector),
         )
     )

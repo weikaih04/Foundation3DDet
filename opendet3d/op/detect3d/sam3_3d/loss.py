@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -137,12 +138,19 @@ class SAM3_3DLossConfig:
     loss_dice_weight: float = 0.0  # Set > 0 to enable dice loss
 
     # ========== 3D Confidence Head ==========
-    # Only supervised on positive (matched) samples. No negative loss.
-    # Inference: final_score = pred_logits.sigmoid() * pred_conf_3d.sigmoid()
+    # Positive: soft target = quality (iou_3d + depth). Negative: push to 0.
+    # Inference: final_score = 2d_score + conf_3d_inference_weight * 3d_score
     use_3d_conf: bool = False  # Enable 3D confidence head loss
-    loss_3d_conf_weight: float = 20.0  # Weight for 3D confidence loss
-    conf_depth_weight: float = 0.3  # Weight for depth quality in quality target
-    conf_iou_3d_weight: float = 0.7  # Weight for 3D IoU in quality target
+    loss_3d_conf_weight: float = 20.0  # Weight for 3D confidence loss (same as 2D loss_cls_weight)
+    conf_depth_weight: float = 0.7  # Weight for depth quality in quality target
+    conf_iou_3d_weight: float = 0.3  # Weight for 3D IoU in quality target
+
+    # ========== Ignore Box Negative Loss Suppression ==========
+    # Suppress negative classification loss for predictions that overlap
+    # with ignore-annotated objects (truncated, occluded, etc.).
+    # This aligns training with eval, where such detections are neutral.
+    use_ignore_suppress: bool = False
+    ignore_iou_threshold: float = 0.5  # 2D IoU threshold for suppression
 
 
 class SAM3_3DLoss(nn.Module):
@@ -196,6 +204,42 @@ class SAM3_3DLoss(nn.Module):
             )
         else:
             self.o2m_matcher = None
+
+    def _compute_ignore_neg_mask(
+        self,
+        pred_boxes: Tensor,
+        ignore_boxes: Tensor,
+        num_ignores: Tensor,
+        threshold: float = 0.5,
+    ) -> Tensor:
+        """Compute mask for predictions overlapping ignore boxes.
+
+        Args:
+            pred_boxes: (B, S, 4) normalized xyxy predicted boxes.
+            ignore_boxes: (B, max_ignore, 4) normalized xyxy ignore boxes.
+            num_ignores: (B,) number of valid ignore boxes per prompt.
+            threshold: 2D IoU threshold above which to suppress.
+
+        Returns:
+            mask: (B, S) float. 1.0 = suppress negative loss, 0.0 = normal.
+        """
+        import torchvision.ops
+
+        B, S, _ = pred_boxes.shape
+        device = pred_boxes.device
+        mask = torch.zeros(B, S, device=device)
+
+        for b in range(B):
+            n_ign = num_ignores[b].item()
+            if n_ign == 0:
+                continue
+            iou = torchvision.ops.box_iou(
+                pred_boxes[b],
+                ignore_boxes[b, :n_ign],
+            )  # (S, n_ign)
+            mask[b] = (iou.max(dim=1).values > threshold).float()
+
+        return mask
 
     def _build_targets_from_batch(
         self, batch: "SAM3_3DBatchedInputs"
@@ -437,6 +481,23 @@ class SAM3_3DLoss(nn.Module):
         if out.presence_logits is not None:
             sam3_outputs["presence_logit_dec"] = out.presence_logits
 
+        # Compute ignore negative loss suppression mask
+        if (
+            self.config.use_ignore_suppress
+            and batch.ignore_boxes2d is not None
+            and batch.num_ignores is not None
+        ):
+            normalized_targets["_ignore_boxes2d"] = batch.ignore_boxes2d
+            normalized_targets["_num_ignores"] = batch.num_ignores
+            normalized_targets["ignore_neg_mask"] = (
+                self._compute_ignore_neg_mask(
+                    pred_boxes_2d,
+                    batch.ignore_boxes2d,
+                    batch.num_ignores,
+                    threshold=self.config.ignore_iou_threshold,
+                )
+            )
+
         # Classification + presence via SAM3's IABCEMdetr
         cls_losses = self.cls_loss.get_loss(
             sam3_outputs, normalized_targets, indices, num_boxes
@@ -497,6 +558,7 @@ class SAM3_3DLoss(nn.Module):
                 num_boxes=num_boxes,
                 intrinsics=intrinsics,
                 image_size=image_size,
+                pred_conf_3d=out.pred_conf_3d_o2m,
             )
             # Apply appropriate scale and loss weights (following SAM3 original)
             # SAM3 original: loss = loss_value * o2m_weight * loss_weight
@@ -509,6 +571,7 @@ class SAM3_3DLoss(nn.Module):
                 "loss_depth": self.config.loss_depth_weight,
                 "loss_dim": self.config.loss_dim_weight,
                 "loss_rot": self.config.loss_rot_weight,
+                "loss_3d_cls": self.config.loss_3d_conf_weight,
             }
             for key, value in o2m_losses.items():
                 loss_weight = o2m_weight_map.get(key, 1.0)
@@ -517,6 +580,9 @@ class SAM3_3DLoss(nn.Module):
                     o2m_loss_val = (
                         self.config.loss_3d_scale * value * loss_weight * self.config.o2m_loss_weight
                     )
+                elif key == "loss_3d_cls":
+                    # 3D confidence loss: weight * o2m_weight (no extra scale)
+                    o2m_loss_val = value * loss_weight * self.config.o2m_loss_weight
                 else:
                     # 2D losses (loss_cls, loss_bbox, loss_giou) use loss_2d_scale
                     o2m_loss_val = (
@@ -549,13 +615,6 @@ class SAM3_3DLoss(nn.Module):
             _loss_3d_time = (time.perf_counter() - _t2) * 1000
 
         # ========== 3D Confidence Loss (positive samples only) ==========
-        # DEBUG: check conditions
-        if not hasattr(self, '_3d_conf_debug_printed'):
-            self._3d_conf_debug_printed = True
-            print(f"[3D Conf Debug] use_3d_conf={self.config.use_3d_conf}, "
-                  f"pred_conf_3d={'not None' if out.pred_conf_3d is not None else 'None'}, "
-                  f"pred_boxes_3d={'not None' if pred_boxes_3d is not None else 'None'}, "
-                  f"intrinsics={'not None' if intrinsics is not None else 'None'}")
         if (self.config.use_3d_conf
                 and out.pred_conf_3d is not None
                 and pred_boxes_3d is not None
@@ -665,6 +724,7 @@ class SAM3_3DLoss(nn.Module):
         num_boxes: Tensor,
         intrinsics: Tensor | None = None,  # (B, 3, 3)
         image_size: tuple[int, int] | None = None,
+        pred_conf_3d: Tensor | None = None,  # (B, S, 1) 3D confidence
     ) -> dict[str, Tensor]:
         """Compute O2M (One-to-Many) auxiliary loss.
 
@@ -728,6 +788,16 @@ class SAM3_3DLoss(nn.Module):
 
         o2m_indices = (batch_idx, src_idx, tgt_idx)
 
+        # Recompute ignore mask for O2M predictions (different pred boxes)
+        if "_ignore_boxes2d" in targets:
+            targets = targets.copy()
+            targets["ignore_neg_mask"] = self._compute_ignore_neg_mask(
+                pred_boxes_2d,
+                targets["_ignore_boxes2d"],
+                targets["_num_ignores"],
+                threshold=self.config.ignore_iou_threshold,
+            )
+
         # 2D losses via SAM3 classes
         o2m_outputs = {
             "pred_logits": pred_logits,
@@ -758,6 +828,17 @@ class SAM3_3DLoss(nn.Module):
                 image_size=image_size,
             )
             losses.update(loss_3d)
+
+        # 3D confidence loss (O2M branch)
+        if (self.config.use_3d_conf
+                and pred_conf_3d is not None
+                and pred_boxes_3d is not None
+                and intrinsics is not None):
+            loss_3d_cls = self._loss_3d_classification(
+                pred_conf_3d, pred_boxes_2d, pred_boxes_3d,
+                o2m_indices, targets, intrinsics, num_boxes, image_size,
+            )
+            losses["loss_3d_cls"] = loss_3d_cls
 
         return losses
 
@@ -919,16 +1000,13 @@ class SAM3_3DLoss(nn.Module):
         num_boxes: Tensor,
         image_size: tuple[int, int],
     ) -> Tensor:
-        """Compute 3D confidence loss (positive samples only).
+        """Compute 3D confidence loss (positive + negative).
 
-        Only supervised on matched (positive) queries. No negative sample loss.
-        The 2D confidence head already handles foreground/background.
-        This head only learns 3D quality: how accurate is the 3D prediction.
+        Positive: soft target = quality (0.7*iou_3d + 0.3*depth)
+        Negative: target = 0, with focal weighting
+        Same structure as 2D cls loss (IABCEMdetr).
 
-        Quality target = conf_depth_weight * depth_quality
-                       + conf_iou_3d_weight * iou_3d
-
-        At inference: final_score = pred_logits.sigmoid() * pred_conf_3d.sigmoid()
+        At inference: final_score = 2d_score + 0.5 * 3d_score
         """
         batch_idx, src_idx, tgt_idx = indices
         B, S, _ = pred_conf_3d.shape
@@ -937,6 +1015,10 @@ class SAM3_3DLoss(nn.Module):
 
         if M == 0:
             return pred_conf_3d.sum() * 0.0
+
+        prob = pred_conf_3d.sigmoid()
+        target_classes = torch.zeros(B, S, 1, device=device)
+        target_classes[(batch_idx, src_idx)] = 1.0
 
         with torch.no_grad():
             # 1. Depth quality - directly from encoded params, no decode needed
@@ -950,8 +1032,12 @@ class SAM3_3DLoss(nn.Module):
             gt_z = target_boxes_3d_raw[:, 2].clamp(min=0.1)
             gt_log_z = torch.log(gt_z)
             depth_quality = torch.exp(-torch.abs(pred_log_z - gt_log_z))
+            depth_quality = torch.nan_to_num(depth_quality, nan=0.0, posinf=1.0, neginf=0.0)
 
-            # 2. 3D IoU - requires decode + corners
+            # 2. 3D IoU using safe shapely-based implementation
+            #    (CPU, full rotation support, never crashes)
+            from opendet3d.op.box.iou_3d_safe import batch_box3d_iou
+
             H, W = image_size
             factors = pred_boxes_2d.new_tensor([[W, H, W, H]])
             src_boxes_2d_pixel = pred_boxes_2d[(batch_idx, src_idx)] * factors
@@ -966,35 +1052,53 @@ class SAM3_3DLoss(nn.Module):
                 pred_decoded_list.append(single_decoded)
             pred_decoded = torch.cat(pred_decoded_list, dim=0)  # (M, 10)
 
-            from vis4d.data.const import AxisMode
-            from vis4d.op.box.box3d import boxes3d_to_corners
-            from opendet3d.op.box.box3d import box3d_overlap
+            iou_3d = batch_box3d_iou(pred_decoded, target_boxes_3d_raw[:, :10])
 
-            pred_corners = boxes3d_to_corners(
-                pred_decoded, AxisMode.OPENCV
-            )  # (M, 8, 3)
-            gt_corners = boxes3d_to_corners(
-                target_boxes_3d_raw[:, :10], AxisMode.OPENCV
-            )  # (M, 8, 3)
-            iou_matrix = box3d_overlap(pred_corners, gt_corners)  # (M, M)
-            iou_3d = iou_matrix.diagonal().clamp(0, 1)  # (M,)
-
-            # 3. Combined quality (only 3D components, no 2D IoU)
+            # 3. Combined quality
             quality = (
                 self.config.conf_depth_weight * depth_quality
                 + self.config.conf_iou_3d_weight * iou_3d
-            )  # in [0, 1] since weights sum to 1.0
+            )
+            quality = torch.nan_to_num(quality, nan=0.0).clamp(0.0, 1.0)
 
-        # BCE loss on positive samples only
-        # Target: quality score for matched queries
-        src_conf = pred_conf_3d[(batch_idx, src_idx)]  # (M, 1)
-        target_quality = quality.unsqueeze(-1)  # (M, 1)
-        loss = F.binary_cross_entropy_with_logits(
-            src_conf, target_quality, reduction="sum"
+            # 4. Build soft target (same as 2D IABCEMdetr pattern)
+            t = (
+                prob[(batch_idx, src_idx)].squeeze(-1) ** self.config.alpha
+                * quality ** (1 - self.config.alpha)
+            )
+            t = t.clamp(min=0.01).detach()
+
+            positive_target = target_classes.clone()
+            positive_target[(batch_idx, src_idx)] = t.unsqueeze(-1)
+
+        # Positive loss with soft quality target
+        loss_pos = F.binary_cross_entropy_with_logits(
+            pred_conf_3d, positive_target, reduction="none"
         )
-        loss = loss / num_boxes.clamp(min=1)
+        loss_pos = loss_pos * target_classes * self.config.pos_weight
 
-        return loss
+        # Negative loss with focal weighting (push unmatched queries toward 0)
+        loss_neg = F.binary_cross_entropy_with_logits(
+            pred_conf_3d, target_classes, reduction="none"
+        )
+        loss_neg = loss_neg * (1 - target_classes) * (prob ** self.config.gamma)
+
+        # Suppress negative loss for predictions overlapping ignore boxes
+        if "ignore_neg_mask" in targets:
+            neg_suppress = targets["ignore_neg_mask"].unsqueeze(-1)
+            loss_neg = loss_neg * (1 - neg_suppress)
+
+        loss_bce = loss_pos + loss_neg
+
+        # Apply presence mask (zero out loss for prompts with no GT)
+        if self.config.use_presence:
+            num_gts = targets.get(
+                "num_boxes", torch.zeros(B, dtype=torch.long, device=device)
+            )
+            keep_loss = (num_gts > 0).float().view(B, 1, 1)  # (B, 1, 1) for (B, S, 1) broadcasting
+            loss_bce = loss_bce * keep_loss
+
+        return loss_bce.mean()
 
     def _compute_aux_loss(
         self,
@@ -1035,6 +1139,16 @@ class SAM3_3DLoss(nn.Module):
         if sam3_aux["pred_boxes"] is None and sam3_aux["pred_boxes_xyxy"] is not None:
             sam3_aux["pred_boxes"] = self._xyxy_to_cxcywh(
                 sam3_aux["pred_boxes_xyxy"]
+            )
+
+        # Recompute ignore mask for this aux layer's predicted boxes
+        if "_ignore_boxes2d" in targets and sam3_aux["pred_boxes_xyxy"] is not None:
+            targets = targets.copy()
+            targets["ignore_neg_mask"] = self._compute_ignore_neg_mask(
+                sam3_aux["pred_boxes_xyxy"],
+                targets["_ignore_boxes2d"],
+                targets["_num_ignores"],
+                threshold=self.config.ignore_iou_threshold,
             )
 
         # Classification loss via SAM3's IABCEMdetr (scaled by loss_2d_scale)

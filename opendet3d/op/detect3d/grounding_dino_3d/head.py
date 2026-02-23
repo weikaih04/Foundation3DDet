@@ -352,7 +352,16 @@ class RoI2Det3D:
                 positive_maps=[token_positive_maps],
             )[0]
 
-            scores, indexes = cls_score.view(-1).topk(self.max_per_img)
+            k = min(self.max_per_img, cls_score.view(-1).shape[0])
+            if k == 0:
+                device = cls_score.device
+                return (
+                    torch.zeros(0, 4, device=device),
+                    torch.zeros(0, device=device),
+                    torch.zeros(0, dtype=torch.long, device=device),
+                    torch.zeros(0, 10, device=device),
+                )
+            scores, indexes = cls_score.view(-1).topk(k)
             num_classes = cls_score.shape[-1]
             det_labels = indexes % num_classes
             bbox_index = indexes // num_classes

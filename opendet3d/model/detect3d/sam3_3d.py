@@ -198,6 +198,12 @@ class SAM3_3DBatchedInputs:
     num_gts: Tensor | None = None            # (N_prompts,) - number of GTs per prompt
     gt_category_ids: Tensor | None = None    # (N_prompts, max_gt)
 
+    # Ignore boxes for negative loss suppression (per-prompt, same category)
+    # Objects marked ignore in Omni3D (truncated, occluded, behind camera, etc.)
+    # are not used as GT but should not cause FP penalty either.
+    ignore_boxes2d: Tensor | None = None     # (N_prompts, max_ignore, 4) normalized xyxy
+    num_ignores: Tensor | None = None        # (N_prompts,) number of ignore boxes per prompt
+
     # Query type tracking (collator-level label, does NOT control SAM3 internal matching).
     # 0=TEXT, 1=VISUAL, 2=GEOMETRY, 3=VISUAL+LABEL, 4=GEOMETRY+LABEL
     # "multi-target" (0,1,3): num_gts can be > 1 (all instances of a category)
@@ -441,15 +447,10 @@ class SAM3_3D(nn.Module):
             )
             print(f"[SAM3_3D] Created bbox3d_head with use_camera_prompt={use_camera_prompt}, depth_latent_dim={depth_latent_dim}")
 
-        # Initialize 3D confidence head from SAM3's 2D class_embed (warm start)
-        if self.bbox3d_head is not None and hasattr(self.sam3, 'class_embed'):
-            src_linear = self.sam3.class_embed  # nn.Linear(hidden_dim, 1)
-            for conf_branch in self.bbox3d_head.conf_branches:
-                # Copy weights to the last linear layer (output layer)
-                last_linear = conf_branch[-1]  # nn.Linear(embed_dims, 1)
-                last_linear.weight.data.copy_(src_linear.weight.data)
-                last_linear.bias.data.copy_(src_linear.bias.data)
-            print("[SAM3_3D] Initialized 3D conf_branches from SAM3 class_embed")
+        # 3D conf_branches use xavier init (from _init_weights in head.py).
+        # No warm start from class_embed: the positive-only loss design
+        # (quality targets ~0.1-0.3 early) conflicts with class_embed's
+        # high-logit initialization, causing large initial loss.
 
         # Load geometry backend pretrained weights
         # This is called during __init__ to ensure weights are loaded for first training
@@ -1252,11 +1253,12 @@ class SAM3_3D(nn.Module):
         # 2D confidence (foreground/background)
         scores_all = pred_logits.sigmoid().squeeze(-1)  # (N_prompts, S)
 
-        # Multiply by 3D quality score if available
+        # Add 3D quality score if available
+        # final_score = 2d_score + 0.5 * 3d_score
         # 2D head handles "is there an object?", 3D head handles "is the 3D accurate?"
         if pred_conf_3d is not None:
             conf_3d = pred_conf_3d.sigmoid().squeeze(-1)  # (N_prompts, S)
-            scores_all = scores_all * conf_3d
+            scores_all = scores_all + 0.5 * conf_3d
 
         # Apply presence score if available (following SAM3 original postprocessors.py)
         # Presence score indicates whether a category has objects in the image

@@ -153,6 +153,8 @@ class COCO3DDataset(CacheMappingMixin, Dataset):
             boxes = []
             boxes3d = np.empty((0, 10), dtype=np.float32)[1:]
             class_ids = np.empty((0,), dtype=np.int64)[1:]
+            ignore_boxes = []
+            ignore_class_ids_list = []
             for ann in anns:
                 cat_name = cats_map[ann["category_id"]]
                 assert cat_name == ann["category_name"]
@@ -161,6 +163,22 @@ class COCO3DDataset(CacheMappingMixin, Dataset):
                     continue
 
                 if ann["ignore"]:
+                    # Preserve ignore box 2D coords and class ID
+                    # for negative loss suppression during training.
+                    # Only keep objects that are actually visible in
+                    # the image — skip behind_camera and degenerate bbox.
+                    if (
+                        cat_name in self.det_map
+                        and not ann.get("behind_camera", False)
+                    ):
+                        x1, y1, w, h = ann["bbox"]
+                        if w > 0 and h > 0:
+                            ignore_boxes.append(
+                                (x1, y1, x1 + w, y1 + h)
+                            )
+                            ignore_class_ids_list.append(
+                                self.det_map[cat_name]
+                            )
                     continue
 
                 # Box 3D
@@ -223,6 +241,15 @@ class COCO3DDataset(CacheMappingMixin, Dataset):
 
             depth_filename = self.get_depth_filenames(img)
 
+            ignore_boxes2d = (
+                np.empty((0, 4), dtype=np.float32)
+                if not ignore_boxes
+                else np.array(ignore_boxes, dtype=np.float32)
+            )
+            ignore_class_ids = np.array(
+                ignore_class_ids_list, dtype=np.int64
+            )
+
             sample = {
                 "img_id": img_id,
                 "img": img,
@@ -230,6 +257,8 @@ class COCO3DDataset(CacheMappingMixin, Dataset):
                 "boxes2d": boxes2d,
                 "boxes3d": boxes3d,
                 "class_ids": class_ids,
+                "ignore_boxes2d": ignore_boxes2d,
+                "ignore_class_ids": ignore_class_ids,
             }
 
             if depth_filename is not None and self.data_backend.exists(
@@ -309,6 +338,14 @@ class COCO3DDataset(CacheMappingMixin, Dataset):
         data_dict[K.boxes3d] = sample["boxes3d"]
         data_dict[K.boxes3d_classes] = sample["class_ids"]
         data_dict[K.axis_mode] = AxisMode.OPENCV
+
+        # Ignore boxes for negative loss suppression (backward compat)
+        data_dict["ignore_boxes2d"] = sample.get(
+            "ignore_boxes2d", np.empty((0, 4), dtype=np.float32)
+        )
+        data_dict["ignore_class_ids"] = sample.get(
+            "ignore_class_ids", np.empty((0,), dtype=np.int64)
+        )
 
         if K.depth_maps in self.keys_to_load:
             depth = self.get_depth_map(sample)

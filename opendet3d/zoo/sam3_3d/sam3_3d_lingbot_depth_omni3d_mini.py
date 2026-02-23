@@ -112,7 +112,9 @@ def get_config() -> ExperimentConfig:
         lingbot_encoder_freeze_blocks=21,
     )
 
-    config.loss = get_sam3_3d_loss_cfg(params, box_coder, use_3d_conf=True)
+    config.loss = get_sam3_3d_loss_cfg(
+        params, box_coder, use_3d_conf=True, use_ignore_suppress=True
+    )
 
     ######################################################
     ##                    OPTIMIZERS                    ##

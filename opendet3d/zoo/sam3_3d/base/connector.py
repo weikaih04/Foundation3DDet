@@ -630,6 +630,9 @@ class SAM3_3DCollator:
         gt_boxes3d_per_query = []
         gt_category_ids_list = []
 
+        # Ignore boxes per query (for negative loss suppression)
+        ignore_boxes2d_per_query = []
+
         # Build unique text list
         unique_texts = []
         text_to_id = {}
@@ -744,6 +747,8 @@ class SAM3_3DCollator:
                         )
                     else:
                         gt_boxes3d_per_query.append(None)
+                    # Oracle mode: no ignore box suppression needed
+                    ignore_boxes2d_per_query.append([])
 
         else:
             # ========== Standard Mode: Group by category ==========
@@ -767,6 +772,18 @@ class SAM3_3DCollator:
                     else:
                         cat_id = 0
                     cat_to_box_indices[cat_id].append(box_idx)
+
+                # Group ignore boxes by category (for negative loss suppression)
+                ignore_boxes2d_raw = sample.get("ignore_boxes2d", None)
+                ignore_class_ids_raw = sample.get("ignore_class_ids", None)
+                cat_to_ignore_indices = defaultdict(list)
+                if (
+                    ignore_boxes2d_raw is not None
+                    and len(ignore_boxes2d_raw) > 0
+                ):
+                    for ign_idx in range(len(ignore_boxes2d_raw)):
+                        ign_cat_id = int(ignore_class_ids_raw[ign_idx])
+                        cat_to_ignore_indices[ign_cat_id].append(ign_idx)
 
                 # Limit number of categories (queries) per image
                 categories = list(cat_to_box_indices.keys())
@@ -866,6 +883,10 @@ class SAM3_3DCollator:
                                 query_gt_boxes3d.append(boxes3d[box_idx].to(device))
                         gt_boxes2d_per_query.append(query_gt_boxes2d)
                         gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+                        # Collect ignore boxes for this category
+                        ign_indices = cat_to_ignore_indices.get(cat_id, [])
+                        query_ign = [normalize_box_xyxy(ignore_boxes2d_raw[i]) for i in ign_indices] if ign_indices and ignore_boxes2d_raw is not None else []
+                        ignore_boxes2d_per_query.append(query_ign)
 
                         # ----- Branch 2 (single-target): GEOMETRY / GEOMETRY+LABEL -----
                         img_ids_list.append(img_idx)
@@ -893,6 +914,10 @@ class SAM3_3DCollator:
                             query_gt_boxes3d.append(boxes3d[selected_idx].to(device))
                         gt_boxes2d_per_query.append(query_gt_boxes2d)
                         gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+                        # Same ignore boxes as Branch 1 (same category)
+                        ign_indices = cat_to_ignore_indices.get(cat_id, [])
+                        query_ign = [normalize_box_xyxy(ignore_boxes2d_raw[i]) for i in ign_indices] if ign_indices and ignore_boxes2d_raw is not None else []
+                        ignore_boxes2d_per_query.append(query_ign)
 
                     else:
                         # ========== Original: Text/Visual random selection ==========
@@ -951,6 +976,10 @@ class SAM3_3DCollator:
                                 query_gt_boxes3d.append(boxes3d[box_idx].to(device))
                         gt_boxes2d_per_query.append(query_gt_boxes2d)
                         gt_boxes3d_per_query.append(query_gt_boxes3d if query_gt_boxes3d else None)
+                        # Collect ignore boxes for this category
+                        ign_indices = cat_to_ignore_indices.get(cat_id, [])
+                        query_ign = [normalize_box_xyxy(ignore_boxes2d_raw[i]) for i in ign_indices] if ign_indices and ignore_boxes2d_raw is not None else []
+                        ignore_boxes2d_per_query.append(query_ign)
 
         profile_stop("  collator_category_group")
 
@@ -1059,6 +1088,31 @@ class SAM3_3DCollator:
 
         gt_category_ids = torch.tensor(gt_category_ids_list, dtype=torch.long, device=device)
 
+        # ========== Ignore boxes: pad to (N_prompts, max_ignore, 4) ==========
+        max_ignore = max(
+            (len(q) for q in ignore_boxes2d_per_query), default=0
+        )
+        if max_ignore > 0:
+            num_ignores_list = []
+            ignore_padded = []
+            for q in ignore_boxes2d_per_query:
+                n_ign = len(q)
+                num_ignores_list.append(n_ign)
+                if n_ign < max_ignore:
+                    padded = q + [
+                        torch.zeros(4, device=device)
+                    ] * (max_ignore - n_ign)
+                else:
+                    padded = q
+                ignore_padded.append(torch.stack(padded))
+            ignore_boxes2d_tensor = torch.stack(ignore_padded)
+            num_ignores_tensor = torch.tensor(
+                num_ignores_list, dtype=torch.long, device=device
+            )
+        else:
+            ignore_boxes2d_tensor = None
+            num_ignores_tensor = None
+
         # Query types: 0=TEXT, 1=VISUAL, 2=GEOMETRY
         query_types = torch.tensor(query_types_list, dtype=torch.long, device=device)
         profile_stop("  collator_tensor_stack")
@@ -1080,6 +1134,8 @@ class SAM3_3DCollator:
             gt_boxes3d=gt_boxes3d,
             num_gts=num_gts,
             gt_category_ids=gt_category_ids,
+            ignore_boxes2d=ignore_boxes2d_tensor,
+            num_ignores=num_ignores_tensor,
             query_types=query_types,
             # Metadata for evaluation/visualization
             sample_names=sample_names,

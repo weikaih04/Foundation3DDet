@@ -19,7 +19,7 @@ from vis4d.engine.connectors import CallbackConnector
 from vis4d.zoo.base import get_default_cfg, get_default_callbacks_cfg
 
 from opendet3d.zoo.gdino3d.base.callback import (
-    get_in_the_wild_evaluator_cfg,
+    get_in_the_wild_eval_callbacks,
     get_visualizer_callback_cfg,
 )
 from opendet3d.zoo.gdino3d.base.connector import (
@@ -113,19 +113,12 @@ def get_config() -> ExperimentConfig:
     ######################################################
     callbacks = get_default_callbacks_cfg()
 
-    callbacks.append(
-        class_config(
-            EvaluatorCallback,
-            evaluator=get_in_the_wild_evaluator_cfg(
-                data_root=in_the_wild_data_root
-            ),
-            metrics_to_eval=["3D"],
-            save_predictions=True,
+    # 2D AP + 3D AP (bbox) + 3D AP (dist)
+    callbacks.extend(
+        get_in_the_wild_eval_callbacks(
+            data_root=in_the_wild_data_root,
             output_dir=config.output_dir,
-            save_prefix="detection",
-            test_connector=class_config(
-                CallbackConnector, key_mapping=CONN_COCO_DET3D_EVAL
-            ),
+            eval_connector_mapping=CONN_COCO_DET3D_EVAL,
         )
     )
 

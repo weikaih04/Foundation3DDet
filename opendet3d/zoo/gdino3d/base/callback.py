@@ -167,14 +167,16 @@ def get_callback_cfg(
 
 def get_in_the_wild_evaluator_cfg(
     data_root: str = "data/in_the_wild",
+    iou_type: str = "bbox",
 ) -> ConfigDict:
     """Get InTheWild evaluator config.
 
-    Uses Detect3DEvaluator with 3D bounding box IoU for the 800+ category
-    human-annotated in-the-wild dataset (COCO/LVIS/Objects365).
+    Uses Detect3DEvaluator for the 800+ category human-annotated
+    in-the-wild dataset (COCO/LVIS/Objects365).
 
     Args:
         data_root: Root directory for in-the-wild data.
+        iou_type: "bbox" for 3D IoU matching, "dist" for center distance.
 
     Returns:
         ConfigDict: Evaluator configuration.
@@ -190,10 +192,75 @@ def get_in_the_wild_evaluator_cfg(
         det_map=det_map,
         cat_map=class_map,
         eval_prox=False,
-        iou_type="bbox",
+        iou_type=iou_type,
         num_columns=4,
         annotation=annotation,
     )
+
+
+def get_in_the_wild_eval_callbacks(
+    data_root: str = "data/in_the_wild",
+    output_dir: FieldReference | str = "",
+    eval_connector_mapping: dict | None = None,
+    test_connector: ConfigDict | None = None,
+) -> list[ConfigDict]:
+    """Get InTheWild evaluation callbacks: 2D AP, 3D AP (bbox), 3D AP (dist).
+
+    Args:
+        data_root: Root directory for in-the-wild data.
+        output_dir: Output directory for saving predictions.
+        eval_connector_mapping: Key mapping for CallbackConnector (GDino3D).
+            Ignored if test_connector is provided.
+        test_connector: Pre-built connector config (SAM3_3D). If None,
+            builds CallbackConnector from eval_connector_mapping.
+
+    Returns:
+        List of EvaluatorCallback configs.
+    """
+    if test_connector is None:
+        from opendet3d.zoo.gdino3d.base.connector import CONN_COCO_DET3D_EVAL
+
+        if eval_connector_mapping is None:
+            eval_connector_mapping = CONN_COCO_DET3D_EVAL
+        test_connector = class_config(
+            CallbackConnector, key_mapping=eval_connector_mapping
+        )
+
+    cbs = []
+
+    # 2D + 3D AP (bbox mode: 3D IoU matching)
+    cbs.append(
+        class_config(
+            EvaluatorCallback,
+            evaluator=get_in_the_wild_evaluator_cfg(
+                data_root=data_root,
+                iou_type="bbox",
+            ),
+            metrics_to_eval=["2D", "3D"],
+            save_predictions=True,
+            output_dir=output_dir,
+            save_prefix="detection_bbox",
+            test_connector=test_connector,
+        )
+    )
+
+    # 3D AP (dist mode: center distance matching)
+    cbs.append(
+        class_config(
+            EvaluatorCallback,
+            evaluator=get_in_the_wild_evaluator_cfg(
+                data_root=data_root,
+                iou_type="dist",
+            ),
+            metrics_to_eval=["3D"],
+            save_predictions=True,
+            output_dir=output_dir,
+            save_prefix="detection_dist",
+            test_connector=test_connector,
+        )
+    )
+
+    return cbs
 
 
 def get_omni3d_evaluator_cfg(

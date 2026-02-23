@@ -113,7 +113,9 @@ def get_config() -> ExperimentConfig:
         backbone_freeze_blocks=28,
     )
 
-    config.loss = get_sam3_3d_loss_cfg(params, box_coder, use_3d_conf=True)
+    config.loss = get_sam3_3d_loss_cfg(
+        params, box_coder, use_3d_conf=True, use_ignore_suppress=True
+    )
 
     ######################################################
     ##                    OPTIMIZERS                    ##

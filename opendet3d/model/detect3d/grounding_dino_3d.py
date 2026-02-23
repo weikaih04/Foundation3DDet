@@ -1543,10 +1543,15 @@ class GroundingDINO3D(GroundingDINO):
                 # With cat_mapping, we convert category name -> global ID, which
                 # is required when per-image categories are used as text prompt
                 # (e.g., InTheWild evaluation with 800+ categories).
+                # NOTE: Use input_texts[i] (original names) instead of
+                # entities[i] (cleaned names) because clean_label_name replaces
+                # underscores with spaces (e.g. "motor_scooter" -> "motor
+                # scooter") while cat_mapping keys use original names.
                 if self.cat_mapping is not None and len(det_labels) > 0:
+                    original_cats = input_texts[i]
                     remapped = det_labels.new_tensor(
                         [
-                            self.cat_mapping[entities[i][label.item()]]
+                            self.cat_mapping[original_cats[label.item()]]
                             for label in det_labels
                         ]
                     )
