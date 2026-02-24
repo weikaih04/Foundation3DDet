@@ -355,6 +355,9 @@ class SAM3_3D(nn.Module):
 
         # ========== Depth Input at Test Time ==========
         use_depth_input_test: bool = False,
+
+        # ========== Eval Score Control ==========
+        eval_3d_conf_weight: float = 0.5,
     ) -> None:
         """Initialize SAM3_3D.
 
@@ -375,6 +378,9 @@ class SAM3_3D(nn.Module):
             oracle_eval: If True, use oracle evaluation mode where each
                 prompt gets top-1 prediction (no NMS, no score filtering).
                 For measuring 3D regression quality with GT box prompts.
+            eval_3d_conf_weight: Weight for 3D confidence in eval score.
+                final_score = 2d_score + weight * 3d_score.
+                Set to 0.0 to use only 2D confidence for eval.
         """
         super().__init__()
 
@@ -408,6 +414,7 @@ class SAM3_3D(nn.Module):
         self.hidden_dim = sam3_model.hidden_dim
         self.oracle_eval = oracle_eval
         self.use_depth_input_test = use_depth_input_test
+        self.eval_3d_conf_weight = eval_3d_conf_weight
 
         # 3D-MOOD components
         self.box_coder = box_coder or GroundingDINO3DCoder()
@@ -1254,11 +1261,17 @@ class SAM3_3D(nn.Module):
         scores_all = pred_logits.sigmoid().squeeze(-1)  # (N_prompts, S)
 
         # Add 3D quality score if available
-        # final_score = 2d_score + 0.5 * 3d_score
+        # final_score = 2d_score + weight * 3d_score
         # 2D head handles "is there an object?", 3D head handles "is the 3D accurate?"
-        if pred_conf_3d is not None:
+        # SAM3_3D_CONF_WEIGHT env var overrides config (e.g., "0.0" for 2D only)
+        import os
+        conf_weight = self.eval_3d_conf_weight
+        conf_weight_override = os.environ.get("SAM3_3D_CONF_WEIGHT", None)
+        if conf_weight_override is not None:
+            conf_weight = float(conf_weight_override)
+        if pred_conf_3d is not None and conf_weight > 0:
             conf_3d = pred_conf_3d.sigmoid().squeeze(-1)  # (N_prompts, S)
-            scores_all = scores_all + 0.5 * conf_3d
+            scores_all = scores_all + conf_weight * conf_3d
 
         # Apply presence score if available (following SAM3 original postprocessors.py)
         # Presence score indicates whether a category has objects in the image

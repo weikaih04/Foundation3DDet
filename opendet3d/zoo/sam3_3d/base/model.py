@@ -125,6 +125,7 @@ def get_sam3_3d_cfg(
     backbone_freeze_blocks: int = 0,
     oracle_eval: bool = False,
     use_depth_input_test: bool = False,
+    eval_3d_conf_weight: float = 0.5,
 ) -> tuple[ConfigDict, ConfigDict]:
     """Get SAM3_3D model configuration.
 
@@ -233,6 +234,7 @@ def get_sam3_3d_cfg(
         backbone_freeze_blocks=backbone_freeze_blocks,
         oracle_eval=oracle_eval,
         use_depth_input_test=use_depth_input_test,
+        eval_3d_conf_weight=eval_3d_conf_weight,
     )
 
     return model, box_coder

@@ -74,6 +74,12 @@ def get_dataset_det_map(
         )
 
         det_map = get_cubifyanything_det_map(dataset_name)
+    elif "Waymo" in dataset_name:
+        from opendet3d.data.datasets.waymo import (
+            get_waymo_det_map,
+        )
+
+        det_map = get_waymo_det_map(dataset_name)
     else:
         raise ValueError(f"Unknown dataset_name: {dataset_name}")
 

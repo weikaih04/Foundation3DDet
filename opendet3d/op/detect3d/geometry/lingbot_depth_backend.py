@@ -177,6 +177,12 @@ class LingbotDepthBackend(GeometryBackendBase):
         # Delete reference to full model (sub-modules survive via self)
         del mdm_model
 
+        # torch.compile for encoder (controlled by SAM3_COMPILE env var)
+        import os
+        if os.environ.get("SAM3_COMPILE", "0") == "1":
+            self.encoder = torch.compile(self.encoder)
+            print("[LingbotDepth] torch.compile ENABLED for encoder")
+
         # Freeze the first N transformer blocks of the encoder backbone.
         # ViT-L has 24 blocks; e.g. encoder_freeze_blocks=20 freezes
         # blocks[0..19] and only trains blocks[20..23] + patch_embed +
