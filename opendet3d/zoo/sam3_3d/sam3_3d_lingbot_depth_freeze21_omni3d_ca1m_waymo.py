@@ -7,8 +7,9 @@ Freeze settings (same as omni3d-only config):
 - SAM3 ViT backbone: freeze 28/32 blocks, train blocks[28..31]
 - Both use full lr (1.0x) for unfrozen blocks
 
-Depth loss: L1 (weight=1.0) + SILog (weight=0.5)
+Depth loss: L1 + SILog + MoGe2 affine-invariant (global, local_4, local_16) + edge + mask_bce
 Camera loss: ray-based MSE (weight=1.0), exp+0.7*diagonal parameterization
+Annotation filtering: disabled (no truncation/visibility/height filtering)
 
 Dataset mixing:
 - Omni3D: ~100K images (6 datasets, train+val splits), HDF5 backend
@@ -109,6 +110,11 @@ def get_config() -> ExperimentConfig:
         data_root=omni3d_data_root,
         data_backend=data_backend,
         shape=sam3_image_shape,
+        # Disable annotation filtering: keep all truncated/occluded/small objects
+        truncation_thres=1.1,
+        visibility_thres=-1.0,
+        min_height_thres=0.0,
+        max_height_thres=1e6,
     )
 
     omni3d_test_data_cfg = get_omni3d_test_cfg(

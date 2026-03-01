@@ -1,11 +1,25 @@
-"""SAM3_3D + LingBot-Depth + Omni3D + CA-1M + Waymo - Mini config.
+"""SAM3_3D + LingBot-Depth + Omni3D + CA-1M + Waymo + 3EED.
 
-For fast verification that the full pipeline runs. Uses mini Omni3D
-datasets (100 samples) for train/test and full CA-1M/Waymo datasets
-but only runs 2 training steps.
+Mixed training with dataset-ratio sampling. Adds 3EED (detection + referring)
+to the existing CA-1M + Waymo mix. 3EED provides multi-platform outdoor data:
+Waymo vehicle, M3ED drone, M3ED quadruped.
+
+Dataset mixing:
+- Omni3D:     ~100K images (6 datasets, train+val splits), HDF5 backend
+- CA-1M:      ~206K images (CubifyAnything_train), HDF5 backend
+- Waymo:      ~99K images (Waymo_train, frame_interval=2), HDF5 backend
+- 3EED_det:   ~12K images (detection, all objects per frame)
+- 3EED_ref:   ~12K images (referring, target objects with short phrases)
+- Sampling: Omni3D 80%, CA-1M 10%, Waymo 5%, 3EED_det 5%, 3EED_ref 5%
+
+HDF5 conversion (run once before training):
+    python -m vis4d.data.io.to_hdf5 -p data/waymo/images
+    python -m vis4d.data.io.to_hdf5 -p data/waymo/depth
+    python -m vis4d.data.io.to_hdf5 -p data/cubifyanything/data
+    python -m vis4d.data.io.to_hdf5 -p data/cubifyanything/depth_gt
 
 Usage:
-    vis4d fit --config opendet3d/zoo/sam3_3d/sam3_3d_lingbot_depth_freeze21_omni3d_ca1m_waymo_mini.py --gpus 2
+    vis4d fit --config opendet3d/zoo/sam3_3d/sam3_3d_lingbot_depth_freeze21_omni3d_ca1m_waymo_3eed.py --gpus 8
 """
 
 from __future__ import annotations
@@ -32,6 +46,9 @@ from opendet3d.zoo.gdino3d.base.dataset.omni3d import (
     get_omni3d_test_cfg,
     get_omni3d_train_cfg,
 )
+from opendet3d.zoo.gdino3d.base.dataset.threeeed import (
+    get_threeeed_train_cfg,
+)
 from opendet3d.zoo.gdino3d.base.dataset.waymo import get_waymo_train_cfg
 from opendet3d.zoo.gdino3d.base.pl import get_pl_cfg
 from opendet3d.zoo.sam3_3d.base.connector import (
@@ -50,19 +67,19 @@ from opendet3d.zoo.sam3_3d.base.optim import get_sam3_3d_optim_cfg
 
 
 def get_config() -> ExperimentConfig:
-    """Returns mini config for SAM3_3D + LingBot + CA-1M + Waymo."""
+    """Returns SAM3_3D + LingBot + CA-1M + Waymo + 3EED config."""
     ######################################################
     ##                    General Config                ##
     ######################################################
     config = get_default_cfg(
-        exp_name="sam3_3d_lingbot_depth_freeze21_omni3d_ca1m_waymo_mini"
+        exp_name="sam3_3d_lingbot_depth_freeze21_omni3d_ca1m_waymo_3eed"
     )
 
     config.use_checkpoint = True
 
     params = get_sam3_3d_hyperparams_cfg(
-        num_epochs=1,
-        samples_per_gpu=2,
+        num_epochs=12,
+        samples_per_gpu=4,
         workers_per_gpu=4,
         base_lr=1e-4,
     )
@@ -76,7 +93,7 @@ def get_config() -> ExperimentConfig:
 
     sam3_image_shape = (1008, 1008)
 
-    # --- Omni3D (mini) ---
+    # --- Omni3D (HDF5 backend) ---
     omni3d_data_root = "data/omni3d"
     omni3d_test_datasets = (
         "KITTI_test",
@@ -91,8 +108,6 @@ def get_config() -> ExperimentConfig:
         data_root=omni3d_data_root,
         data_backend=data_backend,
         shape=sam3_image_shape,
-        use_mini_dataset=True,
-        mini_dataset_size=100,
     )
 
     omni3d_test_data_cfg = get_omni3d_test_cfg(
@@ -101,30 +116,41 @@ def get_config() -> ExperimentConfig:
         data_backend=data_backend,
         shape=sam3_image_shape,
         with_depth=True,
-        use_mini_dataset=True,
-        mini_dataset_size=100,
     )
 
-    # --- CubifyAnything (CA-1M) ---
-    # --- CubifyAnything (CA-1M, mini) ---
+    # --- CubifyAnything (CA-1M, HDF5 backend) ---
     ca1m_train_data_cfg = get_ca1m_train_cfg(
         data_root="data/cubifyanything",
         data_backend=data_backend,
         shape=sam3_image_shape,
         cache_as_binary=True,
-        use_mini_dataset=True,
-        mini_dataset_size=100,
     )
 
-    # --- Waymo (mini) ---
+    # --- Waymo (HDF5 backend) ---
     waymo_train_data_cfg = get_waymo_train_cfg(
         data_root="data/waymo",
         train_datasets=("Waymo_train",),
         data_backend=data_backend,
         shape=sam3_image_shape,
         cache_as_binary=True,
-        use_mini_dataset=True,
-        mini_dataset_size=100,
+    )
+
+    # --- 3EED detection (HDF5 backend) ---
+    threeeed_det_train_data_cfg = get_threeeed_train_cfg(
+        data_root="data/3eed",
+        train_datasets=("3EED_det_train",),
+        data_backend=data_backend,
+        shape=sam3_image_shape,
+        cache_as_binary=True,
+    )
+
+    # --- 3EED referring (HDF5 backend) ---
+    threeeed_ref_train_data_cfg = get_threeeed_train_cfg(
+        data_root="data/3eed",
+        train_datasets=("3EED_ref_train",),
+        data_backend=data_backend,
+        shape=sam3_image_shape,
+        cache_as_binary=True,
     )
 
     # --- Build data config ---
@@ -134,6 +160,8 @@ def get_config() -> ExperimentConfig:
             omni3d_train_data_cfg,
             ca1m_train_data_cfg,
             waymo_train_data_cfg,
+            threeeed_det_train_data_cfg,
+            threeeed_ref_train_data_cfg,
         ],
     )
 
@@ -143,12 +171,11 @@ def get_config() -> ExperimentConfig:
 
     data = DataConfig()
 
-    # Sampling: Omni3D 50%, CA-1M 25%, Waymo 25%
-    # epoch_dataset_idx=0: 1 epoch = Omni3D sees all samples once
+    # Sampling: Omni3D 80%, CA-1M 10%, Waymo 5%, 3EED_det 5%, 3EED_ref 5%
     data.train_dataloader = class_config(
         build_train_dataloader_with_ratios,
         dataset=combined_train_datasets,
-        target_proportions=[0.50, 0.25, 0.25],
+        target_proportions=[0.80, 0.10, 0.05, 0.05, 0.05],
         epoch_dataset_idx=0,
         samples_per_gpu=params.samples_per_gpu,
         workers_per_gpu=params.workers_per_gpu,
@@ -213,7 +240,6 @@ def get_config() -> ExperimentConfig:
         data_root=omni3d_data_root,
         omni3d50=True,
         test_datasets=omni3d_test_datasets,
-        use_mini_dataset=True,
     )
 
     callbacks = get_callback_cfg(

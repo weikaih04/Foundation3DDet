@@ -859,6 +859,7 @@ class SAM3_3D(nn.Module):
                     image_hw=(H, W),
                     depth_gt=depth_gt,
                     depth_mask=depth_mask,
+                    padding=batch.padding,
                 )
 
             # Wait for both streams to complete
@@ -1520,8 +1521,8 @@ class SAM3_3D(nn.Module):
 
         # Get depth maps if available
         depth_maps = None
-        if geom_out is not None and "depth" in geom_out:
-            depth_maps = [geom_out["depth"][i] for i in range(B_images)]
+        if geom_out is not None and "depth_map" in geom_out:
+            depth_maps = [geom_out["depth_map"][i] for i in range(B_images)]
 
         # Get predicted intrinsics if available
         predicted_intrinsics = None

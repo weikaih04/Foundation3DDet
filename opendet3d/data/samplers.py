@@ -218,6 +218,7 @@ def build_train_dataloader_with_ratios(
         num_samples=num_samples,
         shuffle=kwargs.pop("shuffle", True),
     )
+    # shuffle must be False when using custom sampler (PyTorch requirement)
     return build_train_dataloader(
-        dataset=dataset, sampler=sampler, **kwargs
+        dataset=dataset, sampler=sampler, shuffle=False, **kwargs
     )

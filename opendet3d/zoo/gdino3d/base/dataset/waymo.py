@@ -25,6 +25,8 @@ def get_waymo_dataset_cfg(
     remove_empty: bool = False,
     with_depth: bool = False,
     cache_as_binary: bool = False,
+    use_mini_dataset: bool = False,
+    mini_dataset_size: int = 100,
 ) -> list[ConfigDict]:
     """Get the dataset configs for Waymo.
 
@@ -36,8 +38,15 @@ def get_waymo_dataset_cfg(
         remove_empty: Whether to remove empty samples.
         with_depth: Whether to load depth maps.
         cache_as_binary: Whether to cache as binary.
+        use_mini_dataset: If True, use mini dataset cache.
+        mini_dataset_size: Size of mini dataset (default: 100).
     """
-    cached_dir = os.path.join(data_root, "cache")
+    if use_mini_dataset:
+        cached_dir = os.path.join(
+            data_root, f"cache_mini{mini_dataset_size}"
+        )
+    else:
+        cached_dir = os.path.join(data_root, "cache")
 
     dataset_cfg_list = []
     for dataset in datasets:
@@ -75,6 +84,8 @@ def get_waymo_train_cfg(
     data_backend: None | ConfigDict = None,
     shape: tuple[int, int] = (800, 1333),
     cache_as_binary: bool = True,
+    use_mini_dataset: bool = False,
+    mini_dataset_size: int = 100,
 ) -> ConfigDict:
     """Get the train config for Waymo.
 
@@ -84,6 +95,8 @@ def get_waymo_train_cfg(
         data_backend: Data backend configuration.
         shape: Input image shape (H, W).
         cache_as_binary: Whether to cache as binary.
+        use_mini_dataset: If True, use mini dataset cache.
+        mini_dataset_size: Size of mini dataset (default: 100).
     """
     train_dataset_cfg = get_waymo_dataset_cfg(
         data_root=data_root,
@@ -92,6 +105,8 @@ def get_waymo_train_cfg(
         remove_empty=True,
         with_depth=True,
         cache_as_binary=cache_as_binary,
+        use_mini_dataset=use_mini_dataset,
+        mini_dataset_size=mini_dataset_size,
     )
 
     train_preprocess_cfg = get_train_transforms_cfg(shape=shape)
