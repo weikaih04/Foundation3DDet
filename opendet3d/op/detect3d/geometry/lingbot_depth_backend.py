@@ -10,7 +10,8 @@ Uses DINOv2 RGB-D encoder with mixed depth input strategy (per-sample):
 Intrinsic prediction: MLP on cls_token predicts camera K.
 is_ray_aware = False so the 3D head's camera prompt branch is active.
 
-Depth loss: L1 + SILog on all valid pixels of full depth_gt (all samples).
+Depth loss: L1 + MoGe2 affine-invariant losses (global, local, edge)
+  + confidence mask BCE on all valid pixels.
 Camera loss: ray-based MSE (same approach as UniDepthV2).
 """
 
@@ -26,6 +27,42 @@ from torch import Tensor
 from .base import GeometryBackendBase, GeometryBackendOutput
 from opendet3d.op.geometric.ray import generate_rays
 from opendet3d.op.loss.silog_loss import SILogLoss
+
+from moge.train.losses import (
+    affine_invariant_global_loss,
+    affine_invariant_local_loss,
+    edge_loss,
+    mask_bce_loss,
+)
+
+
+def backproject_depth_to_points(
+    depth: Tensor, K: Tensor, H: int, W: int
+) -> Tensor:
+    """Back-project depth map to 3D points using camera intrinsics.
+
+    Args:
+        depth: [B, 1, H, W] or [B, H, W] metric depth.
+        K: [B, 3, 3] camera intrinsics.
+        H: Image height.
+        W: Image width.
+
+    Returns:
+        points: [B, H, W, 3] 3D points in camera space (x, y, z).
+    """
+    u = torch.arange(W, device=depth.device, dtype=depth.dtype)
+    v = torch.arange(H, device=depth.device, dtype=depth.dtype)
+    u, v = torch.meshgrid(u, v, indexing="xy")  # [H, W]
+
+    z = depth.squeeze(1) if depth.ndim == 4 else depth  # [B, H, W]
+    fx = K[:, 0, 0]  # [B]
+    fy = K[:, 1, 1]  # [B]
+    cx = K[:, 0, 2]  # [B]
+    cy = K[:, 1, 2]  # [B]
+
+    x = (u[None] - cx[:, None, None]) / fx[:, None, None] * z
+    y = (v[None] - cy[:, None, None]) / fy[:, None, None] * z
+    return torch.stack([x, y, z], dim=-1)  # [B, H, W, 3]
 
 
 class LingbotDepthBackend(GeometryBackendBase):
@@ -54,12 +91,15 @@ class LingbotDepthBackend(GeometryBackendBase):
             projection is applied. Use 256 to avoid projection.
         depth_loss_weight: Weight for L1 depth loss.
         silog_loss_weight: Weight for SILog depth loss (scale-invariant).
+        affine_global_weight: Weight for MoGe2 affine-invariant global loss.
+        affine_local_weight: Weight for MoGe2 affine-invariant local loss.
+        edge_loss_weight: Weight for MoGe2 edge loss.
+        mask_loss_weight: Weight for confidence mask BCE loss.
         monocular_prob: Probability of zero depth input (training).
         masked_prob: Probability of patch-masked depth input (training).
         mask_ratio_range: (min, max) masking ratio for patch-masked mode.
         mask_patch_size: Patch size for depth masking grid.
         camera_loss_weight: Weight for ray-based L2 camera loss.
-        ssi_loss_weight: Weight for EdgeGuidedLocalSSI depth loss.
         detach_depth_latents: Whether to detach depth_latents from graph.
         encoder_freeze_blocks: Number of encoder transformer blocks to
             freeze (from the beginning). ViT-L has 24 blocks; e.g. 20
@@ -72,18 +112,21 @@ class LingbotDepthBackend(GeometryBackendBase):
     def __init__(
         self,
         pretrained_model: str = (
-            "robbyant/lingbot-depth-postrain-dc-vitl14"
+            "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
         ),
         num_tokens: int = 2400,
         target_latent_dim: int = 128,
         depth_loss_weight: float = 1.0,
         silog_loss_weight: float = 0.5,
+        affine_global_weight: float = 1.0,
+        affine_local_weight: float = 1.0,
+        edge_loss_weight: float = 1.0,
+        mask_loss_weight: float = 0.1,
         monocular_prob: float = 0.7,
         masked_prob: float = 0.2,
         mask_ratio_range: tuple[float, float] = (0.6, 0.9),
         mask_patch_size: int = 14,
         camera_loss_weight: float = 1.0,
-        ssi_loss_weight: float = 0.5,
         detach_depth_latents: bool = True,
         encoder_freeze_blocks: int = 0,
     ) -> None:
@@ -94,32 +137,20 @@ class LingbotDepthBackend(GeometryBackendBase):
         self.target_latent_dim = target_latent_dim
         self.depth_loss_weight = depth_loss_weight
         self.silog_loss_weight = silog_loss_weight
+        self.affine_global_weight = affine_global_weight
+        self.affine_local_weight = affine_local_weight
+        self.edge_loss_weight = edge_loss_weight
+        self.mask_loss_weight = mask_loss_weight
         self.monocular_prob = monocular_prob
         self.masked_prob = masked_prob
         self.mask_ratio_range = mask_ratio_range
         self.mask_patch_size = mask_patch_size
         self.camera_loss_weight = camera_loss_weight
-        self.ssi_loss_weight = ssi_loss_weight
 
-        # SILog loss (scale-invariant, same as UniDepthV2)
+        # SILog loss (scale-invariant)
         self.silog_loss = SILogLoss(
             scale_pred_weight=0.15,
         ) if silog_loss_weight > 0 else None
-
-        # EdgeGuidedLocalSSI loss (edge-guided scale-shift-invariant)
-        if ssi_loss_weight > 0:
-            from unidepth.ops.losses import EdgeGuidedLocalSSI
-
-            self.ssi_loss = EdgeGuidedLocalSSI.build({
-                "name": "EdgeGuidedLocalSSI",
-                "weight": 1.0,
-                "output_fn": "sqrt",
-                "input_fn": "log1i",
-                "use_global": True,
-                "min_samples": 6,
-            })
-        else:
-            self.ssi_loss = None
 
         # Load pretrained MDMModel and decompose into sub-modules
         from mdm.model.v2 import MDMModel
@@ -135,6 +166,17 @@ class LingbotDepthBackend(GeometryBackendBase):
         self.depth_head = mdm_model.depth_head
         self.remap_depth_in = mdm_model.remap_depth_in
         self.remap_depth_out = mdm_model.remap_depth_out
+
+        # Load mask_head from pretrained model (confidence prediction)
+        if hasattr(mdm_model, "mask_head"):
+            self.mask_head = mdm_model.mask_head
+            print("[LingbotDepth] mask_head loaded from checkpoint")
+        else:
+            self.mask_head = None
+            print(
+                "[LingbotDepth] WARNING: mask_head not found in "
+                "checkpoint, confidence prediction disabled"
+            )
 
         # Get dimensions from loaded model
         cls_dim = self.encoder.dim_features
@@ -218,10 +260,13 @@ class LingbotDepthBackend(GeometryBackendBase):
             f"{copythrough_prob:.0%} copy-through\n"
             f"  mask_ratio_range={mask_ratio_range}, "
             f"mask_patch_size={mask_patch_size}\n"
-            f"  depth_loss_weight={depth_loss_weight}, "
-            f"silog_loss_weight={silog_loss_weight}, "
-            f"ssi_loss_weight={ssi_loss_weight}, "
-            f"camera_loss_weight={camera_loss_weight}\n"
+            f"  losses: L1={depth_loss_weight}, "
+            f"affine_global={affine_global_weight}, "
+            f"affine_local={affine_local_weight}, "
+            f"edge={edge_loss_weight}, "
+            f"mask_bce={mask_loss_weight}, "
+            f"camera_ray={camera_loss_weight}\n"
+            f"  mask_head={'loaded' if self.mask_head is not None else 'none'}\n"
             f"{freeze_msg}"
         )
 
@@ -400,7 +445,7 @@ class LingbotDepthBackend(GeometryBackendBase):
         images: Tensor,
         depth_input: Tensor | None,
         image_hw: tuple[int, int],
-    ) -> tuple[Tensor, Tensor, Tensor, int, int]:
+    ) -> tuple[Tensor, Tensor, Tensor, int, int, list[Tensor]]:
         """Run encoder + neck + depth_head pipeline.
 
         Replicates MDMModel.forward() logic (lines 98-168 of v2.py).
@@ -416,6 +461,7 @@ class LingbotDepthBackend(GeometryBackendBase):
             cls_token: [B, cls_dim].
             base_h: Token grid height.
             base_w: Token grid width.
+            neck_out: List of neck feature maps for mask_head.
         """
         from mdm.utils.geo import normalized_view_plane_uv
 
@@ -515,13 +561,42 @@ class LingbotDepthBackend(GeometryBackendBase):
         if self.remap_depth_out == "exp":
             depth_map = depth_reg.clamp(-10, 10).exp()  # [B, 1, H, W]
         elif self.remap_depth_out == "linear":
-            depth_map = depth_reg
+            # Linear output can be negative; clamp to positive for
+            # downstream log-based losses and 3D head depth usage.
+            depth_map = depth_reg.clamp(min=1e-3)
         else:
             raise ValueError(
                 f"Invalid remap_depth_out: {self.remap_depth_out}"
             )
 
-        return depth_map, depth_latents, cls_token, base_h, base_w
+        return depth_map, depth_latents, cls_token, base_h, base_w, neck_out
+
+    def _run_mask_head(
+        self,
+        neck_out: list[Tensor],
+        H: int,
+        W: int,
+    ) -> Tensor | None:
+        """Run mask_head to produce confidence map.
+
+        Args:
+            neck_out: List of neck feature maps.
+            H: Target height.
+            W: Target width.
+
+        Returns:
+            confidence_map: [B, 1, H, W] sigmoid probabilities, or None.
+        """
+        if self.mask_head is None:
+            return None
+        confidence_raw = self.mask_head(neck_out)[-1]  # [B, 1, h, w]
+        confidence_map = F.interpolate(
+            confidence_raw,
+            (H, W),
+            mode="bilinear",
+            align_corners=False,
+        ).sigmoid()
+        return confidence_map
 
     @torch.autocast(device_type="cuda", enabled=False)
     def _compute_losses(
@@ -532,12 +607,12 @@ class LingbotDepthBackend(GeometryBackendBase):
         K_pred: Tensor,
         intrinsics: Tensor,
         image_hw: tuple[int, int],
-        images: Tensor | None = None,
+        confidence_map: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Compute depth and camera losses.
 
-        Depth loss: masked L1 on raw metric depth (LingBot-Depth paper
-        Section 2.3).
+        Depth loss: masked L1 + MoGe2 affine-invariant losses (global,
+        local level 4 & 16, edge) + confidence mask BCE.
         Camera loss: ray-based L2 RMSE (same as UniDepthV2).
 
         Args:
@@ -547,12 +622,13 @@ class LingbotDepthBackend(GeometryBackendBase):
             K_pred: [B, 3, 3] predicted intrinsics.
             intrinsics: [B, 3, 3] ground truth intrinsics.
             image_hw: (H, W) image dimensions.
-            images: [B, 3, H, W] normalized images for SSI edge detection.
+            confidence_map: [B, 1, H, W] confidence from mask_head.
 
         Returns:
             Dictionary of loss tensors.
         """
         losses = {}
+        H, W = image_hw
 
         # Cast to float32 for numerical stability under mixed precision
         depth_map = depth_map.float()
@@ -562,10 +638,10 @@ class LingbotDepthBackend(GeometryBackendBase):
             depth_gt = depth_gt.float()
         if depth_mask is not None:
             depth_mask = depth_mask.float()
-        if images is not None:
-            images = images.float()
+        if confidence_map is not None:
+            confidence_map = confidence_map.float()
 
-        # Depth loss: masked L1 on raw metric depth
+        # Depth losses
         if depth_gt is not None:
             depth_pred = depth_map.squeeze(1)  # [B, H, W]
 
@@ -578,51 +654,127 @@ class LingbotDepthBackend(GeometryBackendBase):
                     depth_mask = depth_mask.squeeze(1)
                 valid_mask = valid_mask & depth_mask.bool()
 
+            B = depth_pred.shape[0]
+
+            # L1 metric depth loss
             if valid_mask.any():
                 depth_loss = F.l1_loss(
                     depth_pred[valid_mask], depth_gt[valid_mask]
                 )
             else:
-                depth_loss = torch.tensor(
-                    0.0,
-                    device=depth_map.device,
-                    dtype=depth_map.dtype,
-                )
+                depth_loss = depth_pred.new_tensor(0.0)
 
-            losses["depth_l1"] = depth_loss * self.depth_loss_weight
+            losses["depth_l1"] = (
+                depth_loss.clamp(max=10.0) * self.depth_loss_weight
+            )
 
-            # SILog loss: scale-invariant log loss (same as UniDepthV2)
-            if self.silog_loss is not None:
-                silog_loss = self.silog_loss(
+            # SILog loss (scale-invariant)
+            if self.silog_loss is not None and valid_mask.any():
+                silog_val = self.silog_loss(
                     depth_pred, depth_gt, mask=valid_mask
                 )
-                losses["depth_silog"] = silog_loss * self.silog_loss_weight
-
-            # EdgeGuidedLocalSSI loss (same as UniDepthV2)
-            if self.ssi_loss is not None and images is not None:
-                depth_pred_4d = depth_map  # [B, 1, H, W]
-                depth_gt_4d = depth_gt.unsqueeze(1)  # [B, 1, H, W]
-                mask_4d = valid_mask.unsqueeze(1)  # [B, 1, H, W]
-                images_01 = (
-                    images * self.denorm_std + self.denorm_mean
-                )
-                ssi_loss = self.ssi_loss(
-                    input=depth_pred_4d,
-                    target=depth_gt_4d,
-                    mask=mask_4d.float(),
-                    image=images_01,
-                    validity_mask=mask_4d.float(),
-                )
-                losses["depth_ssi"] = (
-                    ssi_loss.mean() * self.ssi_loss_weight
+                losses["depth_silog"] = (
+                    silog_val.clamp(max=10.0)
+                    * self.silog_loss_weight
                 )
 
-        # Camera loss: ray-based MSE (same as UniDepthV2 Regression loss
-        # on rays, see unidepthv2.py compute_losses "camera" section)
+            # Back-project to 3D points for MoGe2 losses
+            pred_points = backproject_depth_to_points(
+                depth_pred, K_pred, H, W
+            )  # [B, H, W, 3]
+            gt_points = backproject_depth_to_points(
+                depth_gt, intrinsics, H, W
+            )  # [B, H, W, 3]
+            # MoGe2 convention: invalid GT -> inf
+            gt_points[~valid_mask] = float("inf")
+
+            # Per-image MoGe2 losses (alignment is per-image)
+            aff_global_sum = depth_pred.new_tensor(0.0)
+            aff_local4_sum = depth_pred.new_tensor(0.0)
+            aff_local16_sum = depth_pred.new_tensor(0.0)
+            edge_sum = depth_pred.new_tensor(0.0)
+
+            for i in range(B):
+                # Affine-invariant global
+                loss_g, _, scale_i = affine_invariant_global_loss(
+                    pred_points[i],
+                    gt_points[i],
+                    align_resolution=48,
+                )
+                aff_global_sum = aff_global_sum + loss_g
+
+                focal_i = K_pred[i, 0, 0]
+
+                # Affine-invariant local level 4 (large patches)
+                loss_l4, _ = affine_invariant_local_loss(
+                    pred_points[i],
+                    gt_points[i],
+                    focal_i,
+                    scale_i,
+                    level=4,
+                    align_resolution=24,
+                    num_patches=16,
+                )
+                aff_local4_sum = aff_local4_sum + loss_l4
+
+                # Affine-invariant local level 16 (medium patches)
+                loss_l16, _ = affine_invariant_local_loss(
+                    pred_points[i],
+                    gt_points[i],
+                    focal_i,
+                    scale_i,
+                    level=16,
+                    align_resolution=24,
+                    num_patches=256,
+                )
+                aff_local16_sum = aff_local16_sum + loss_l16
+
+                # Edge loss (per-image)
+                loss_e, _ = edge_loss(
+                    pred_points[i], gt_points[i]
+                )
+                edge_sum = edge_sum + loss_e
+
+            losses["affine_global"] = (
+                (aff_global_sum / B).clamp(max=10.0)
+                * self.affine_global_weight
+            )
+            losses["affine_local_4"] = (
+                (aff_local4_sum / B).clamp(max=10.0)
+                * self.affine_local_weight
+            )
+            losses["affine_local_16"] = (
+                (aff_local16_sum / B).clamp(max=10.0)
+                * self.affine_local_weight
+            )
+            losses["edge"] = (
+                (edge_sum / B).clamp(max=10.0)
+                * self.edge_loss_weight
+            )
+
+            # Mask BCE loss (confidence map)
+            if (
+                confidence_map is not None
+                and self.mask_loss_weight > 0
+            ):
+                conf = confidence_map.squeeze(1)  # [B, H, W]
+                gt_mask_fin = valid_mask  # positive: valid depth
+                gt_mask_inf = ~valid_mask  # negative: invalid depth
+                loss_mask, _ = mask_bce_loss(
+                    conf, gt_mask_fin, gt_mask_inf
+                )
+                losses["mask_bce"] = (
+                    loss_mask.mean().clamp(max=10.0)
+                    * self.mask_loss_weight
+                )
+
+        # Camera loss: ray-based MSE (same as UniDepthV2)
         rays_pred, _ = generate_rays(K_pred, image_hw)
         rays_gt, _ = generate_rays(intrinsics, image_hw)
         camera_loss = F.mse_loss(rays_pred, rays_gt)
-        losses["camera_ray"] = camera_loss * self.camera_loss_weight
+        losses["camera_ray"] = (
+            camera_loss.clamp(max=10.0) * self.camera_loss_weight
+        )
 
         return losses
 
@@ -653,6 +805,185 @@ class LingbotDepthBackend(GeometryBackendBase):
 
         return K_scaled
 
+    def _has_valid_padding(self, padding: list | None) -> bool:
+        """Check if padding info is valid and non-zero."""
+        if padding is None:
+            return False
+        return any(
+            p is not None and any(v > 0 for v in p) for p in padding
+        )
+
+    def _crop_padding_single(
+        self,
+        image: Tensor,
+        intrinsics: Tensor,
+        pad_info: list[int],
+        H_pad: int,
+        W_pad: int,
+        depth_gt: Tensor | None = None,
+        depth_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, int, int, Tensor | None, Tensor | None]:
+        """Crop padding from a single image and adjust intrinsics.
+
+        Args:
+            image: [1, 3, H_pad, W_pad] padded image.
+            intrinsics: [1, 3, 3] padded-space intrinsics.
+            pad_info: [pad_left, pad_right, pad_top, pad_bottom].
+            H_pad: Padded height.
+            W_pad: Padded width.
+            depth_gt: [1, 1, H_pad, W_pad] or None.
+            depth_mask: [1, 1, H_pad, W_pad] or [1, H_pad, W_pad] or None.
+
+        Returns:
+            (cropped_image, adjusted_intrinsics, H_orig, W_orig,
+             cropped_depth_gt, cropped_depth_mask)
+        """
+        pad_left, pad_right, pad_top, pad_bottom = pad_info
+        H_orig = H_pad - pad_top - pad_bottom
+        W_orig = W_pad - pad_left - pad_right
+
+        # Crop image
+        img_cropped = image[
+            :, :, pad_top : pad_top + H_orig, pad_left : pad_left + W_orig
+        ]
+
+        # Adjust intrinsics: reverse CenterPadIntrinsics
+        K_cropped = intrinsics.clone()
+        K_cropped[0, 0, 2] -= pad_left  # cx
+        K_cropped[0, 1, 2] -= pad_top  # cy
+
+        # Crop depth_gt
+        dgt_cropped = None
+        if depth_gt is not None:
+            dgt_cropped = depth_gt[
+                :, :,
+                pad_top : pad_top + H_orig,
+                pad_left : pad_left + W_orig,
+            ]
+
+        # Crop depth_mask
+        dm_cropped = None
+        if depth_mask is not None:
+            if depth_mask.ndim == 3:
+                dm_cropped = depth_mask[
+                    :,
+                    pad_top : pad_top + H_orig,
+                    pad_left : pad_left + W_orig,
+                ]
+            else:
+                dm_cropped = depth_mask[
+                    :, :,
+                    pad_top : pad_top + H_orig,
+                    pad_left : pad_left + W_orig,
+                ]
+
+        return (
+            img_cropped,
+            K_cropped,
+            H_orig,
+            W_orig,
+            dgt_cropped,
+            dm_cropped,
+        )
+
+    def _repad_depth_latents(
+        self,
+        depth_latents: Tensor,
+        base_h_orig: int,
+        base_w_orig: int,
+        base_h_pad: int,
+        base_w_pad: int,
+        pad_top: int,
+        pad_left: int,
+        H_pad: int,
+        W_pad: int,
+    ) -> Tensor:
+        """Repad depth latents from original to padded token grid.
+
+        Places original-resolution tokens at the correct position within
+        the padded token grid, with zeros filling the padding regions.
+
+        Args:
+            depth_latents: [1, N_orig, C] original-resolution latents.
+            base_h_orig: Original token grid height.
+            base_w_orig: Original token grid width.
+            base_h_pad: Padded token grid height.
+            base_w_pad: Padded token grid width.
+            pad_top: Pixel-space top padding.
+            pad_left: Pixel-space left padding.
+            H_pad: Padded image height.
+            W_pad: Padded image width.
+
+        Returns:
+            [1, N_pad, C] depth latents in padded token grid.
+        """
+        if (
+            base_h_orig == base_h_pad
+            and base_w_orig == base_w_pad
+        ):
+            return depth_latents
+
+        _, N_orig, C = depth_latents.shape
+
+        # Reshape to spatial: [1, C, base_h_orig, base_w_orig]
+        dl_2d = depth_latents.permute(0, 2, 1).reshape(
+            1, C, base_h_orig, base_w_orig
+        )
+
+        # Compute token-space offsets
+        pad_top_tok = round(pad_top * base_h_pad / H_pad)
+        pad_left_tok = round(pad_left * base_w_pad / W_pad)
+
+        # Clamp to valid range
+        pad_top_tok = min(pad_top_tok, base_h_pad - 1)
+        pad_left_tok = min(pad_left_tok, base_w_pad - 1)
+
+        # How many original tokens fit
+        h_fit = min(base_h_orig, base_h_pad - pad_top_tok)
+        w_fit = min(base_w_orig, base_w_pad - pad_left_tok)
+
+        # Create padded output with zeros
+        dl_padded = torch.zeros(
+            1,
+            C,
+            base_h_pad,
+            base_w_pad,
+            device=depth_latents.device,
+            dtype=depth_latents.dtype,
+        )
+        dl_padded[
+            :,
+            :,
+            pad_top_tok : pad_top_tok + h_fit,
+            pad_left_tok : pad_left_tok + w_fit,
+        ] = dl_2d[:, :, :h_fit, :w_fit]
+
+        # Flatten back: [1, N_pad, C]
+        return dl_padded.flatten(2).permute(0, 2, 1)
+
+    def _repad_depth_map(
+        self,
+        depth_map: Tensor,
+        pad_left: int,
+        pad_right: int,
+        pad_top: int,
+        pad_bottom: int,
+    ) -> Tensor:
+        """Repad depth map from original to padded resolution.
+
+        Args:
+            depth_map: [1, 1, H_orig, W_orig].
+            pad_left, pad_right, pad_top, pad_bottom: Pixel padding.
+
+        Returns:
+            [1, 1, H_pad, W_pad] with zeros in padding region.
+        """
+        return F.pad(
+            depth_map,
+            (pad_left, pad_right, pad_top, pad_bottom),
+            value=0.0,
+        )
+
     def forward_train(
         self,
         images: Tensor,
@@ -668,6 +999,10 @@ class LingbotDepthBackend(GeometryBackendBase):
         Uses mixed depth input strategy: each sample independently
         gets monocular / patch-masked / copy-through depth input.
 
+        When padding info is provided, crops padding before the encoder
+        so LingBot-Depth processes at original resolution with correct
+        aspect ratio, then repads outputs back to padded space.
+
         Args:
             images: [B, 3, H, W] 3D-MOOD normalized images.
             depth_feats: Ignored (we use our own encoder).
@@ -675,38 +1010,239 @@ class LingbotDepthBackend(GeometryBackendBase):
             image_hw: (H, W) image dimensions.
             depth_gt: [B, H, W] ground truth depth.
             depth_mask: [B, H, W] valid depth mask.
+            **kwargs: May contain 'padding' (list of [L,R,T,B] per image).
 
         Returns:
             GeometryBackendOutput.
         """
         B = images.shape[0]
-        H, W = image_hw
+        H_pad, W_pad = image_hw
+        padding = kwargs.get("padding", None)
 
-        # Prepare depth input with mixed strategy
-        depth_input = self._prepare_depth_input(
-            depth_gt, depth_mask, B, H, W, images.device
+        # If no valid padding, use original batched code path
+        if not self._has_valid_padding(padding):
+            return self._forward_train_batched(
+                images, intrinsics, image_hw, depth_gt, depth_mask
+            )
+
+        # Per-image processing at original (unpadded) resolution
+        # Padded token grid (target for repadding depth_latents)
+        base_h_pad, base_w_pad = self._compute_token_grid(
+            H_pad, W_pad
         )
 
-        # Run encoder + decoder pipeline
-        depth_map, depth_latents, cls_token, base_h, base_w = (
-            self._run_encoder_and_decoder(images, depth_input, image_hw)
+        depth_maps_list = []
+        depth_latents_list = []
+        K_pred_list = []
+        confidence_maps_list = []
+        losses_accum = {}
+
+        for i in range(B):
+            pad_info = padding[i]
+            if pad_info is None or all(v == 0 for v in pad_info):
+                # No padding for this image
+                pad_left = pad_right = pad_top = pad_bottom = 0
+                img_i = images[i : i + 1]
+                K_i = intrinsics[i : i + 1]
+                H_orig, W_orig = H_pad, W_pad
+                dgt_i = (
+                    depth_gt[i : i + 1] if depth_gt is not None
+                    else None
+                )
+                dm_i = (
+                    depth_mask[i : i + 1]
+                    if depth_mask is not None
+                    else None
+                )
+            else:
+                pad_left, pad_right, pad_top, pad_bottom = pad_info
+                (
+                    img_i,
+                    K_i,
+                    H_orig,
+                    W_orig,
+                    dgt_i,
+                    dm_i,
+                ) = self._crop_padding_single(
+                    images[i : i + 1],
+                    intrinsics[i : i + 1],
+                    pad_info,
+                    H_pad,
+                    W_pad,
+                    (
+                        depth_gt[i : i + 1]
+                        if depth_gt is not None
+                        else None
+                    ),
+                    (
+                        depth_mask[i : i + 1]
+                        if depth_mask is not None
+                        else None
+                    ),
+                )
+
+            orig_hw = (H_orig, W_orig)
+
+            # Prepare depth input with mixed strategy (per-image)
+            depth_input_i = self._prepare_depth_input(
+                dgt_i, dm_i, 1, H_orig, W_orig, images.device
+            )
+
+            # Run encoder at ORIGINAL resolution (correct aspect ratio)
+            (
+                depth_map_i,
+                depth_latents_i,
+                cls_token_i,
+                base_h_i,
+                base_w_i,
+                neck_out_i,
+            ) = self._run_encoder_and_decoder(
+                img_i, depth_input_i, orig_hw
+            )
+
+            # Predict intrinsics at original resolution
+            K_pred_i = self._predict_intrinsics(
+                cls_token_i, H_orig, W_orig
+            )
+
+            # Run mask_head for confidence map
+            confidence_map_i = self._run_mask_head(
+                neck_out_i, H_orig, W_orig
+            )
+
+            # Compute losses at original resolution
+            losses_i = self._compute_losses(
+                depth_map_i,
+                dgt_i,
+                dm_i,
+                K_pred_i,
+                K_i,
+                orig_hw,
+                confidence_map=confidence_map_i,
+            )
+
+            # Accumulate losses
+            for key, val in losses_i.items():
+                if key not in losses_accum:
+                    losses_accum[key] = val
+                else:
+                    losses_accum[key] = losses_accum[key] + val
+
+            # Repad depth_map back to padded resolution
+            depth_map_padded_i = self._repad_depth_map(
+                depth_map_i,
+                pad_left,
+                pad_right,
+                pad_top,
+                pad_bottom,
+            )
+            depth_maps_list.append(depth_map_padded_i)
+
+            # Repad confidence_map back to padded resolution
+            if confidence_map_i is not None:
+                confidence_maps_list.append(
+                    self._repad_depth_map(
+                        confidence_map_i,
+                        pad_left,
+                        pad_right,
+                        pad_top,
+                        pad_bottom,
+                    )
+                )
+
+            # Repad depth_latents to padded token grid
+            depth_latents_padded_i = self._repad_depth_latents(
+                depth_latents_i,
+                base_h_i,
+                base_w_i,
+                base_h_pad,
+                base_w_pad,
+                pad_top,
+                pad_left,
+                H_pad,
+                W_pad,
+            )
+            depth_latents_list.append(depth_latents_padded_i)
+
+            # K_pred: restore to padded space (add padding offset)
+            # fx, fy unchanged (padding doesn't change focal length)
+            # Use non-inplace ops to preserve autograd graph
+            K_pred_padded_i = K_pred_i.clone()
+            K_pred_padded_i[:, 0, 2] = K_pred_i[:, 0, 2] + pad_left
+            K_pred_padded_i[:, 1, 2] = K_pred_i[:, 1, 2] + pad_top
+            K_pred_list.append(K_pred_padded_i)
+
+        # Average losses across batch
+        for key in losses_accum:
+            losses_accum[key] = losses_accum[key] / B
+
+        # Stack results
+        depth_map = torch.cat(depth_maps_list, dim=0)
+        depth_latents = torch.cat(depth_latents_list, dim=0)
+        K_pred = torch.cat(K_pred_list, dim=0)
+        confidence_map = (
+            torch.cat(confidence_maps_list, dim=0)
+            if confidence_maps_list
+            else None
         )
 
         depth_latents = self._maybe_detach_latents(depth_latents)
 
-        # Predict intrinsics from cls_token
-        K_pred = self._predict_intrinsics(cls_token, H, W)
-
-        # Compute losses
-        losses = self._compute_losses(
-            depth_map, depth_gt, depth_mask, K_pred, intrinsics, image_hw,
-            images=images,
+        # Ray intrinsics: padded intrinsics scaled to padded token grid
+        # (consistent with padded depth_latents space)
+        internal_hw = (base_h_pad * 14, base_w_pad * 14)
+        ray_intrinsics = self._scale_intrinsics(
+            intrinsics, (H_pad, W_pad), internal_hw
         )
 
-        # Ray intrinsics: GT K scaled to encoder internal resolution
-        # The 3D head generates ray_embeddings at ray_image_hw, then
-        # flat_interpolate downsamples by ray_downsample to match
-        # depth_latents spatial grid (base_h, base_w)
+        return GeometryBackendOutput(
+            depth_map=depth_map,
+            depth_latents=depth_latents,
+            K_pred=K_pred,
+            ray_intrinsics=ray_intrinsics,
+            ray_image_hw=internal_hw,
+            ray_downsample=14,
+            aux={
+                "depth_latents_hw": (base_h_pad, base_w_pad),
+                "confidence_map": confidence_map,
+            },
+            losses=losses_accum,
+        )
+
+    def _forward_train_batched(
+        self,
+        images: Tensor,
+        intrinsics: Tensor,
+        image_hw: tuple[int, int],
+        depth_gt: Tensor | None,
+        depth_mask: Tensor | None,
+    ) -> GeometryBackendOutput:
+        """Original batched forward_train path (no unpadding)."""
+        B = images.shape[0]
+        H, W = image_hw
+
+        depth_input = self._prepare_depth_input(
+            depth_gt, depth_mask, B, H, W, images.device
+        )
+
+        (
+            depth_map, depth_latents, cls_token,
+            base_h, base_w, neck_out,
+        ) = self._run_encoder_and_decoder(
+            images, depth_input, image_hw
+        )
+
+        depth_latents = self._maybe_detach_latents(depth_latents)
+        K_pred = self._predict_intrinsics(cls_token, H, W)
+
+        # Run mask_head for confidence map
+        confidence_map = self._run_mask_head(neck_out, H, W)
+
+        losses = self._compute_losses(
+            depth_map, depth_gt, depth_mask, K_pred, intrinsics,
+            image_hw, confidence_map=confidence_map,
+        )
+
         internal_hw = (base_h * 14, base_w * 14)
         ray_intrinsics = self._scale_intrinsics(
             intrinsics, (H, W), internal_hw
@@ -719,7 +1255,10 @@ class LingbotDepthBackend(GeometryBackendBase):
             ray_intrinsics=ray_intrinsics,
             ray_image_hw=internal_hw,
             ray_downsample=14,
-            aux={"depth_latents_hw": (base_h, base_w)},
+            aux={
+                "depth_latents_hw": (base_h, base_w),
+                "confidence_map": confidence_map,
+            },
             losses=losses,
         )
 
@@ -735,29 +1274,196 @@ class LingbotDepthBackend(GeometryBackendBase):
     ) -> GeometryBackendOutput:
         """Forward pass for inference.
 
+        When padding info is provided, crops padding before the encoder
+        so LingBot-Depth processes at original resolution, then repads.
+
         Args:
             images: [B, 3, H, W] 3D-MOOD normalized images.
             depth_feats: Ignored.
             intrinsics: [B, 3, 3] camera intrinsics.
             image_hw: (H, W) image dimensions.
-            depth_gt: [B, 1, H, W] depth map input (optional). If None, uses
-                zero depth (monocular mode). If provided, uses depth as input
-                (oracle/GT-depth mode).
+            depth_gt: [B, 1, H, W] depth map input (optional).
+            **kwargs: May contain 'padding' (list of [L,R,T,B]).
 
         Returns:
             GeometryBackendOutput.
         """
-        H, W = image_hw
+        H_pad, W_pad = image_hw
+        padding = kwargs.get("padding", None)
 
-        # Use provided depth_gt if available, otherwise zero (monocular)
-        depth_input = depth_gt if depth_gt is not None else None
-        depth_map, depth_latents, cls_token, base_h, base_w = (
-            self._run_encoder_and_decoder(images, depth_input, image_hw)
+        # If no valid padding, use original batched code path
+        if not self._has_valid_padding(padding):
+            return self._forward_test_batched(
+                images, intrinsics, image_hw, depth_gt
+            )
+
+        # Per-image processing at original resolution
+        B = images.shape[0]
+        base_h_pad, base_w_pad = self._compute_token_grid(
+            H_pad, W_pad
+        )
+
+        depth_maps_list = []
+        depth_latents_list = []
+        K_pred_list = []
+        confidence_maps_list = []
+
+        for i in range(B):
+            pad_info = padding[i]
+            if pad_info is None or all(v == 0 for v in pad_info):
+                pad_left = pad_right = pad_top = pad_bottom = 0
+                img_i = images[i : i + 1]
+                K_i = intrinsics[i : i + 1]
+                H_orig, W_orig = H_pad, W_pad
+                dgt_i = (
+                    depth_gt[i : i + 1]
+                    if depth_gt is not None
+                    else None
+                )
+            else:
+                pad_left, pad_right, pad_top, pad_bottom = pad_info
+                (
+                    img_i,
+                    K_i,
+                    H_orig,
+                    W_orig,
+                    dgt_i,
+                    _,
+                ) = self._crop_padding_single(
+                    images[i : i + 1],
+                    intrinsics[i : i + 1],
+                    pad_info,
+                    H_pad,
+                    W_pad,
+                    (
+                        depth_gt[i : i + 1]
+                        if depth_gt is not None
+                        else None
+                    ),
+                )
+
+            orig_hw = (H_orig, W_orig)
+
+            # Use depth_gt as input if available, otherwise monocular
+            depth_input_i = dgt_i if dgt_i is not None else None
+
+            (
+                depth_map_i,
+                depth_latents_i,
+                cls_token_i,
+                base_h_i,
+                base_w_i,
+                neck_out_i,
+            ) = self._run_encoder_and_decoder(
+                img_i, depth_input_i, orig_hw
+            )
+
+            K_pred_i = self._predict_intrinsics(
+                cls_token_i, H_orig, W_orig
+            )
+
+            # Run mask_head for confidence map
+            confidence_map_i = self._run_mask_head(
+                neck_out_i, H_orig, W_orig
+            )
+
+            # Repad depth_map
+            depth_maps_list.append(
+                self._repad_depth_map(
+                    depth_map_i,
+                    pad_left,
+                    pad_right,
+                    pad_top,
+                    pad_bottom,
+                )
+            )
+
+            # Repad confidence_map
+            if confidence_map_i is not None:
+                confidence_maps_list.append(
+                    self._repad_depth_map(
+                        confidence_map_i,
+                        pad_left,
+                        pad_right,
+                        pad_top,
+                        pad_bottom,
+                    )
+                )
+
+            # Repad depth_latents
+            depth_latents_list.append(
+                self._repad_depth_latents(
+                    depth_latents_i,
+                    base_h_i,
+                    base_w_i,
+                    base_h_pad,
+                    base_w_pad,
+                    pad_top,
+                    pad_left,
+                    H_pad,
+                    W_pad,
+                )
+            )
+
+            # K_pred: restore to padded space (non-inplace for autograd)
+            K_pred_padded_i = K_pred_i.clone()
+            K_pred_padded_i[:, 0, 2] = K_pred_i[:, 0, 2] + pad_left
+            K_pred_padded_i[:, 1, 2] = K_pred_i[:, 1, 2] + pad_top
+            K_pred_list.append(K_pred_padded_i)
+
+        depth_map = torch.cat(depth_maps_list, dim=0)
+        depth_latents = torch.cat(depth_latents_list, dim=0)
+        K_pred = torch.cat(K_pred_list, dim=0)
+        confidence_map = (
+            torch.cat(confidence_maps_list, dim=0)
+            if confidence_maps_list
+            else None
         )
 
         depth_latents = self._maybe_detach_latents(depth_latents)
 
+        internal_hw = (base_h_pad * 14, base_w_pad * 14)
+        ray_intrinsics = self._scale_intrinsics(
+            intrinsics, (H_pad, W_pad), internal_hw
+        )
+
+        return GeometryBackendOutput(
+            depth_map=depth_map,
+            depth_latents=depth_latents,
+            K_pred=K_pred,
+            ray_intrinsics=ray_intrinsics,
+            ray_image_hw=internal_hw,
+            ray_downsample=14,
+            aux={
+                "depth_latents_hw": (base_h_pad, base_w_pad),
+                "confidence_map": confidence_map,
+            },
+            losses={},
+        )
+
+    def _forward_test_batched(
+        self,
+        images: Tensor,
+        intrinsics: Tensor,
+        image_hw: tuple[int, int],
+        depth_gt: Tensor | None,
+    ) -> GeometryBackendOutput:
+        """Original batched forward_test path (no unpadding)."""
+        H, W = image_hw
+
+        depth_input = depth_gt if depth_gt is not None else None
+        (
+            depth_map, depth_latents, cls_token,
+            base_h, base_w, neck_out,
+        ) = self._run_encoder_and_decoder(
+            images, depth_input, image_hw
+        )
+
+        depth_latents = self._maybe_detach_latents(depth_latents)
         K_pred = self._predict_intrinsics(cls_token, H, W)
+
+        # Run mask_head for confidence map
+        confidence_map = self._run_mask_head(neck_out, H, W)
 
         internal_hw = (base_h * 14, base_w * 14)
         ray_intrinsics = self._scale_intrinsics(
@@ -771,6 +1477,9 @@ class LingbotDepthBackend(GeometryBackendBase):
             ray_intrinsics=ray_intrinsics,
             ray_image_hw=internal_hw,
             ray_downsample=14,
-            aux={"depth_latents_hw": (base_h, base_w)},
+            aux={
+                "depth_latents_hw": (base_h, base_w),
+                "confidence_map": confidence_map,
+            },
             losses={},
         )
