@@ -28,6 +28,8 @@ from .base import GeometryBackendBase, GeometryBackendOutput
 from opendet3d.op.geometric.ray import generate_rays
 from opendet3d.op.loss.silog_loss import SILogLoss
 
+import utils3d
+
 from moge.train.losses import (
     affine_invariant_global_loss,
     affine_invariant_local_loss,
@@ -41,28 +43,25 @@ def backproject_depth_to_points(
 ) -> Tensor:
     """Back-project depth map to 3D points using camera intrinsics.
 
+    Uses utils3d (same as MoGe2) with normalized intrinsics.
+
     Args:
         depth: [B, 1, H, W] or [B, H, W] metric depth.
-        K: [B, 3, 3] camera intrinsics.
+        K: [B, 3, 3] camera intrinsics (pixel space).
         H: Image height.
         W: Image width.
 
     Returns:
         points: [B, H, W, 3] 3D points in camera space (x, y, z).
     """
-    u = torch.arange(W, device=depth.device, dtype=depth.dtype)
-    v = torch.arange(H, device=depth.device, dtype=depth.dtype)
-    u, v = torch.meshgrid(u, v, indexing="xy")  # [H, W]
-
     z = depth.squeeze(1) if depth.ndim == 4 else depth  # [B, H, W]
-    fx = K[:, 0, 0]  # [B]
-    fy = K[:, 1, 1]  # [B]
-    cx = K[:, 0, 2]  # [B]
-    cy = K[:, 1, 2]  # [B]
-
-    x = (u[None] - cx[:, None, None]) / fx[:, None, None] * z
-    y = (v[None] - cy[:, None, None]) / fy[:, None, None] * z
-    return torch.stack([x, y, z], dim=-1)  # [B, H, W, 3]
+    # Normalize pixel intrinsics to [0, 1] for utils3d
+    K_norm = K.clone()
+    K_norm[:, 0, 0] /= W
+    K_norm[:, 0, 2] /= W
+    K_norm[:, 1, 1] /= H
+    K_norm[:, 1, 2] /= H
+    return utils3d.pt.depth_map_to_point_map(z, intrinsics=K_norm)
 
 
 class LingbotDepthBackend(GeometryBackendBase):
@@ -118,9 +117,9 @@ class LingbotDepthBackend(GeometryBackendBase):
         target_latent_dim: int = 128,
         depth_loss_weight: float = 1.0,
         silog_loss_weight: float = 0.5,
-        affine_global_weight: float = 1.0,
-        affine_local_weight: float = 1.0,
-        edge_loss_weight: float = 1.0,
+        affine_global_weight: float = 10.0,
+        affine_local_weight: float = 10.0,
+        edge_loss_weight: float = 10.0,
         mask_loss_weight: float = 0.1,
         monocular_prob: float = 0.7,
         masked_prob: float = 0.2,
@@ -129,9 +128,11 @@ class LingbotDepthBackend(GeometryBackendBase):
         camera_loss_weight: float = 1.0,
         detach_depth_latents: bool = True,
         encoder_freeze_blocks: int = 0,
+        unpad_test: bool = True,
     ) -> None:
         """Initialize the LingbotDepthBackend."""
         super().__init__(detach_depth_latents=detach_depth_latents)
+        self.unpad_test = unpad_test
 
         self.num_tokens = num_tokens
         self.target_latent_dim = target_latent_dim
@@ -679,8 +680,15 @@ class LingbotDepthBackend(GeometryBackendBase):
                 )
 
             # Back-project to 3D points for MoGe2 losses
+            # 50% chance per image: use K_pred or GT intrinsics
+            # This trains intrinsic head via MoGe2 loss while keeping
+            # depth supervised with GT intrinsics half the time.
+            use_pred_k = torch.rand(B, device=depth_pred.device) < 0.5
+            K_for_pred = torch.where(
+                use_pred_k[:, None, None], K_pred, intrinsics
+            )
             pred_points = backproject_depth_to_points(
-                depth_pred, K_pred, H, W
+                depth_pred, K_for_pred, H, W
             )  # [B, H, W, 3]
             gt_points = backproject_depth_to_points(
                 depth_gt, intrinsics, H, W
@@ -689,50 +697,65 @@ class LingbotDepthBackend(GeometryBackendBase):
             gt_points[~valid_mask] = float("inf")
 
             # Per-image MoGe2 losses (alignment is per-image)
-            aff_global_sum = depth_pred.new_tensor(0.0)
-            aff_local4_sum = depth_pred.new_tensor(0.0)
-            aff_local16_sum = depth_pred.new_tensor(0.0)
-            edge_sum = depth_pred.new_tensor(0.0)
+            zero = depth_pred.new_tensor(0.0)
+            aff_global_sum = zero
+            aff_local4_sum = zero
+            aff_local16_sum = zero
+            edge_sum = zero
 
             for i in range(B):
-                # Affine-invariant global
-                loss_g, _, scale_i = affine_invariant_global_loss(
-                    pred_points[i],
-                    gt_points[i],
-                    align_resolution=48,
-                )
+                has_valid = valid_mask[i].any()
+                if has_valid:
+                    loss_g, _, scale_i = (
+                        affine_invariant_global_loss(
+                            pred_points[i],
+                            gt_points[i],
+                            align_resolution=48,
+                        )
+                    )
+                else:
+                    loss_g = zero
+                    scale_i = zero
                 aff_global_sum = aff_global_sum + loss_g
 
-                focal_i = K_pred[i, 0, 0]
+                # MoGe2 local loss expects normalized focal
+                # (fx/W, fy/H ~0.5-1.0), not pixel focal
+                fx_norm = K_pred[i, 0, 0] / W
+                fy_norm = K_pred[i, 1, 1] / H
+                focal_i = 1.0 / (
+                    1.0 / fx_norm**2 + 1.0 / fy_norm**2
+                ) ** 0.5
 
-                # Affine-invariant local level 4 (large patches)
-                loss_l4, _ = affine_invariant_local_loss(
-                    pred_points[i],
-                    gt_points[i],
-                    focal_i,
-                    scale_i,
-                    level=4,
-                    align_resolution=24,
-                    num_patches=16,
-                )
+                if has_valid:
+                    loss_l4, _ = affine_invariant_local_loss(
+                        pred_points[i],
+                        gt_points[i],
+                        focal_i,
+                        scale_i,
+                        level=4,
+                        align_resolution=24,
+                        num_patches=16,
+                        importance_sampling=False,
+                    )
+                    loss_l16, _ = affine_invariant_local_loss(
+                        pred_points[i],
+                        gt_points[i],
+                        focal_i,
+                        scale_i,
+                        level=16,
+                        align_resolution=12,
+                        num_patches=256,
+                        importance_sampling=False,
+                    )
+                    loss_e, _ = edge_loss(
+                        pred_points[i], gt_points[i]
+                    )
+                else:
+                    loss_l4 = zero
+                    loss_l16 = zero
+                    loss_e = zero
                 aff_local4_sum = aff_local4_sum + loss_l4
-
-                # Affine-invariant local level 16 (medium patches)
-                loss_l16, _ = affine_invariant_local_loss(
-                    pred_points[i],
-                    gt_points[i],
-                    focal_i,
-                    scale_i,
-                    level=16,
-                    align_resolution=24,
-                    num_patches=256,
-                )
                 aff_local16_sum = aff_local16_sum + loss_l16
-
-                # Edge loss (per-image)
-                loss_e, _ = edge_loss(
-                    pred_points[i], gt_points[i]
-                )
                 edge_sum = edge_sum + loss_e
 
             losses["affine_global"] = (
@@ -753,13 +776,32 @@ class LingbotDepthBackend(GeometryBackendBase):
             )
 
             # Mask BCE loss (confidence map)
+            # MoGe2 uses 3-state masks (fin / inf / unknown).
+            # For sparse data (LiDAR), most pixels have no
+            # annotation and should NOT be labeled "known invalid".
+            # Use per-image coverage to decide: dense (>50%)
+            # treats all non-valid as known-invalid; sparse
+            # treats only depth_mask-annotated invalid pixels.
             if (
                 confidence_map is not None
                 and self.mask_loss_weight > 0
             ):
                 conf = confidence_map.squeeze(1)  # [B, H, W]
-                gt_mask_fin = valid_mask  # positive: valid depth
-                gt_mask_inf = ~valid_mask  # negative: invalid depth
+                gt_mask_fin = valid_mask  # [B, H, W]
+                has_depth = depth_gt > 0  # [B, H, W]
+                if depth_mask is not None:
+                    annotated = depth_mask.bool()
+                else:
+                    # Per-image: dense → all pixels annotated;
+                    # sparse → only depth>0 pixels annotated.
+                    coverage = has_depth.flatten(1).float().mean(1)
+                    is_dense = coverage > 0.7  # [B]
+                    annotated = torch.where(
+                        is_dense[:, None, None],
+                        torch.ones_like(has_depth),
+                        has_depth,
+                    )
+                gt_mask_inf = annotated & ~has_depth
                 loss_mask, _ = mask_bce_loss(
                     conf, gt_mask_fin, gt_mask_inf
                 )
@@ -1291,8 +1333,8 @@ class LingbotDepthBackend(GeometryBackendBase):
         H_pad, W_pad = image_hw
         padding = kwargs.get("padding", None)
 
-        # If no valid padding, use original batched code path
-        if not self._has_valid_padding(padding):
+        # If unpad disabled or no valid padding, use batched (padded) path
+        if not self.unpad_test or not self._has_valid_padding(padding):
             return self._forward_test_batched(
                 images, intrinsics, image_hw, depth_gt
             )

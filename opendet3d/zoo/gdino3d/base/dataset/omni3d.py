@@ -30,10 +30,6 @@ def get_omni3d_dataset_cfg(
     cache_as_binary: bool = False,
     use_mini_dataset: bool = False,
     mini_dataset_size: int = 100,
-    truncation_thres: float | None = None,
-    visibility_thres: float | None = None,
-    min_height_thres: float | None = None,
-    max_height_thres: float | None = None,
 ) -> list[ConfigDict]:
     """Get the dataset configs for Omni3D.
 
@@ -47,10 +43,6 @@ def get_omni3d_dataset_cfg(
         cache_as_binary: Whether to cache as binary
         use_mini_dataset: If True, use mini dataset (cache_omni3d50_miniN)
         mini_dataset_size: Size of mini dataset (default: 100)
-        truncation_thres: Override truncation threshold (None = COCO3D default 0.333).
-        visibility_thres: Override visibility threshold (None = COCO3D default 0.333).
-        min_height_thres: Override min height threshold (None = COCO3D default 0.0625).
-        max_height_thres: Override max height threshold (None = COCO3D default 1.5).
     """
     if use_mini_dataset:
         cached_dir = os.path.join(data_root, f"cache_omni3d50_mini{mini_dataset_size}")
@@ -78,17 +70,6 @@ def get_omni3d_dataset_cfg(
 
         det_map = get_dataset_det_map(dataset_name=dataset, omni3d50=omni3d50)
 
-        # Build extra kwargs for annotation filtering thresholds
-        filter_kwargs = {}
-        if truncation_thres is not None:
-            filter_kwargs["truncation_thres"] = truncation_thres
-        if visibility_thres is not None:
-            filter_kwargs["visibility_thres"] = visibility_thres
-        if min_height_thres is not None:
-            filter_kwargs["min_height_thres"] = min_height_thres
-        if max_height_thres is not None:
-            filter_kwargs["max_height_thres"] = max_height_thres
-
         dataset_cfg = class_config(
             dataset_obj,
             data_backend=data_backend,
@@ -100,7 +81,6 @@ def get_omni3d_dataset_cfg(
             data_prefix="data",
             cache_as_binary=cache_as_binary,
             cached_file_path=os.path.join(cached_dir, f"{dataset}.pkl"),
-            **filter_kwargs,
         )
 
         dataset_cfg_list.append(dataset_cfg)
@@ -130,10 +110,6 @@ def get_omni3d_train_cfg(
     cache_as_binary: bool = True,
     use_mini_dataset: bool = False,
     mini_dataset_size: int = 100,
-    truncation_thres: float | None = None,
-    visibility_thres: float | None = None,
-    min_height_thres: float | None = None,
-    max_height_thres: float | None = None,
 ) -> ConfigDict:
     """Get the train config for Omni3D.
 
@@ -146,10 +122,6 @@ def get_omni3d_train_cfg(
         cache_as_binary: Whether to cache as binary
         use_mini_dataset: If True, use mini dataset for fast testing
         mini_dataset_size: Size of mini dataset (default: 100)
-        truncation_thres: Override truncation threshold (None = default 0.333).
-        visibility_thres: Override visibility threshold (None = default 0.333).
-        min_height_thres: Override min height threshold (None = default 0.0625).
-        max_height_thres: Override max height threshold (None = default 1.5).
     """
     train_dataset_cfg = get_omni3d_dataset_cfg(
         data_root=data_root,
@@ -161,10 +133,6 @@ def get_omni3d_train_cfg(
         cache_as_binary=cache_as_binary,
         use_mini_dataset=use_mini_dataset,
         mini_dataset_size=mini_dataset_size,
-        truncation_thres=truncation_thres,
-        visibility_thres=visibility_thres,
-        min_height_thres=min_height_thres,
-        max_height_thres=max_height_thres,
     )
 
     train_preprocess_cfg = get_train_transforms_cfg(shape=shape)

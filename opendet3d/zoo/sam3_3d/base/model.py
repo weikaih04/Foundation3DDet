@@ -125,6 +125,7 @@ def get_sam3_3d_cfg(
     backbone_freeze_blocks: int = 0,
     oracle_eval: bool = False,
     use_depth_input_test: bool = False,
+    unpad_test: bool = True,
     eval_3d_conf_weight: float = 0.5,
 ) -> tuple[ConfigDict, ConfigDict]:
     """Get SAM3_3D model configuration.
@@ -186,6 +187,7 @@ def get_sam3_3d_cfg(
             camera_loss_weight=1.0,
             detach_depth_latents=True,
             encoder_freeze_blocks=lingbot_encoder_freeze_blocks,
+            unpad_test=unpad_test,
         )
         # Neck level 1 outputs 256-dim, same as UniDepthV2
         depth_latent_dim = 256
