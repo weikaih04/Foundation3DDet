@@ -788,6 +788,7 @@ class SAM3_3DCollator:
                 # Limit number of categories (queries) per image
                 categories = list(cat_to_box_indices.keys())
                 if len(categories) > self.max_prompts_per_image:
+                    random.shuffle(categories)
                     categories = categories[:self.max_prompts_per_image]
 
                 # ========== Create queries per category ==========
@@ -1326,10 +1327,20 @@ class SAM3_3DVisConnector:
             class_ids = filtered_class_ids
             scores = filtered_scores
 
+        # Cast to float32 for numpy compatibility (bf16 not supported)
+        if scores is not None:
+            scores = [s.float() for s in scores]
+        if boxes3d is not None:
+            boxes3d = [b.float() for b in boxes3d]
+
+        intrinsics = data.original_intrinsics
+        if intrinsics is not None:
+            intrinsics = intrinsics.float()
+
         return {
             "images": images,
             "image_names": data.sample_names,
-            "intrinsics": data.original_intrinsics,
+            "intrinsics": intrinsics,
             "boxes3d": boxes3d,
             "class_ids": class_ids,
             "scores": scores,

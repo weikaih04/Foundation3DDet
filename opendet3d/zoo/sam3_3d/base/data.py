@@ -128,7 +128,7 @@ def sam3_3d_5mode_collate_fn(batch: List[dict], **kwargs):
     global _5mode_collator
     if _5mode_collator is None:
         _5mode_collator = SAM3_3DCollator(
-            max_prompts_per_image=50,
+            max_prompts_per_image=15,
             use_text_prompts=True,
             use_geometry_prompts=True,
             text_only_prob=0.5,
