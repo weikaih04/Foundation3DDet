@@ -19,6 +19,30 @@ from opendet3d.op.geometric.rotation import (
 )
 
 
+def _normalize_rotation_half(poses: Tensor) -> Tensor:
+    """Normalize rotation matrices to [0, pi) yaw range.
+
+    For objects with 180-degree rotational ambiguity (e.g. tables, chairs),
+    this folds yaw into [0, pi) so that 90 and 270 map to the same target.
+    Also handles boundary: 180 and 0 map to the same target.
+
+    Uses Y-axis rotation (OPENCV convention) to detect and flip.
+    """
+    import math
+
+    yaw = rotation_matrix_yaw(
+        poses, axis_mode=AxisMode.OPENCV
+    )[:, 1]  # [N]
+    # Flip by 180 around Y-axis: Ry(pi) = diag(-1, 1, -1)
+    # yaw in [-pi, 0) or yaw ~= pi -> flip to [0, pi)
+    flip_mask = (yaw < 0) | (yaw > math.pi - 1e-4)
+    poses_out = poses.clone()
+    # R_new = R @ Ry(pi), Ry(pi) negates columns 0 and 2
+    poses_out[flip_mask, :, 0] = -poses[flip_mask, :, 0]
+    poses_out[flip_mask, :, 2] = -poses[flip_mask, :, 2]
+    return poses_out
+
+
 class GroundingDINO3DCoder:
     """Grounding DINO 3D box Coder."""
 
@@ -28,11 +52,18 @@ class GroundingDINO3DCoder:
         depth_scale: float = 2.0,
         dim_scale: float = 2.0,
         orientation: str = "rotation_6d",
+        ambiguous_rotation: bool = False,
     ) -> None:
         """Initialize the Grounding DINO 3D encoder."""
         self.center_scale = center_scale
         self.depth_scale = depth_scale
         self.dim_scale = dim_scale
+        self.ambiguous_rotation = ambiguous_rotation
+        if ambiguous_rotation:
+            print(
+                "[GroundingDINO3DCoder] ambiguous_rotation=True: "
+                "GT rotation normalized to [0, 180) yaw range"
+            )
 
         assert orientation in {
             "yaw",
@@ -88,9 +119,14 @@ class GroundingDINO3DCoder:
             boxes3d[:, 2].new_zeros(1),
         )
 
+        poses = quaternion_to_matrix(boxes3d[:, 6:])
+
+        if self.ambiguous_rotation:
+            poses = _normalize_rotation_half(poses)
+
         if self.orientation == "yaw":
             yaw = rotation_matrix_yaw(
-                quaternion_to_matrix(boxes3d[:, 6:]),
+                poses,
                 axis_mode=AxisMode.OPENCV,
             )[:, 1]
 
@@ -101,8 +137,6 @@ class GroundingDINO3DCoder:
                 [delta_center, depth, dims, sin_yaw, cos_yaw], -1
             )
         elif self.orientation == "rotation_6d":
-            poses = quaternion_to_matrix(boxes3d[:, 6:])
-
             rot_6d = matrix_to_rotation_6d(poses)
 
             boxes3d_target = torch.cat([delta_center, depth, dims, rot_6d], -1)
@@ -143,6 +177,9 @@ class GroundingDINO3DCoder:
             )
         elif self.orientation == "rotation_6d":
             poses = rotation_6d_to_matrix(boxes3d[:, 6:])
+
+            if self.ambiguous_rotation:
+                poses = _normalize_rotation_half(poses)
 
             orientation = matrix_to_quaternion(poses)
 

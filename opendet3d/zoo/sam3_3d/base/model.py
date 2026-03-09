@@ -127,6 +127,7 @@ def get_sam3_3d_cfg(
     use_depth_input_test: bool = False,
     unpad_test: bool = True,
     eval_3d_conf_weight: float = 0.5,
+    ambiguous_rotation: bool = False,
 ) -> tuple[ConfigDict, ConfigDict]:
     """Get SAM3_3D model configuration.
 
@@ -139,12 +140,17 @@ def get_sam3_3d_cfg(
         backbone_freeze_blocks: Number of SAM3 ViT blocks to freeze (0=none, 30=last 2 trainable).
         oracle_eval: If True, use oracle evaluation mode (top-1 per prompt,
             no NMS) for measuring 3D regression with GT box prompts.
+        ambiguous_rotation: If True, normalize GT rotation to [0, 180) yaw
+            range to eliminate 180-degree rotation ambiguity.
 
     Returns:
         Tuple of (model_cfg, box_coder_cfg).
     """
     # Box coder
-    box_coder = class_config(GroundingDINO3DCoder)
+    box_coder = class_config(
+        GroundingDINO3DCoder,
+        ambiguous_rotation=ambiguous_rotation,
+    )
 
     # Note: bbox3d_head is NOT created here - let SAM3_3D create it automatically
     # based on geometry_backend.is_ray_aware to get the correct use_camera_prompt setting.

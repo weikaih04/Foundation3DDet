@@ -300,12 +300,16 @@ class Omni3DEvaluator(Evaluator):
             # Collect error metrics from all datasets
             all_ase = []
             all_aoe = []
+            all_aoe_sym = []
+            all_ods_sym = []
 
             # Determine which keys to look for based on mode
             if self.enable_aprel3d:
-                ase_key, aoe_key = "ASERel", "AOERel"
+                ase_key, aoe_key, aoe_sym_key = "ASERel", "AOERel", "AOERelSym"
+                ods_sym_key = "ODSRelSym"
             else:
-                ase_key, aoe_key = "ASE", "AOE"
+                ase_key, aoe_key, aoe_sym_key = "ASE", "AOE", "AOE_Sym"
+                ods_sym_key = "ODS_Sym"
 
             for dataset_name in self.dataset_names:
                 per_dataset_log_dict = per_dataset_results[dataset_name]
@@ -313,9 +317,15 @@ class Omni3DEvaluator(Evaluator):
                     all_ase.append(per_dataset_log_dict[ase_key])
                 if aoe_key in per_dataset_log_dict and not np.isnan(per_dataset_log_dict[aoe_key]):
                     all_aoe.append(per_dataset_log_dict[aoe_key])
+                if aoe_sym_key in per_dataset_log_dict and not np.isnan(per_dataset_log_dict[aoe_sym_key]):
+                    all_aoe_sym.append(per_dataset_log_dict[aoe_sym_key])
+                if ods_sym_key in per_dataset_log_dict and not np.isnan(per_dataset_log_dict[ods_sym_key]):
+                    all_ods_sym.append(per_dataset_log_dict[ods_sym_key])
 
             log_dict[ase_key] = np.mean(all_ase) if len(all_ase) > 0 else float("nan")
             log_dict[aoe_key] = np.mean(all_aoe) if len(all_aoe) > 0 else float("nan")
+            log_dict[aoe_sym_key] = np.mean(all_aoe_sym) if len(all_aoe_sym) > 0 else float("nan")
+            log_dict[ods_sym_key] = np.mean(all_ods_sym) if len(all_ods_sym) > 0 else float("nan")
 
         if self.per_class_eval:
             precisions = evaluator.eval["precision"]

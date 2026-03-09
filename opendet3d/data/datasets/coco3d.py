@@ -261,8 +261,9 @@ class COCO3DDataset(CacheMappingMixin, Dataset):
                 "ignore_class_ids": ignore_class_ids,
             }
 
-            if depth_filename is not None and self.data_backend.exists(
-                depth_filename
+            if depth_filename is not None and (
+                self.data_backend.exists(depth_filename)
+                or os.path.exists(depth_filename)
             ):
                 sample["depth_filename"] = depth_filename
 
