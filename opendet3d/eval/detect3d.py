@@ -52,6 +52,12 @@ class Detect3DEvaluator(Evaluator):
         iou_type: str = "bbox",
         num_columns: int = 6,
         base_classes: list[str] | None = None,
+        # Frequency-based AP split (LVIS-style)
+        # Categories with <rare_thresh images -> APr
+        # Categories with rare_thresh..freq_thresh images -> APc
+        # Categories with >=freq_thresh images -> APf
+        freq_rare_thresh: int = 0,
+        freq_freq_thresh: int = 0,
         # APRel3D parameters
         enable_aprel3d: bool = False,
         scale_search_min: float = 0.1,
@@ -87,6 +93,36 @@ class Detect3DEvaluator(Evaluator):
             self._coco_gt = COCO3D([annotation], category_names)
 
         self.cat_map = cat_map
+
+        # Build frequency split if thresholds are set
+        self.freq_rare_thresh = freq_rare_thresh
+        self.freq_freq_thresh = freq_freq_thresh
+        self.cat_freq_group: dict[int, str] | None = None
+        if freq_rare_thresh > 0 and freq_freq_thresh > 0:
+            with open(annotation) as f:
+                ann_data = json.load(f)
+            cat_img_count: dict[int, set] = {}
+            for ann in ann_data["annotations"]:
+                cid = ann["category_id"]
+                if cid not in cat_img_count:
+                    cat_img_count[cid] = set()
+                cat_img_count[cid].add(ann["image_id"])
+            self.cat_freq_group = {}
+            for cat in ann_data["categories"]:
+                n = len(cat_img_count.get(cat["id"], set()))
+                if n < freq_rare_thresh:
+                    self.cat_freq_group[cat["id"]] = "rare"
+                elif n < freq_freq_thresh:
+                    self.cat_freq_group[cat["id"]] = "common"
+                else:
+                    self.cat_freq_group[cat["id"]] = "frequent"
+            n_r = sum(1 for v in self.cat_freq_group.values() if v == "rare")
+            n_c = sum(1 for v in self.cat_freq_group.values() if v == "common")
+            n_f = sum(1 for v in self.cat_freq_group.values() if v == "frequent")
+            print(f"[Detect3DEvaluator] Frequency split: "
+                  f"rare(<{freq_rare_thresh})={n_r}, "
+                  f"common({freq_rare_thresh}-{freq_freq_thresh})={n_c}, "
+                  f"frequent(>={freq_freq_thresh})={n_f}")
 
         self.bbox_2D_evals_per_cat_area: DictStrAny = {}
         self.bbox_3D_evals_per_cat_area: DictStrAny = {}
@@ -630,10 +666,10 @@ class Detect3DEvaluator(Evaluator):
                     main_metric = "AP"
             else:
                 if self.enable_aprel3d:
-                    metrics = ["APRel", "ATERel", "ASERel", "AOERel", "ODSRel"]
+                    metrics = ["APRel", "ATERel", "ASERel", "AOERel", "ODSRel", "ODSRelSym"]
                     main_metric = "ODSRel"
                 else:
-                    metrics = ["AP", "ATE", "ASE", "AOE", "ODS"]
+                    metrics = ["AP", "ATE", "ASE", "AOE", "ODS", "ODS_Sym"]
                     main_metric = "ODS"
 
             if self.base_classes is not None:
@@ -677,32 +713,40 @@ class Detect3DEvaluator(Evaluator):
 
                 score_dict = dict(zip(metrics, evaluator.stats))
 
-                # Compute mASE, mAOE for bbox mode
+                # Compute mASE, mAOE, mAOE_Sym for bbox mode
                 # Note: ATE is not returned in bbox mode because the normalization
                 # by IoU threshold makes it unreliable (can be > 1)
                 rot_tp_errors = evaluator.eval["rot_tp_errors"]
+                rot_sym_tp_errors = evaluator.eval["rot_sym_tp_errors"]
                 scale_tp_errors = evaluator.eval["scale_tp_errors"]
 
                 rot_tp = rot_tp_errors[:, :, :, 0, -1]
                 rot_tp = rot_tp[rot_tp > -1]
+
+                rot_sym_tp = rot_sym_tp_errors[:, :, :, 0, -1]
+                rot_sym_tp = rot_sym_tp[rot_sym_tp > -1]
 
                 scale_tp = scale_tp_errors[:, :, :, 0, -1]
                 scale_tp = scale_tp[scale_tp > -1]
 
                 if rot_tp.size:
                     mAOE = np.mean(rot_tp).item()
+                    mAOE_Sym = np.mean(rot_sym_tp).item()
                     mASE = np.mean(scale_tp).item()
                 else:
                     mAOE = float("nan")
+                    mAOE_Sym = float("nan")
                     mASE = float("nan")
 
                 # Add error metrics to output (no ATE in bbox mode)
                 if self.enable_aprel3d:
                     score_dict["ASERel"] = mASE
                     score_dict["AOERel"] = mAOE
+                    score_dict["AOERelSym"] = mAOE_Sym
                 else:
                     score_dict["ASE"] = mASE
                     score_dict["AOE"] = mAOE
+                    score_dict["AOE_Sym"] = mAOE_Sym
 
                 # Add scale statistics for APRel3D
                 if self.enable_aprel3d and len(self.optimal_scales) > 0:
@@ -712,6 +756,7 @@ class Detect3DEvaluator(Evaluator):
             else:
                 trans_tp_errors = evaluator.eval["trans_tp_errors"]
                 rot_tp_errors = evaluator.eval["rot_tp_errors"]
+                rot_sym_tp_errors = evaluator.eval["rot_sym_tp_errors"]
                 scale_tp_errors = evaluator.eval["scale_tp_errors"]
 
                 precision = precisions[:, :, :, 0, -1]
@@ -727,24 +772,34 @@ class Detect3DEvaluator(Evaluator):
                 rot_tp = rot_tp_errors[:, :, :, 0, -1]
                 rot_tp = rot_tp[rot_tp > -1]
 
+                rot_sym_tp = rot_sym_tp_errors[:, :, :, 0, -1]
+                rot_sym_tp = rot_sym_tp[rot_sym_tp > -1]
+
                 scale_tp = scale_tp_errors[:, :, :, 0, -1]
                 scale_tp = scale_tp[scale_tp > -1]
 
                 if trans_tp.size:
                     mATE = np.mean(trans_tp).item()
                     mAOE = np.mean(rot_tp).item()
+                    mAOE_Sym = np.mean(rot_sym_tp).item()
                     mASE = np.mean(scale_tp).item()
 
                     mODS = (
                         np.sum(mAP * 3 + (1 - mATE) + (1 - mAOE) + (1 - mASE))
                         / 6
                     )
+                    mODS_Sym = (
+                        np.sum(mAP * 3 + (1 - mATE) + (1 - mAOE_Sym) + (1 - mASE))
+                        / 6
+                    )
 
                 else:
                     mATE = float("nan")
                     mAOE = float("nan")
+                    mAOE_Sym = float("nan")
                     mASE = float("nan")
                     mODS = float("nan")
+                    mODS_Sym = float("nan")
 
                 if self.enable_aprel3d:
                     score_dict = {
@@ -752,7 +807,9 @@ class Detect3DEvaluator(Evaluator):
                         "ATERel": mATE,
                         "ASERel": mASE,
                         "AOERel": mAOE,
+                        "AOERelSym": mAOE_Sym,
                         "ODSRel": mODS,
+                        "ODSRelSym": mODS_Sym,
                     }
                 else:
                     score_dict = {
@@ -760,7 +817,9 @@ class Detect3DEvaluator(Evaluator):
                         "ATE": mATE,
                         "ASE": mASE,
                         "AOE": mAOE,
+                        "AOE_Sym": mAOE_Sym,
                         "ODS": mODS,
+                        "ODS_Sym": mODS_Sym,
                     }
 
                 # Add scale statistics for APRel3D
@@ -777,6 +836,7 @@ class Detect3DEvaluator(Evaluator):
             results_per_category = []
             score_base_list = []
             score_novel_list = []
+            freq_ap: dict[str, list] = {"rare": [], "common": [], "frequent": []}
 
             for idx, cat_id in enumerate(self._coco_gt.getCatIds()):
                 # area range index 0: all area ranges
@@ -796,24 +856,34 @@ class Detect3DEvaluator(Evaluator):
                     rot_tp = rot_tp_errors[:, :, idx, 0, -1]
                     rot_tp = rot_tp[rot_tp > -1]
 
+                    rot_sym_tp = rot_sym_tp_errors[:, :, idx, 0, -1]
+                    rot_sym_tp = rot_sym_tp[rot_sym_tp > -1]
+
                     scale_tp = scale_tp_errors[:, :, idx, 0, -1]
                     scale_tp = scale_tp[scale_tp > -1]
 
                     if trans_tp.size:
                         ate = np.mean(trans_tp).item()
                         aoe = np.mean(rot_tp).item()
+                        aoe_sym = np.mean(rot_sym_tp).item()
                         ase = np.mean(scale_tp).item()
 
                         ods = (
                             np.sum(ap * 3 + (1 - ate) + (1 - aoe) + (1 - ase))
                             / 6
                         )
+                        ods_sym = (
+                            np.sum(ap * 3 + (1 - ate) + (1 - aoe_sym) + (1 - ase))
+                            / 6
+                        )
 
                     else:
                         ate = float("nan")
                         aoe = float("nan")
+                        aoe_sym = float("nan")
                         ase = float("nan")
                         ods = float("nan")
+                        ods_sym = float("nan")
 
                     results_per_category.append(
                         (
@@ -822,7 +892,9 @@ class Detect3DEvaluator(Evaluator):
                             f"{ate:0.3f}",
                             f"{ase:0.3f}",
                             f"{aoe:0.3f}",
+                            f"{aoe_sym:0.3f}",
                             f"{ods:0.3f}",
+                            f"{ods_sym:0.3f}",
                         )
                     )
                 else:
@@ -841,11 +913,15 @@ class Detect3DEvaluator(Evaluator):
                     else:
                         score_novel_list.append(score)
 
+                if self.cat_freq_group is not None and not np.isnan(ap):
+                    group = self.cat_freq_group.get(cat_id, "rare")
+                    freq_ap[group].append(ap)
+
             results_flatten = list(itertools.chain(*results_per_category))
 
             if self.iou_type == "dist":
-                num_columns = 6
-                headers = ["category", "AP", "ATE", "ASE", "AOE", "ODS"]
+                num_columns = 8
+                headers = ["category", "AP", "ATE", "ASE", "AOE", "AOE_Sym", "ODS", "ODS_Sym"]
             else:
                 num_columns = min(
                     self.num_columns, len(results_per_category) * 2
@@ -867,6 +943,17 @@ class Detect3DEvaluator(Evaluator):
             score_dict[f"{main_metric}_Novel"] = np.mean(
                 score_novel_list
             ).item()
+
+        if self.cat_freq_group is not None and self.per_class_eval:
+            score_dict["APr"] = np.mean(freq_ap["rare"]).item() if freq_ap["rare"] else float("nan")
+            score_dict["APc"] = np.mean(freq_ap["common"]).item() if freq_ap["common"] else float("nan")
+            score_dict["APf"] = np.mean(freq_ap["frequent"]).item() if freq_ap["frequent"] else float("nan")
+            log_str += (
+                f"\nFrequency split (<{self.freq_rare_thresh}/{self.freq_freq_thresh}):"
+                f" APr={score_dict['APr']:.4f} ({len(freq_ap['rare'])} cats),"
+                f" APc={score_dict['APc']:.4f} ({len(freq_ap['common'])} cats),"
+                f" APf={score_dict['APf']:.4f} ({len(freq_ap['frequent'])} cats)"
+            )
 
         return score_dict, log_str
 
@@ -1005,6 +1092,7 @@ class Detect3Deval(COCOeval):
         )  # -1 for the precision of absent categories
         trans_tp_errors = -np.ones((T, R, K, A, M))
         rot_tp_errors = -np.ones((T, R, K, A, M))
+        rot_sym_tp_errors = -np.ones((T, R, K, A, M))
         scale_tp_errors = -np.ones((T, R, K, A, M))
         recall = -np.ones((T, K, A, M))
         scores = -np.ones((T, R, K, A, M))
@@ -1098,6 +1186,11 @@ class Detect3Deval(COCOeval):
                         axis=1,
                     )[:, inds]
 
+                    oems_sym = np.concatenate(
+                        [e["dtOrientationErrorSym"][:, 0:maxDet] for e in E],
+                        axis=1,
+                    )[:, inds]
+
                     sems = np.concatenate(
                         [e["dtScaleError"][:, 0:maxDet] for e in E], axis=1
                     )[:, inds]
@@ -1113,6 +1206,7 @@ class Detect3Deval(COCOeval):
                         ss = np.zeros((R,))
                         tran_tp_error = np.ones((R,))
                         rot_tp_error = np.ones((R,))
+                        rot_sym_tp_error = np.ones((R,))
                         scale_tp_error = np.ones((R,))
 
                         if nd:
@@ -1127,6 +1221,7 @@ class Detect3Deval(COCOeval):
                         q = q.tolist()
                         tran_tp_error = tran_tp_error.tolist()
                         rot_tp_error = rot_tp_error.tolist()
+                        rot_sym_tp_error = rot_sym_tp_error.tolist()
                         scale_tp_error = scale_tp_error.tolist()
 
                         for i in range(nd - 1, 0, -1):
@@ -1142,6 +1237,7 @@ class Detect3Deval(COCOeval):
                                 # Store errors for both bbox and dist modes
                                 tran_tp_error[ri] = tems[t][pi]
                                 rot_tp_error[ri] = oems[t][pi]
+                                rot_sym_tp_error[ri] = oems_sym[t][pi]
                                 scale_tp_error[ri] = sems[t][pi]
                         except:
                             pass
@@ -1155,6 +1251,9 @@ class Detect3Deval(COCOeval):
                         )
                         rot_tp_errors[t, :, k, a, m] = np.array(
                             rot_tp_error
+                        )
+                        rot_sym_tp_errors[t, :, k, a, m] = np.array(
+                            rot_sym_tp_error
                         )
                         scale_tp_errors[t, :, k, a, m] = np.array(
                             scale_tp_error
@@ -1171,6 +1270,7 @@ class Detect3Deval(COCOeval):
             "scores": scores,
             "trans_tp_errors": trans_tp_errors,
             "rot_tp_errors": rot_tp_errors,
+            "rot_sym_tp_errors": rot_sym_tp_errors,
             "scale_tp_errors": scale_tp_errors,
         }
 
@@ -1343,6 +1443,7 @@ class Detect3Deval(COCOeval):
         tem = np.ones((T, D))  # Translation Error
         sem = np.ones((T, D))  # Scale Error
         oem = np.ones((T, D))  # Oritentation Error
+        oem_sym = np.ones((T, D))  # Symmetric Orientation Error (mod 180)
         gtIg = np.array([g["_ignore"] for g in gt])
         dtIg = np.zeros((T, D))
 
@@ -1421,15 +1522,16 @@ class Detect3Deval(COCOeval):
 
                     # Orientation Error (same for both modes)
                     try:
-                        oem[tind, dind] = (
-                            so3_relative_angle(
-                                torch.tensor(d["R_cam"])[None],
-                                torch.tensor(gt[m]["R_cam"])[None],
-                                cos_bound=1e-2,
-                                eps=1e-3,
-                            ).item()
-                            / np.pi
-                        )
+                        angle = so3_relative_angle(
+                            torch.tensor(d["R_cam"])[None],
+                            torch.tensor(gt[m]["R_cam"])[None],
+                            cos_bound=1e-2,
+                            eps=1e-3,
+                        ).item()
+                        oem[tind, dind] = angle / np.pi
+                        # Symmetric: fold 180 ambiguity, min(angle, pi-angle)
+                        # range [0, pi/2], normalized by pi/2 to [0, 1]
+                        oem_sym[tind, dind] = min(angle, np.pi - angle) / (np.pi / 2)
                     except ValueError as e:
                         # Skip invalid rotation matrix pairs
                         # This can happen when GT or prediction has numerical precision issues
@@ -1445,6 +1547,7 @@ class Detect3Deval(COCOeval):
                         )
                         # Set to maximum error (180 degrees = 1.0 in normalized units)
                         oem[tind, dind] = 1.0
+                        oem_sym[tind, dind] = 1.0
 
                     # Scale Error (same for both modes)
                     min_whl = np.minimum(
@@ -1493,6 +1596,7 @@ class Detect3Deval(COCOeval):
             "dtTranslationError": tem,
             "dtScaleError": sem,
             "dtOrientationError": oem,
+            "dtOrientationErrorSym": oem_sym,
         }
 
     def summarize(self):
