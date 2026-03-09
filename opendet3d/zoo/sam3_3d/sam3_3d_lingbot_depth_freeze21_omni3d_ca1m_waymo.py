@@ -110,11 +110,6 @@ def get_config() -> ExperimentConfig:
         data_root=omni3d_data_root,
         data_backend=data_backend,
         shape=sam3_image_shape,
-        # Disable annotation filtering: keep all truncated/occluded/small objects
-        truncation_thres=1.1,
-        visibility_thres=-1.0,
-        min_height_thres=0.0,
-        max_height_thres=1e6,
     )
 
     omni3d_test_data_cfg = get_omni3d_test_cfg(

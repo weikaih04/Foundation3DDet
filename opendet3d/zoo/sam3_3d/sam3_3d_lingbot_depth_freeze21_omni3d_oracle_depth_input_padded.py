@@ -1,28 +1,30 @@
-"""SAM3_3D with LingBot-Depth on InTheWild - Oracle + GT Depth Input.
+"""SAM3_3D with LingBot-Depth on Omni3D - Oracle + GT Depth Input (Padded).
 
-Evaluates SAM3_3D + LingBot-Depth (freeze21, 12e) on the InTheWild benchmark.
+For evaluating checkpoints trained with padded 1008x1008 images.
+Sets unpad_test=False so the encoder sees padded images at test time,
+matching the training behavior of older checkpoints (pre-unpad code).
 
-Mode: GT 2D boxes as geometry prompts (oracle) + GT depth map fed to LingBot.
-Upper-bound oracle: perfect 2D detection + perfect depth input.
-Measures pure 3D regression quality of the model head.
+Combines oracle_eval=True and use_depth_input_test=True:
+- Oracle: each GT 2D box is fed as a geometry prompt (one-to-one)
+- Depth input: LingBot receives GT depth map during inference
 """
 
 from __future__ import annotations
 
-import os
-
 from vis4d.config import class_config
 from vis4d.config.typing import ExperimentConfig
-from vis4d.data.data_pipe import DataPipe
 from vis4d.data.io.hdf5 import HDF5Backend
 from vis4d.zoo.base import get_default_cfg
 
-from opendet3d.zoo.gdino3d.base.callback import get_in_the_wild_eval_callbacks
-from opendet3d.zoo.gdino3d.base.dataset.omni3d import get_omni3d_train_cfg
-from opendet3d.zoo.gdino3d.base.dataset.transform import get_test_transforms_cfg
+from opendet3d.zoo.gdino3d.base.callback import get_omni3d_evaluator_cfg
+from opendet3d.zoo.gdino3d.base.dataset.omni3d import (
+    get_omni3d_test_cfg,
+    get_omni3d_train_cfg,
+)
 from opendet3d.zoo.gdino3d.base.pl import get_pl_cfg
 
 from opendet3d.zoo.sam3_3d.base.optim import get_sam3_3d_optim_cfg
+
 from opendet3d.zoo.sam3_3d.base.model import (
     get_sam3_3d_cfg,
     get_sam3_3d_hyperparams_cfg,
@@ -30,20 +32,19 @@ from opendet3d.zoo.sam3_3d.base.model import (
 from opendet3d.zoo.sam3_3d.base.loss import get_sam3_3d_loss_cfg
 from opendet3d.zoo.sam3_3d.base.connector import (
     get_sam3_3d_data_connector_cfg,
-    SAM3_3DDetect3DEvalConnector,
+    SAM3_3DEvalConnector,
     SAM3_3DVisConnector,
 )
 from opendet3d.zoo.sam3_3d.base.data import get_sam3_3d_data_cfg
-from opendet3d.data.datasets.in_the_wild import (
-    InTheWild3DDataset,
-    load_in_the_wild_class_map,
-)
 
 
 def get_config() -> ExperimentConfig:
-    """Returns SAM3_3D + LingBot oracle + GT depth eval config for InTheWild."""
+    """Returns oracle + GT depth input (padded) eval config."""
+    ######################################################
+    ##                    General Config                ##
+    ######################################################
     config = get_default_cfg(
-        exp_name="sam3_3d_lingbot_depth_freeze21_in_the_wild_oracle_depth_input"
+        exp_name="sam3_3d_lingbot_depth_freeze21_omni3d_oracle_depth_input_padded"
     )
 
     config.use_checkpoint = True
@@ -61,9 +62,20 @@ def get_config() -> ExperimentConfig:
     ##          Datasets with augmentations             ##
     ######################################################
     data_backend = class_config(HDF5Backend)
-    sam3_image_shape = (1008, 1008)
+
+    test_datasets_cfg = []
+
     omni3d_data_root = "data/omni3d"
-    in_the_wild_data_root = "data/in_the_wild"
+    omni3d_test_datasets = (
+        "KITTI_test",
+        "nuScenes_test",
+        "SUNRGBD_test",
+        "Hypersim_test",
+        "ARKitScenes_test",
+        "Objectron_test",
+    )
+
+    sam3_image_shape = (1008, 1008)
 
     omni3d_train_data_cfg = get_omni3d_train_cfg(
         data_root=omni3d_data_root,
@@ -71,36 +83,26 @@ def get_config() -> ExperimentConfig:
         shape=sam3_image_shape,
     )
 
-    annotation_path = os.path.join(
-        in_the_wild_data_root, "annotations/InTheWild_val_human_filtered.json"
-    )
-    class_map = load_in_the_wild_class_map(annotation_path)
-
-    itw_test_data_cfg = class_config(
-        DataPipe,
-        datasets=class_config(
-            InTheWild3DDataset,
-            data_root=in_the_wild_data_root,
-            dataset_name="InTheWild_val_human_filtered",
-            class_map=class_map,
-            with_depth=True,
-            data_backend=data_backend,
-            data_prefix=in_the_wild_data_root,
-            cache_as_binary=True,
-            cached_file_path="data/in_the_wild/val_depth_human_filtered.pkl",
-        ),
-        preprocess_fn=get_test_transforms_cfg(shape=sam3_image_shape, with_depth=True),
+    omni3d_test_data_cfg = get_omni3d_test_cfg(
+        data_root=omni3d_data_root,
+        test_datasets=omni3d_test_datasets,
+        data_backend=data_backend,
+        shape=sam3_image_shape,
+        with_depth=True,
     )
 
+    test_datasets_cfg.append(omni3d_test_data_cfg)
+
+    # Oracle mode: test collator creates per-GT-box geometry prompts
     config.data = get_sam3_3d_data_cfg(
         train_datasets=omni3d_train_data_cfg,
-        test_datasets=[itw_test_data_cfg],
+        test_datasets=test_datasets_cfg,
         samples_per_gpu=params.samples_per_gpu,
         workers_per_gpu=params.workers_per_gpu,
         max_prompts_per_image=50,
         use_text_prompts=True,
         use_geometry_prompts=True,
-        oracle_eval=True,
+        oracle_eval=True,  # Each GT box = one geometry prompt
     )
 
     ######################################################
@@ -112,9 +114,9 @@ def get_config() -> ExperimentConfig:
         geometry_backend_type="lingbot_depth",
         lingbot_encoder_freeze_blocks=21,
         backbone_freeze_blocks=28,
-        oracle_eval=True,
+        oracle_eval=True,  # Top-1 per prompt, no NMS
         use_depth_input_test=True,
-        unpad_test=False,
+        unpad_test=False,  # Keep padded input to match old ckpt training
     )
 
     config.loss = get_sam3_3d_loss_cfg(params, box_coder)
@@ -138,19 +140,29 @@ def get_config() -> ExperimentConfig:
     ######################################################
     ##                     CALLBACKS                    ##
     ######################################################
+    omni3d_evaluator_cfg = get_omni3d_evaluator_cfg(
+        data_root=omni3d_data_root,
+        omni3d50=True,
+        test_datasets=omni3d_test_datasets,
+    )
+
+    from vis4d.engine.callbacks import EvaluatorCallback, VisualizerCallback
     from vis4d.data.const import AxisMode
-    from vis4d.engine.callbacks import VisualizerCallback
     from vis4d.vis.image.bbox3d_visualizer import BoundingBox3DVisualizer
     from vis4d.vis.image.canvas import PillowCanvasBackend
     from vis4d.zoo.base import get_default_callbacks_cfg
 
     callbacks = get_default_callbacks_cfg()
 
-    callbacks.extend(
-        get_in_the_wild_eval_callbacks(
-            data_root=in_the_wild_data_root,
+    callbacks.append(
+        class_config(
+            EvaluatorCallback,
+            evaluator=omni3d_evaluator_cfg,
+            metrics_to_eval=["2D", "3D"],
+            save_predictions=True,
             output_dir=config.output_dir,
-            test_connector=class_config(SAM3_3DDetect3DEvalConnector),
+            save_prefix="detection",
+            test_connector=class_config(SAM3_3DEvalConnector),
         )
     )
 
@@ -163,7 +175,7 @@ def get_config() -> ExperimentConfig:
                 width=4,
                 camera_near_clip=0.01,
                 plot_heading=False,
-                vis_freq=50,
+                vis_freq=1,
                 plot_trajectory=False,
                 canvas=class_config(PillowCanvasBackend, font_size=16),
                 save_boxes3d=True,

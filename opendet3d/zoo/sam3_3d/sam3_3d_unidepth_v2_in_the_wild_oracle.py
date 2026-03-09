@@ -71,7 +71,7 @@ def get_config() -> ExperimentConfig:
     )
 
     annotation_path = os.path.join(
-        in_the_wild_data_root, "annotations/InTheWild_val.json"
+        in_the_wild_data_root, "annotations/InTheWild_val_human_filtered.json"
     )
     class_map = load_in_the_wild_class_map(annotation_path)
 
@@ -80,12 +80,13 @@ def get_config() -> ExperimentConfig:
         datasets=class_config(
             InTheWild3DDataset,
             data_root=in_the_wild_data_root,
-            dataset_name="InTheWild_val",
+            dataset_name="InTheWild_val_human_filtered",
             class_map=class_map,
             with_depth=False,
-            data_backend=None,
+            data_backend=data_backend,
+            data_prefix=in_the_wild_data_root,
             cache_as_binary=True,
-            cached_file_path="data/in_the_wild/val.pkl",
+            cached_file_path="data/in_the_wild/val_human_filtered.pkl",
         ),
         preprocess_fn=get_test_transforms_cfg(shape=sam3_image_shape, with_depth=False),
     )
