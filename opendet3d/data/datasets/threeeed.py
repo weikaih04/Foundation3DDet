@@ -20,12 +20,21 @@ def get_threeeed_det_map(
     data_root: str = "data/3eed",
 ) -> dict[str, int]:
     """Build det_map from 3EED annotation JSON categories."""
+    cache_path = os.path.join(
+        data_root, "annotations", f"{dataset_name}_class_map.json"
+    )
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            return json.load(f)
     json_path = os.path.join(
         data_root, "annotations", f"{dataset_name}.json"
     )
     with open(json_path) as f:
         data = json.load(f)
-    return {cat["name"]: cat["id"] for cat in data["categories"]}
+    class_map = {cat["name"]: cat["id"] for cat in data["categories"]}
+    with open(cache_path, "w") as f:
+        json.dump(class_map, f)
+    return class_map
 
 
 def get_threeeed_class_map(
