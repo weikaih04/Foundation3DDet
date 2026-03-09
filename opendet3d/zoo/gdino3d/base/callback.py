@@ -168,6 +168,7 @@ def get_callback_cfg(
 def get_in_the_wild_evaluator_cfg(
     data_root: str = "data/in_the_wild",
     iou_type: str = "bbox",
+    human_filtered: bool = True,
 ) -> ConfigDict:
     """Get InTheWild evaluator config.
 
@@ -177,13 +178,18 @@ def get_in_the_wild_evaluator_cfg(
     Args:
         data_root: Root directory for in-the-wild data.
         iou_type: "bbox" for 3D IoU matching, "dist" for center distance.
+        human_filtered: If True, use human-filtered annotations
+            (valid3D + 2-pass human review). If False, use original.
 
     Returns:
         ConfigDict: Evaluator configuration.
     """
     from opendet3d.data.datasets.in_the_wild import load_in_the_wild_class_map
 
-    annotation = os.path.join(data_root, "annotations/InTheWild_val.json")
+    ann_name = (
+        "InTheWild_val_human_filtered" if human_filtered else "InTheWild_val"
+    )
+    annotation = os.path.join(data_root, f"annotations/{ann_name}.json")
     class_map = load_in_the_wild_class_map(annotation)
     det_map = {name: i for i, name in enumerate(sorted(class_map.keys()))}
 
@@ -195,6 +201,8 @@ def get_in_the_wild_evaluator_cfg(
         iou_type=iou_type,
         num_columns=4,
         annotation=annotation,
+        freq_rare_thresh=5,
+        freq_freq_thresh=20,
     )
 
 
