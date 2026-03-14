@@ -210,17 +210,22 @@ def noise_box(
     box: np.ndarray,
     im_size: tuple,
     box_noise_std: float = 0.1,
-    box_noise_max: Optional[float] = 20.0,
-    min_box_area: float = 100.0,
+    box_noise_max: Optional[float] = None,
+    min_box_area: float = 0.0,
 ) -> np.ndarray:
     """Add noise to a box for data augmentation.
+
+    Follows SAM3's noise_box implementation:
+    - Gaussian noise scaled by box dimensions
+    - Optional pixel clamp
+    - Fallback to original box if area too small
 
     Args:
         box: Box in xyxy format (x1, y1, x2, y2)
         im_size: Image size (H, W)
         box_noise_std: Noise std relative to box size
-        box_noise_max: Max noise in pixels
-        min_box_area: Min area after noising
+        box_noise_max: Max noise in pixels (None = no clamp)
+        min_box_area: Min area after noising (SAM3 default: 0.0)
 
     Returns:
         Noised box in xyxy format
@@ -243,7 +248,7 @@ def noise_box(
     noised_box = np.maximum(noised_box, 0)
     noised_box = np.minimum(noised_box, [W, H, W, H])
 
-    # Check min area
+    # Check min area (SAM3 default: 0.0 = no limit)
     new_w = noised_box[2] - noised_box[0]
     new_h = noised_box[3] - noised_box[1]
     if new_w * new_h <= min_box_area:
@@ -298,7 +303,13 @@ class SAM3_3DCollator:
         # Box prompt options
         use_box_prompts: bool = True,
         box_noise_std: float = 0.0,
-        box_noise_max: float | None = 20.0,
+        box_noise_max: float | None = None,
+        # Multi-tier box noise: (prob, std) tiers sampled per box.
+        # If set, overrides box_noise_std. Each tier is (probability, std).
+        # Probabilities must sum to 1.0.
+        # Example: [(0.3, 0.0), (0.5, 0.1), (0.2, 0.2)]
+        #   = 30% no noise, 50% mild, 20% extreme
+        box_noise_tiers: list[tuple[float, float]] | None = None,
         # Text/Visual query ratio (SAM3 original design)
         text_query_prob: float = 0.7,  # 70% text, 30% visual (SAM3 recommended)
         keep_text_for_visual: bool = False,  # If True, visual queries keep category text
@@ -314,6 +325,7 @@ class SAM3_3DCollator:
         use_label_prob: float = 1/3,  # P(+LABEL) when query has a box prompt
         # Oracle evaluation mode (GT box as geometry prompt)
         oracle_eval: bool = False,  # If True, each GT box = one geometry prompt
+        oracle_text_category: bool = False,  # If True, oracle + category text
         # Training vs inference filtering
         filter_empty_boxes: bool = True,  # Set False at test time to keep 0-GT-box images
     ):
@@ -334,7 +346,9 @@ class SAM3_3DCollator:
                 - "random_box": uniform sample from box, label from mask
             use_box_prompts: Whether to use box prompts
             box_noise_std: Noise std for box jittering (0 = no noise)
-            box_noise_max: Max noise in pixels
+            box_noise_max: Max noise in pixels (None = no clamp)
+            box_noise_tiers: Multi-tier noise as list of (prob, std).
+                Overrides box_noise_std when set.
             text_query_prob: Probability of text-only queries (SAM3 recommended: 0.7)
                 Only used when use_geometry_prompts=False (legacy 2-mode).
             keep_text_for_visual: If True, visual queries keep category text
@@ -353,6 +367,9 @@ class SAM3_3DCollator:
             oracle_eval: If True, each GT 2D box becomes its own geometry
                 prompt (one-to-one). For measuring 3D regression quality
                 in isolation, following DetAny3D's GT prompt evaluation.
+            oracle_text_category: If True, oracle mode with category text.
+                Each GT box = one GEOMETRY+LABEL prompt with text
+                "geometric: <category>" (e.g., "geometric: apple").
         """
         self.max_prompts_per_image = max_prompts_per_image
         self.use_text_prompts = use_text_prompts
@@ -368,6 +385,7 @@ class SAM3_3DCollator:
         self.use_box_prompts = use_box_prompts
         self.box_noise_std = box_noise_std
         self.box_noise_max = box_noise_max
+        self.box_noise_tiers = box_noise_tiers
 
         # Text/Visual query ratio
         self.text_query_prob = text_query_prob
@@ -382,9 +400,22 @@ class SAM3_3DCollator:
 
         # Oracle evaluation mode
         self.oracle_eval = oracle_eval
+        self.oracle_text_category = oracle_text_category
 
         # Training vs inference filtering
         self.filter_empty_boxes = filter_empty_boxes
+
+    def _sample_box_noise_std(self) -> float:
+        """Sample box noise std from tiers or fallback to self.box_noise_std."""
+        if self.box_noise_tiers is not None:
+            r = random.random()
+            cumulative = 0.0
+            for prob, std in self.box_noise_tiers:
+                cumulative += prob
+                if r < cumulative:
+                    return std
+            return self.box_noise_tiers[-1][1]
+        return self.box_noise_std
 
     def _sample_num_points(self, num_spec: int | tuple[int, int]) -> int:
         """Sample number of points from spec."""
@@ -750,6 +781,97 @@ class SAM3_3DCollator:
                     # Oracle mode: no ignore box suppression needed
                     ignore_boxes2d_per_query.append([])
 
+        elif self.oracle_text_category:
+            # ========== Oracle + Text Category Mode ==========
+            # Same as oracle (each GT box = one geometry prompt), but with
+            # category-specific text: "geometric: <category>" instead of
+            # generic "geometric". Query type = GEOMETRY+LABEL (4).
+            for img_idx, sample in enumerate(batch):
+                boxes2d = sample.get("boxes2d")
+                boxes3d = sample.get("boxes3d")
+                class_ids = sample.get("boxes2d_classes")
+                class_names = sample.get("boxes2d_names", None)
+
+                if boxes2d is None or len(boxes2d) == 0:
+                    continue
+
+                original_hw = sample.get("original_hw", None)
+                pad_info = sample.get("padding", None)
+
+                if original_hw is not None and pad_info is not None:
+                    orig_h, orig_w = original_hw
+                    if isinstance(orig_h, torch.Tensor):
+                        orig_h, orig_w = orig_h.item(), orig_w.item()
+                    pad_left, pad_right, pad_top, pad_bottom = pad_info
+                    if isinstance(pad_left, torch.Tensor):
+                        pad_left = pad_left.item()
+                        pad_right = pad_right.item()
+                        pad_top = pad_top.item()
+                        pad_bottom = pad_bottom.item()
+                    content_w = W - pad_left - pad_right
+                    content_h = H - pad_top - pad_bottom
+                    scale_x = content_w / orig_w
+                    scale_y = content_h / orig_h
+
+                    def transform_box_to_padded(box_raw):
+                        """Transform box: original pixel -> padded pixel."""
+                        if isinstance(box_raw, torch.Tensor):
+                            box = box_raw.clone().float()
+                        else:
+                            box = torch.tensor(box_raw, dtype=torch.float32)
+                        box[0::2] = box[0::2] * scale_x + pad_left
+                        box[1::2] = box[1::2] * scale_y + pad_top
+                        return box
+                else:
+                    def transform_box_to_padded(box_raw):
+                        if isinstance(box_raw, torch.Tensor):
+                            return box_raw.clone().float()
+                        return torch.tensor(box_raw, dtype=torch.float32)
+
+                for box_idx in range(len(boxes2d)):
+                    img_ids_list.append(img_idx)
+
+                    # Category ID
+                    if class_ids is not None:
+                        cat_id = class_ids[box_idx]
+                        if isinstance(cat_id, torch.Tensor):
+                            cat_id = cat_id.item()
+                    else:
+                        cat_id = 0
+                    gt_category_ids_list.append(cat_id)
+
+                    # Get category name
+                    if class_names is not None and cat_id < len(class_names):
+                        cat_name = class_names[cat_id]
+                    else:
+                        cat_name = self.default_text
+
+                    # GEOMETRY+LABEL query: "geometric: <category>"
+                    gl_text = f"{self.geometric_query_str}: {cat_name}"
+                    if gl_text not in text_to_id:
+                        text_to_id[gl_text] = len(unique_texts)
+                        unique_texts.append(gl_text)
+                    query_types_list.append(4)  # GEOMETRY+LABEL
+                    is_visual_query_list.append(True)
+                    text_ids_list.append(text_to_id[gl_text])
+
+                    # Transform box to padded pixel space, then normalize
+                    box_padded = transform_box_to_padded(boxes2d[box_idx])
+                    box_norm_xyxy = normalize_box_xyxy(box_padded)
+                    geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
+
+                    # Target = this single box (one-to-one)
+                    gt_boxes2d_per_query.append(
+                        [normalize_box_xyxy(boxes2d[box_idx])]
+                    )
+                    if boxes3d is not None and box_idx < len(boxes3d):
+                        gt_boxes3d_per_query.append(
+                            [boxes3d[box_idx].to(device)]
+                        )
+                    else:
+                        gt_boxes3d_per_query.append(None)
+                    ignore_boxes2d_per_query.append([])
+
         else:
             # ========== Standard Mode: Group by category ==========
             for img_idx, sample in enumerate(batch):
@@ -835,11 +957,12 @@ class SAM3_3DCollator:
                             sel_idx = random.choice(box_indices_inner)
                             bx = boxes2d[sel_idx]
                             bx_np = bx.cpu().numpy() if isinstance(bx, torch.Tensor) else bx
-                            if self.box_noise_std > 0:
+                            std = self._sample_box_noise_std()
+                            if std > 0:
                                 bx_np = noise_box(
                                     bx_np,
                                     im_size=(H, W),
-                                    box_noise_std=self.box_noise_std,
+                                    box_noise_std=std,
                                     box_noise_max=self.box_noise_max,
                                 )
                             norm_xyxy = torch.tensor([
@@ -950,11 +1073,12 @@ class SAM3_3DCollator:
                             box_xyxy = boxes2d[selected_idx]
                             box_xyxy_np = box_xyxy.cpu().numpy() if isinstance(box_xyxy, torch.Tensor) else box_xyxy
 
-                            if self.box_noise_std > 0:
+                            std = self._sample_box_noise_std()
+                            if std > 0:
                                 box_xyxy_np = noise_box(
                                     box_xyxy_np,
                                     im_size=(H, W),
-                                    box_noise_std=self.box_noise_std,
+                                    box_noise_std=std,
                                     box_noise_max=self.box_noise_max,
                                 )
 

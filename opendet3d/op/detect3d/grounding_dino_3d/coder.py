@@ -43,6 +43,72 @@ def _normalize_rotation_half(poses: Tensor) -> Tensor:
     return poses_out
 
 
+def _normalize_canonical(
+    poses: Tensor, dims: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Normalize rotation and dimensions to canonical form.
+
+    Eliminates OBB rotation ambiguity via 2 steps:
+
+    Step 1 - Force W <= L:
+        If W > L, swap W and L, then apply Ry(90 deg) to rotation.
+        boxes3d dims = [W, L, H]. Canonical: X=L, Z=W, so swapping
+        W<->L requires rotating 90 deg around Y to keep the box
+        geometry identical.
+        Ry(90): new_col0 = old_col2, new_col2 = -old_col0
+
+    Step 2 - Normalize yaw to [0, pi):
+        Same as _normalize_rotation_half. Apply Ry(180 deg) if yaw < 0
+        or yaw >= pi.
+
+    Together these reduce 4-fold Ry ambiguity to 1-fold.
+    (Rx(180) upside-down ambiguity is left to data preprocessing.)
+
+    Args:
+        poses: Rotation matrices [N, 3, 3].
+        dims: Dimensions [N, 3] as [W, L, H].
+
+    Returns:
+        poses_out: Normalized rotation matrices [N, 3, 3].
+        dims_out: Normalized dimensions [N, 3] with W <= L.
+    """
+    import math
+
+    poses_out = poses.clone()
+    dims_out = dims.clone()
+
+    # Step 1: Force W <= L
+    # dims = [W, L, H], indices 0, 1, 2
+    swap_mask = dims_out[:, 0] > dims_out[:, 1]  # W > L
+    if swap_mask.any():
+        # Swap W and L
+        w_old = dims_out[swap_mask, 0].clone()
+        dims_out[swap_mask, 0] = dims_out[swap_mask, 1]
+        dims_out[swap_mask, 1] = w_old
+
+        # Apply Ry(90 deg): R_new = R @ Ry(90)
+        # Ry(90) = [[0,0,1],[0,1,0],[-1,0,0]]
+        # col0_new = R @ [0,0,-1]^T = -col2
+        # col1_new = R @ [0,1,0]^T  = col1 (unchanged)
+        # col2_new = R @ [1,0,0]^T  = col0
+        col0 = poses_out[swap_mask, :, 0].clone()
+        col2 = poses_out[swap_mask, :, 2].clone()
+        poses_out[swap_mask, :, 0] = -col2
+        poses_out[swap_mask, :, 2] = col0
+
+    # Step 2: Normalize yaw to [0, pi)
+    yaw = rotation_matrix_yaw(
+        poses_out, axis_mode=AxisMode.OPENCV
+    )[:, 1]  # [N]
+    flip_mask = (yaw < 0) | (yaw > math.pi - 1e-4)
+    if flip_mask.any():
+        # R_new = R @ Ry(pi), negates columns 0 and 2
+        poses_out[flip_mask, :, 0] = -poses_out[flip_mask, :, 0]
+        poses_out[flip_mask, :, 2] = -poses_out[flip_mask, :, 2]
+
+    return poses_out, dims_out
+
+
 class GroundingDINO3DCoder:
     """Grounding DINO 3D box Coder."""
 
@@ -53,13 +119,20 @@ class GroundingDINO3DCoder:
         dim_scale: float = 2.0,
         orientation: str = "rotation_6d",
         ambiguous_rotation: bool = False,
+        canonical_rotation: bool = False,
     ) -> None:
         """Initialize the Grounding DINO 3D encoder."""
         self.center_scale = center_scale
         self.depth_scale = depth_scale
         self.dim_scale = dim_scale
         self.ambiguous_rotation = ambiguous_rotation
-        if ambiguous_rotation:
+        self.canonical_rotation = canonical_rotation
+        if canonical_rotation:
+            print(
+                "[GroundingDINO3DCoder] canonical_rotation=True: "
+                "dims normalized to W<=L, yaw to [0, 180)"
+            )
+        elif ambiguous_rotation:
             print(
                 "[GroundingDINO3DCoder] ambiguous_rotation=True: "
                 "GT rotation normalized to [0, 180) yaw range"
@@ -112,17 +185,21 @@ class GroundingDINO3DCoder:
         )
         depth = depth.unsqueeze(-1)
 
-        valid_dims = boxes3d[:, 3:6] > 0
-        dims = torch.where(
-            valid_dims,
-            torch.log(boxes3d[:, 3:6]) * self.dim_scale,
-            boxes3d[:, 2].new_zeros(1),
-        )
+        raw_dims = boxes3d[:, 3:6]  # [W, L, H]
 
         poses = quaternion_to_matrix(boxes3d[:, 6:])
 
-        if self.ambiguous_rotation:
+        if self.canonical_rotation:
+            poses, raw_dims = _normalize_canonical(poses, raw_dims)
+        elif self.ambiguous_rotation:
             poses = _normalize_rotation_half(poses)
+
+        valid_dims = raw_dims > 0
+        dims = torch.where(
+            valid_dims,
+            torch.log(raw_dims) * self.dim_scale,
+            raw_dims.new_zeros(1),
+        )
 
         if self.orientation == "yaw":
             yaw = rotation_matrix_yaw(
@@ -172,15 +249,15 @@ class GroundingDINO3DCoder:
                 [torch.zeros_like(yaw), yaw, torch.zeros_like(yaw)], -1
             )
 
-            orientation = matrix_to_quaternion(
-                euler_angles_to_matrix(orientation)
-            )
+            poses = euler_angles_to_matrix(orientation)
         elif self.orientation == "rotation_6d":
             poses = rotation_6d_to_matrix(boxes3d[:, 6:])
 
-            if self.ambiguous_rotation:
-                poses = _normalize_rotation_half(poses)
+        if self.canonical_rotation:
+            poses, dims = _normalize_canonical(poses, dims)
+        elif self.ambiguous_rotation:
+            poses = _normalize_rotation_half(poses)
 
-            orientation = matrix_to_quaternion(poses)
+        orientation = matrix_to_quaternion(poses)
 
         return torch.cat([center_3d, dims, orientation], dim=1)

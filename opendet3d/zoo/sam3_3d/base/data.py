@@ -33,6 +33,7 @@ from .connector import SAM3_3DCollator
 _default_collator = None
 _test_collator = None
 _oracle_collator = None
+_oracle_text_category_collator = None
 _5mode_collator = None
 
 
@@ -111,6 +112,31 @@ def sam3_3d_oracle_collate_fn(batch: List[dict], **kwargs):
     return _oracle_collator(batch)
 
 
+def sam3_3d_oracle_text_category_collate_fn(batch: List[dict], **kwargs):
+    """Oracle + text category SAM3_3D collate function (module-level).
+
+    Each GT 2D box becomes its own GEOMETRY+LABEL prompt with category text
+    (e.g., "geometric: apple"). One-to-one mapping like oracle, but with
+    category-specific text like training's Branch 2 GEOMETRY+LABEL mode.
+
+    Args:
+        batch: List of data samples
+        **kwargs: Additional arguments from vis4d (e.g., collate_keys)
+
+    Returns:
+        Collated batch data
+    """
+    global _oracle_text_category_collator
+    if _oracle_text_category_collator is None:
+        _oracle_text_category_collator = SAM3_3DCollator(
+            max_prompts_per_image=50,
+            use_text_prompts=True,
+            oracle_text_category=True,
+            filter_empty_boxes=False,
+        )
+    return _oracle_text_category_collator(batch)
+
+
 def sam3_3d_5mode_collate_fn(batch: List[dict], **kwargs):
     """5-mode SAM3_3D collate function (module-level for vis4d).
 
@@ -133,6 +159,11 @@ def sam3_3d_5mode_collate_fn(batch: List[dict], **kwargs):
             use_geometry_prompts=True,
             text_only_prob=0.5,
             use_label_prob=1/3,
+            box_noise_tiers=[
+                (0.5, 0.0),   # 50% no noise (exact GT box)
+                (0.4, 0.1),   # 40% mild jitter (~10% box size)
+                (0.1, 0.2),   # 10% moderate jitter (~20% box size)
+            ],
         )
     return _5mode_collator(batch)
 
@@ -233,6 +264,8 @@ def get_sam3_3d_data_cfg(
     test_use_geometry_prompts: bool = False,
     # Oracle evaluation mode
     oracle_eval: bool = False,
+    # Oracle + text category evaluation mode
+    oracle_text_category: bool = False,
 ) -> DataConfig:
     """Get the data config for SAM3_3D with custom collator.
 
@@ -263,6 +296,8 @@ def get_sam3_3d_data_cfg(
         test_text_query_prob: Probability of text queries during test
         test_use_geometry_prompts: Whether to use geometry prompts during test
         oracle_eval: If True, test collator uses oracle mode
+        oracle_text_category: If True, test collator uses oracle + text
+            category mode (GEOMETRY+LABEL with "geometric: <category>")
 
     Returns:
         DataConfig with train and test dataloaders
@@ -280,7 +315,9 @@ def get_sam3_3d_data_cfg(
     # correctly.  create_sam3_3d_collate_fn() closures do NOT work because
     # vis4d's DelayedInstantiator resolves by __module__ + __name__ back to
     # the module-level function, ignoring the closure parameters.
-    if oracle_eval:
+    if oracle_text_category:
+        test_collate_fn = sam3_3d_oracle_text_category_collate_fn
+    elif oracle_eval:
         test_collate_fn = sam3_3d_oracle_collate_fn
     else:
         test_collate_fn = sam3_3d_test_collate_fn

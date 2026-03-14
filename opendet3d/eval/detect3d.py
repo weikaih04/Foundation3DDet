@@ -38,6 +38,41 @@ from opendet3d.op.box.box3d import box3d_overlap
 from opendet3d.op.geometric.rotation import so3_relative_angle
 
 
+def _canonicalize_rotation_np(R_cam, dims_whl):
+    """Canonicalize rotation for evaluation (numpy version).
+
+    Matches _normalize_canonical in coder.py. Eliminates 4-fold OBB
+    rotation ambiguity:
+      Step 1 - Force W <= L: if W > L, swap and apply Ry(90).
+      Step 2 - Normalize yaw to [0, pi): if yaw outside, apply Ry(180).
+
+    Args:
+        R_cam: 3x3 rotation matrix (numpy).
+        dims_whl: [W, H, L] dimensions (numpy or list).
+
+    Returns:
+        R_out: 3x3 canonical rotation matrix.
+    """
+    R_out = np.array(R_cam, dtype=np.float64).copy()
+    w, h, l = float(dims_whl[0]), float(dims_whl[1]), float(dims_whl[2])
+
+    # Step 1: Force W <= L
+    if w > l:
+        w, l = l, w
+        col0 = R_out[:, 0].copy()
+        R_out[:, 0] = -R_out[:, 2]
+        R_out[:, 2] = col0
+
+    # Step 2: Normalize yaw to [0, pi)
+    # YZX intrinsic: yaw = atan2(-R[2,0], R[0,0])
+    yaw = np.arctan2(-R_out[2, 0], R_out[0, 0])
+    if yaw < 0 or yaw > np.pi - 1e-4:
+        R_out[:, 0] = -R_out[:, 0]
+        R_out[:, 2] = -R_out[:, 2]
+
+    return R_out
+
+
 class Detect3DEvaluator(Evaluator):
     """3D object detection evaluation with COCO format."""
 
@@ -58,12 +93,9 @@ class Detect3DEvaluator(Evaluator):
         # Categories with >=freq_thresh images -> APf
         freq_rare_thresh: int = 0,
         freq_freq_thresh: int = 0,
-        # APRel3D parameters
+        # APRel3D parameters (LabelAny3D-style)
         enable_aprel3d: bool = False,
-        scale_search_min: float = 0.1,
-        scale_search_max: float = 10.0,
-        scale_search_steps: int = 100,
-        scale_optimize_method: str = "A",  # "A" = score-weighted, "B" = match-first
+        aprel_2d_iou_thresh: float = 0.75,
     ) -> None:
         """Create an instance of the class."""
         if id2name is None:
@@ -78,12 +110,9 @@ class Detect3DEvaluator(Evaluator):
         self.num_columns = num_columns
         self.base_classes = base_classes
 
-        # APRel3D settings
+        # APRel3D settings (LabelAny3D-style)
         self.enable_aprel3d = enable_aprel3d
-        self.scale_search_min = scale_search_min
-        self.scale_search_max = scale_search_max
-        self.scale_search_steps = scale_search_steps
-        self.scale_optimize_method = scale_optimize_method
+        self.aprel_2d_iou_thresh = aprel_2d_iou_thresh
 
         self.tp_errors = ["ATE", "AOE", "ASE"]
 
@@ -177,291 +206,103 @@ class Detect3DEvaluator(Evaluator):
         self.bbox_3D_evals_per_cat_area.clear()
         self.optimal_scales.clear()
 
-    def _scale_predictions(
-        self, preds: list[DictStrAny], scale: float
-    ) -> list[DictStrAny]:
-        """Scale predictions by a factor (returns new list, doesn't modify input).
-
-        Args:
-            preds: List of prediction dictionaries
-            scale: Scale factor to apply
-
-        Returns:
-            List of scaled predictions
-        """
-        scaled_preds = []
-
-        for pred in preds:
-            scaled_pred = pred.copy()
-
-            # Scale center_cam
-            if "center_cam" in pred:
-                scaled_pred["center_cam"] = [
-                    c * scale for c in pred["center_cam"]
-                ]
-
-            # Scale dimensions
-            if "dimensions" in pred:
-                scaled_pred["dimensions"] = [
-                    d * scale for d in pred["dimensions"]
-                ]
-
-            # Scale bbox3D corners relative to their center
-            # This preserves corner ordering and coplanarity
-            if "bbox3D" in pred and "center_cam" in pred:
-                orig_center = pred["center_cam"]
-                new_center = scaled_pred["center_cam"]
-
-                # Scale each corner's offset from center, then translate to new center
-                scaled_corners = []
-                for corner in pred["bbox3D"]:
-                    # offset from original center
-                    offset = [corner[i] - orig_center[i] for i in range(3)]
-                    # scale offset and add to new center
-                    new_corner = [new_center[i] + offset[i] * scale for i in range(3)]
-                    scaled_corners.append(new_corner)
-                scaled_pred["bbox3D"] = scaled_corners
-            elif "bbox3D" in pred:
-                # Fallback: scale corners directly (old behavior)
-                scaled_pred["bbox3D"] = [
-                    [c * scale for c in corner] for corner in pred["bbox3D"]
-                ]
-
-            # Scale depth
-            if "depth" in pred:
-                scaled_pred["depth"] = pred["depth"] * scale
-
-            # Note: R_cam (rotation) is NOT scaled
-            # Note: bbox (2D box) is NOT scaled
-            # Note: score, category_id, etc. remain unchanged
-
-            scaled_preds.append(scaled_pred)
-
-        return scaled_preds
-
-    def _compute_avg_3d_iou(
-        self, preds: list[DictStrAny], gts: list[DictStrAny]
-    ) -> float:
-        """Compute average 3D IoU for bbox mode.
-
-        Args:
-            preds: List of prediction dictionaries
-            gts: List of ground truth dictionaries
-
-        Returns:
-            Average maximum IoU across predictions (weighted by score)
-        """
-        if len(preds) == 0 or len(gts) == 0:
-            return 0.0
-
-        # Filter to top predictions by score to avoid noise from low-confidence detections
-        # This is important because AP evaluation primarily considers high-score predictions
-        preds_sorted = sorted(preds, key=lambda x: x.get("score", 0), reverse=True)
-        # Keep top-k predictions, where k = min(num_gts * 3, num_preds)
-        # This ensures we focus on the most relevant predictions
-        max_preds = min(len(gts) * 3, len(preds))
-        preds_filtered = preds_sorted[:max_preds] if max_preds > 0 else preds_sorted
-
-        # Extract bbox3D
-        pred_boxes = torch.tensor(
-            [p["bbox3D"] for p in preds_filtered], dtype=torch.float32
-        )
-        gt_boxes = torch.tensor(
-            [g["bbox3D"] for g in gts], dtype=torch.float32
-        )
-
-        # Compute 3D IoU matrix [N_pred, N_gt]
-        # box3d_overlap from opendet3d.op.box.box3d returns only IoU tensor
-        ious = box3d_overlap(pred_boxes, gt_boxes)
-
-        # For each pred, take max IoU
-        max_ious = ious.max(dim=1)[0]
-
-        # Score-weighted average to prioritize high-confidence predictions
-        scores = torch.tensor(
-            [p.get("score", 1.0) for p in preds_filtered], dtype=torch.float32
-        )
-        if scores.sum() > 0:
-            avg_iou = (max_ious * scores).sum().item() / scores.sum().item()
-        else:
-            avg_iou = max_ious.mean().item()
-
-        return avg_iou
-
-    def _compute_avg_distance(
-        self, preds: list[DictStrAny], gts: list[DictStrAny]
-    ) -> float:
-        """Compute average center distance for dist mode.
-
-        Args:
-            preds: List of prediction dictionaries
-            gts: List of ground truth dictionaries
-
-        Returns:
-            Average minimum distance across predictions
-        """
-        if len(preds) == 0 or len(gts) == 0:
-            return np.inf
-
-        # Extract center_cam
-        pred_centers = np.array([p["center_cam"] for p in preds])
-        gt_centers = np.array([g["center_cam"] for g in gts])
-
-        # Compute distance matrix [N_pred, N_gt]
-        distances = cdist(pred_centers, gt_centers, metric="euclidean")
-
-        # For each pred, take min distance
-        min_distances = distances.min(axis=1)
-
-        # Average
-        avg_distance = min_distances.mean()
-
-        return avg_distance
-
-    def _match_predictions(
-        self, preds: list[DictStrAny], gts: list[DictStrAny], iou_thresh: float = 0.05
-    ) -> list[tuple[int, int]]:
-        """Match predictions to GTs using greedy matching by score.
-
-        Args:
-            preds: List of prediction dictionaries
-            gts: List of ground truth dictionaries
-            iou_thresh: Minimum IoU threshold for matching
-
-        Returns:
-            List of (pred_idx, gt_idx) tuples for matched pairs
-        """
-        if len(preds) == 0 or len(gts) == 0:
-            return []
-
-        # Sort by score (descending)
-        sorted_indices = sorted(
-            range(len(preds)), key=lambda i: preds[i].get("score", 0), reverse=True
-        )
-
-        # Compute IoU matrix
-        pred_boxes = torch.tensor([p["bbox3D"] for p in preds], dtype=torch.float32)
-        gt_boxes = torch.tensor([g["bbox3D"] for g in gts], dtype=torch.float32)
-        ious = box3d_overlap(pred_boxes, gt_boxes)
-
-        gt_matched = [False] * len(gts)
-        matches = []
-
-        for pred_idx in sorted_indices:
-            best_iou = iou_thresh
-            best_gt = -1
-            for gt_idx in range(len(gts)):
-                if gt_matched[gt_idx]:
-                    continue
-                # Check category match
-                if preds[pred_idx].get("category_id") != gts[gt_idx].get("category_id"):
-                    continue
-                if ious[pred_idx, gt_idx] > best_iou:
-                    best_iou = ious[pred_idx, gt_idx].item()
-                    best_gt = gt_idx
-
-            if best_gt >= 0:
-                matches.append((pred_idx, best_gt))
-                gt_matched[best_gt] = True
-
-        return matches
-
-    def _compute_matched_iou(
-        self, preds: list[DictStrAny], gts: list[DictStrAny], matches: list[tuple[int, int]]
-    ) -> float:
-        """Compute average IoU for matched pairs only.
-
-        Args:
-            preds: List of prediction dictionaries
-            gts: List of ground truth dictionaries
-            matches: List of (pred_idx, gt_idx) tuples
-
-        Returns:
-            Average IoU of matched pairs
-        """
-        if len(matches) == 0:
-            return 0.0
-
-        matched_preds = [preds[m[0]] for m in matches]
-        matched_gts = [gts[m[1]] for m in matches]
-
-        pred_boxes = torch.tensor([p["bbox3D"] for p in matched_preds], dtype=torch.float32)
-        gt_boxes = torch.tensor([g["bbox3D"] for g in matched_gts], dtype=torch.float32)
-        ious = box3d_overlap(pred_boxes, gt_boxes)
-
-        # Take diagonal (1-1 matching)
-        matched_ious = torch.diag(ious)
-        return matched_ious.mean().item()
-
     def _find_optimal_scale(
         self, preds: list[DictStrAny], gts: list[DictStrAny]
     ) -> float:
-        """Find optimal scale factor via grid search.
+        """Find optimal global scale factor (LabelAny3D method).
 
-        Args:
-            preds: List of prediction dictionaries
-            gts: List of ground truth dictionaries
-
-        Returns:
-            Optimal scale factor
+        Ported from LabelAny3D compute_optimal_scale():
+        1. Match each dt to best gt using 2D IoU (threshold 0.75).
+        2. Grid search [0.1, 3.5] step 0.1, maximize avg 3D IoU.
         """
-        scales = np.linspace(
-            self.scale_search_min,
-            self.scale_search_max,
-            self.scale_search_steps,
-        )
+        # Collect dt/gt 3D corners and 2D boxes
+        dt_boxes = []
+        dt_boxes_2d = []
+        for pred in preds:
+            if "bbox3D" not in pred or "bbox" not in pred:
+                continue
+            dt_boxes.append(pred["bbox3D"])
+            # bbox is COCO [x, y, w, h], convert to [x1, y1, x2, y2]
+            b = pred["bbox"]
+            dt_boxes_2d.append([b[0], b[1], b[0] + b[2], b[1] + b[3]])
 
-        best_scale = 1.0
+        gt_boxes = []
+        gt_boxes_2d = []
+        for gt in gts:
+            if "bbox3D" not in gt or "bbox" not in gt:
+                continue
+            gt_boxes.append(gt["bbox3D"])
+            b = gt["bbox"]
+            gt_boxes_2d.append([b[0], b[1], b[0] + b[2], b[1] + b[3]])
 
-        if self.scale_optimize_method == "B":
-            # Method B: Match first, then optimize scale on matched pairs only
-            matches = self._match_predictions(preds, gts, iou_thresh=0.05)
-            if len(matches) == 0:
-                return 1.0
+        if len(gt_boxes) == 0 or len(dt_boxes) == 0:
+            return 1.0
 
-            matched_preds = [preds[m[0]] for m in matches]
-            matched_gts = [gts[m[1]] for m in matches]
+        dt_boxes = np.array(dt_boxes, dtype=np.float32)
+        gt_boxes = np.array(gt_boxes, dtype=np.float32)
 
-            best_metric = -np.inf
-            for s in scales:
-                scaled_preds = self._scale_predictions(matched_preds, s)
-                avg_iou = self._compute_matched_iou(
-                    scaled_preds, matched_gts,
-                    [(i, i) for i in range(len(matches))]  # 1-1 mapping
+        # Match each dt to the most similar gt using 2D IoU
+        matched_pairs = []
+        for dt_idx, dt_2d in enumerate(dt_boxes_2d):
+            best_iou = 0
+            best_gt_idx = -1
+
+            for gt_idx, gt_2d in enumerate(gt_boxes_2d):
+                x1 = max(dt_2d[0], gt_2d[0])
+                y1 = max(dt_2d[1], gt_2d[1])
+                x2 = min(dt_2d[2], gt_2d[2])
+                y2 = min(dt_2d[3], gt_2d[3])
+
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                inter_area = (x2 - x1) * (y2 - y1)
+                dt_area = (dt_2d[2] - dt_2d[0]) * (dt_2d[3] - dt_2d[1])
+                gt_area = (gt_2d[2] - gt_2d[0]) * (gt_2d[3] - gt_2d[1])
+                iou = inter_area / (dt_area + gt_area - inter_area)
+
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = gt_idx
+
+            if best_gt_idx >= 0 and best_iou > 0.75:
+                matched_pairs.append((dt_idx, best_gt_idx))
+
+        if len(matched_pairs) == 0:
+            return 1.0
+
+        def compute_avg_iou(scale):
+            avg_iou = 0.0
+            for dt_idx, gt_idx in matched_pairs:
+                scaled_dt_box = dt_boxes[dt_idx] * scale
+                dt_tensor = torch.tensor(
+                    scaled_dt_box[np.newaxis, :, :],
+                    dtype=torch.float32,
                 )
-                if avg_iou > best_metric:
-                    best_metric = avg_iou
-                    best_scale = s
+                gt_tensor = torch.tensor(
+                    gt_boxes[gt_idx][np.newaxis, :, :],
+                    dtype=torch.float32,
+                )
+                iou = box3d_overlap(dt_tensor, gt_tensor).cpu().numpy()[0]
+                avg_iou += iou
+            return avg_iou / len(matched_pairs)
 
-        elif self.iou_type == "bbox":
-            # Method A (default): bbox mode, maximize 3D IoU with score-weighting
-            best_metric = -np.inf
+        # Grid search: start with scale=1.0, then search [0.1, 3.5]
+        best_scale = 1.0
+        best_iou = compute_avg_iou(best_scale)
 
-            for s in scales:
-                scaled_preds = self._scale_predictions(preds, s)
-                avg_iou = self._compute_avg_3d_iou(scaled_preds, gts)
-
-                if avg_iou > best_metric:
-                    best_metric = avg_iou
-                    best_scale = s
-
-        elif self.iou_type == "dist":
-            # dist mode: minimize center distance
-            best_metric = np.inf
-
-            for s in scales:
-                scaled_preds = self._scale_predictions(preds, s)
-                avg_dist = self._compute_avg_distance(scaled_preds, gts)
-
-                if avg_dist < best_metric:
-                    best_metric = avg_dist
-                    best_scale = s
+        for scale in np.arange(0.1, 3.51, 0.1):
+            iou = compute_avg_iou(scale)
+            if iou > best_iou:
+                best_iou = iou
+                best_scale = scale
 
         return best_scale
 
     def _optimize_and_apply_scales(self) -> None:
-        """Optimize scale for each image and apply to predictions."""
-        print("Optimizing scales for APRel3D...")
+        """Optimize per-image scale and apply to all predictions."""
+        print("Optimizing scales for APRel3D (LabelAny3D method)...")
+        print(f"  2D IoU match threshold: {self.aprel_2d_iou_thresh}")
 
         # Step 1: Group predictions by image
         preds_by_image = defaultdict(list)
@@ -469,83 +310,53 @@ class Detect3DEvaluator(Evaluator):
             preds_by_image[pred["image_id"]].append(pred)
 
         # Step 2: Optimize scale for each image
+        n_matched_images = 0
         for img_id, preds in preds_by_image.items():
-            # Get GTs for this image
             gts = self._coco_gt.loadAnns(
                 self._coco_gt.getAnnIds(imgIds=[img_id])
             )
-
             if len(gts) == 0:
                 self.optimal_scales[img_id] = 1.0
                 continue
 
-            # Optimize scale
             s_star = self._find_optimal_scale(preds, gts)
             self.optimal_scales[img_id] = s_star
+            if s_star != 1.0:
+                n_matched_images += 1
 
-        # Step 3: Apply scales to all predictions
+        # Step 3: Apply scales (direct corner multiplication)
         scaled_predictions = []
-        regenerated_count = 0
-        fallback_count = 0
-
         for pred in self._predictions:
             img_id = pred["image_id"]
             scale = self.optimal_scales.get(img_id, 1.0)
 
             scaled_pred = pred.copy()
 
-            # Scale center_cam
             if "center_cam" in pred:
                 scaled_pred["center_cam"] = [
                     c * scale for c in pred["center_cam"]
                 ]
-
-            # Scale dimensions
             if "dimensions" in pred:
                 scaled_pred["dimensions"] = [
                     d * scale for d in pred["dimensions"]
                 ]
-
-            # Scale bbox3D corners relative to their center
-            # This preserves corner ordering and coplanarity
-            # Must match the method used in _scale_predictions for consistency
-            if "bbox3D" in pred and "center_cam" in pred:
-                orig_center = pred["center_cam"]
-                new_center = scaled_pred["center_cam"]
-
-                # Scale each corner's offset from center, then translate to new center
-                scaled_corners = []
-                for corner in pred["bbox3D"]:
-                    # offset from original center
-                    offset = [corner[i] - orig_center[i] for i in range(3)]
-                    # scale offset and add to new center
-                    new_corner = [new_center[i] + offset[i] * scale for i in range(3)]
-                    scaled_corners.append(new_corner)
-                scaled_pred["bbox3D"] = scaled_corners
-                regenerated_count += 1
-            elif "bbox3D" in pred:
-                # Fallback: scale corners directly (old behavior)
+            if "bbox3D" in pred:
                 scaled_pred["bbox3D"] = [
-                    [c * scale for c in corner] for corner in pred["bbox3D"]
+                    [c * scale for c in corner]
+                    for corner in pred["bbox3D"]
                 ]
-                fallback_count += 1
-
-            # Scale depth
             if "depth" in pred:
                 scaled_pred["depth"] = pred["depth"] * scale
 
             scaled_predictions.append(scaled_pred)
 
-        print(f"  Corner regeneration: {regenerated_count} boxes")
-        print(f"  Direct scaling (fallback): {fallback_count} boxes")
-
-        # Replace predictions
         self._predictions = scaled_predictions
 
         # Print statistics
         scales = list(self.optimal_scales.values())
         if len(scales) > 0:
-            print(f"APRel3D: Optimized {len(scales)} images")
+            print(f"APRel3D: {len(scales)} images, "
+                  f"{n_matched_images} had 2D-IoU matches")
             print(f"  Mean scale: {np.mean(scales):.3f}")
             print(f"  Std scale: {np.std(scales):.3f}")
             print(f"  Min scale: {np.min(scales):.3f}")
@@ -718,6 +529,7 @@ class Detect3DEvaluator(Evaluator):
                 # by IoU threshold makes it unreliable (can be > 1)
                 rot_tp_errors = evaluator.eval["rot_tp_errors"]
                 rot_sym_tp_errors = evaluator.eval["rot_sym_tp_errors"]
+                rot_canonical_tp_errors = evaluator.eval["rot_canonical_tp_errors"]
                 scale_tp_errors = evaluator.eval["scale_tp_errors"]
 
                 rot_tp = rot_tp_errors[:, :, :, 0, -1]
@@ -726,16 +538,21 @@ class Detect3DEvaluator(Evaluator):
                 rot_sym_tp = rot_sym_tp_errors[:, :, :, 0, -1]
                 rot_sym_tp = rot_sym_tp[rot_sym_tp > -1]
 
+                rot_canonical_tp = rot_canonical_tp_errors[:, :, :, 0, -1]
+                rot_canonical_tp = rot_canonical_tp[rot_canonical_tp > -1]
+
                 scale_tp = scale_tp_errors[:, :, :, 0, -1]
                 scale_tp = scale_tp[scale_tp > -1]
 
                 if rot_tp.size:
                     mAOE = np.mean(rot_tp).item()
                     mAOE_Sym = np.mean(rot_sym_tp).item()
+                    mAOE_Canonical = np.mean(rot_canonical_tp).item()
                     mASE = np.mean(scale_tp).item()
                 else:
                     mAOE = float("nan")
                     mAOE_Sym = float("nan")
+                    mAOE_Canonical = float("nan")
                     mASE = float("nan")
 
                 # Add error metrics to output (no ATE in bbox mode)
@@ -743,10 +560,12 @@ class Detect3DEvaluator(Evaluator):
                     score_dict["ASERel"] = mASE
                     score_dict["AOERel"] = mAOE
                     score_dict["AOERelSym"] = mAOE_Sym
+                    score_dict["AOERelCanonical"] = mAOE_Canonical
                 else:
                     score_dict["ASE"] = mASE
                     score_dict["AOE"] = mAOE
                     score_dict["AOE_Sym"] = mAOE_Sym
+                    score_dict["AOE_Canonical"] = mAOE_Canonical
 
                 # Add scale statistics for APRel3D
                 if self.enable_aprel3d and len(self.optimal_scales) > 0:
@@ -757,6 +576,7 @@ class Detect3DEvaluator(Evaluator):
                 trans_tp_errors = evaluator.eval["trans_tp_errors"]
                 rot_tp_errors = evaluator.eval["rot_tp_errors"]
                 rot_sym_tp_errors = evaluator.eval["rot_sym_tp_errors"]
+                rot_canonical_tp_errors = evaluator.eval["rot_canonical_tp_errors"]
                 scale_tp_errors = evaluator.eval["scale_tp_errors"]
 
                 precision = precisions[:, :, :, 0, -1]
@@ -775,6 +595,9 @@ class Detect3DEvaluator(Evaluator):
                 rot_sym_tp = rot_sym_tp_errors[:, :, :, 0, -1]
                 rot_sym_tp = rot_sym_tp[rot_sym_tp > -1]
 
+                rot_canonical_tp = rot_canonical_tp_errors[:, :, :, 0, -1]
+                rot_canonical_tp = rot_canonical_tp[rot_canonical_tp > -1]
+
                 scale_tp = scale_tp_errors[:, :, :, 0, -1]
                 scale_tp = scale_tp[scale_tp > -1]
 
@@ -782,6 +605,7 @@ class Detect3DEvaluator(Evaluator):
                     mATE = np.mean(trans_tp).item()
                     mAOE = np.mean(rot_tp).item()
                     mAOE_Sym = np.mean(rot_sym_tp).item()
+                    mAOE_Canonical = np.mean(rot_canonical_tp).item()
                     mASE = np.mean(scale_tp).item()
 
                     mODS = (
@@ -792,14 +616,20 @@ class Detect3DEvaluator(Evaluator):
                         np.sum(mAP * 3 + (1 - mATE) + (1 - mAOE_Sym) + (1 - mASE))
                         / 6
                     )
+                    mODS_Canonical = (
+                        np.sum(mAP * 3 + (1 - mATE) + (1 - mAOE_Canonical) + (1 - mASE))
+                        / 6
+                    )
 
                 else:
                     mATE = float("nan")
                     mAOE = float("nan")
                     mAOE_Sym = float("nan")
+                    mAOE_Canonical = float("nan")
                     mASE = float("nan")
                     mODS = float("nan")
                     mODS_Sym = float("nan")
+                    mODS_Canonical = float("nan")
 
                 if self.enable_aprel3d:
                     score_dict = {
@@ -808,8 +638,10 @@ class Detect3DEvaluator(Evaluator):
                         "ASERel": mASE,
                         "AOERel": mAOE,
                         "AOERelSym": mAOE_Sym,
+                        "AOERelCanonical": mAOE_Canonical,
                         "ODSRel": mODS,
                         "ODSRelSym": mODS_Sym,
+                        "ODSRelCanonical": mODS_Canonical,
                     }
                 else:
                     score_dict = {
@@ -818,8 +650,10 @@ class Detect3DEvaluator(Evaluator):
                         "ASE": mASE,
                         "AOE": mAOE,
                         "AOE_Sym": mAOE_Sym,
+                        "AOE_Canonical": mAOE_Canonical,
                         "ODS": mODS,
                         "ODS_Sym": mODS_Sym,
+                        "ODS_Canonical": mODS_Canonical,
                     }
 
                 # Add scale statistics for APRel3D
@@ -1093,6 +927,7 @@ class Detect3Deval(COCOeval):
         trans_tp_errors = -np.ones((T, R, K, A, M))
         rot_tp_errors = -np.ones((T, R, K, A, M))
         rot_sym_tp_errors = -np.ones((T, R, K, A, M))
+        rot_canonical_tp_errors = -np.ones((T, R, K, A, M))
         scale_tp_errors = -np.ones((T, R, K, A, M))
         recall = -np.ones((T, K, A, M))
         scores = -np.ones((T, R, K, A, M))
@@ -1191,6 +1026,11 @@ class Detect3Deval(COCOeval):
                         axis=1,
                     )[:, inds]
 
+                    oems_canonical = np.concatenate(
+                        [e["dtOrientationErrorCanonical"][:, 0:maxDet] for e in E],
+                        axis=1,
+                    )[:, inds]
+
                     sems = np.concatenate(
                         [e["dtScaleError"][:, 0:maxDet] for e in E], axis=1
                     )[:, inds]
@@ -1207,6 +1047,7 @@ class Detect3Deval(COCOeval):
                         tran_tp_error = np.ones((R,))
                         rot_tp_error = np.ones((R,))
                         rot_sym_tp_error = np.ones((R,))
+                        rot_canonical_tp_error = np.ones((R,))
                         scale_tp_error = np.ones((R,))
 
                         if nd:
@@ -1222,6 +1063,7 @@ class Detect3Deval(COCOeval):
                         tran_tp_error = tran_tp_error.tolist()
                         rot_tp_error = rot_tp_error.tolist()
                         rot_sym_tp_error = rot_sym_tp_error.tolist()
+                        rot_canonical_tp_error = rot_canonical_tp_error.tolist()
                         scale_tp_error = scale_tp_error.tolist()
 
                         for i in range(nd - 1, 0, -1):
@@ -1238,6 +1080,7 @@ class Detect3Deval(COCOeval):
                                 tran_tp_error[ri] = tems[t][pi]
                                 rot_tp_error[ri] = oems[t][pi]
                                 rot_sym_tp_error[ri] = oems_sym[t][pi]
+                                rot_canonical_tp_error[ri] = oems_canonical[t][pi]
                                 scale_tp_error[ri] = sems[t][pi]
                         except:
                             pass
@@ -1255,6 +1098,9 @@ class Detect3Deval(COCOeval):
                         rot_sym_tp_errors[t, :, k, a, m] = np.array(
                             rot_sym_tp_error
                         )
+                        rot_canonical_tp_errors[t, :, k, a, m] = np.array(
+                            rot_canonical_tp_error
+                        )
                         scale_tp_errors[t, :, k, a, m] = np.array(
                             scale_tp_error
                         )
@@ -1271,6 +1117,7 @@ class Detect3Deval(COCOeval):
             "trans_tp_errors": trans_tp_errors,
             "rot_tp_errors": rot_tp_errors,
             "rot_sym_tp_errors": rot_sym_tp_errors,
+            "rot_canonical_tp_errors": rot_canonical_tp_errors,
             "scale_tp_errors": scale_tp_errors,
         }
 
@@ -1444,6 +1291,7 @@ class Detect3Deval(COCOeval):
         sem = np.ones((T, D))  # Scale Error
         oem = np.ones((T, D))  # Oritentation Error
         oem_sym = np.ones((T, D))  # Symmetric Orientation Error (mod 180)
+        oem_canonical = np.ones((T, D))  # Canonical Orientation Error
         gtIg = np.array([g["_ignore"] for g in gt])
         dtIg = np.zeros((T, D))
 
@@ -1532,6 +1380,22 @@ class Detect3Deval(COCOeval):
                         # Symmetric: fold 180 ambiguity, min(angle, pi-angle)
                         # range [0, pi/2], normalized by pi/2 to [0, 1]
                         oem_sym[tind, dind] = min(angle, np.pi - angle) / (np.pi / 2)
+
+                        # Canonical: normalize both to canonical form
+                        # (W<=L + yaw [0,pi)) before computing angle
+                        R_pred_c = _canonicalize_rotation_np(
+                            d["R_cam"], d["dimensions"]
+                        )
+                        R_gt_c = _canonicalize_rotation_np(
+                            gt[m]["R_cam"], gt[m]["dimensions"]
+                        )
+                        angle_c = so3_relative_angle(
+                            torch.tensor(R_pred_c)[None],
+                            torch.tensor(R_gt_c)[None],
+                            cos_bound=1e-2,
+                            eps=1e-3,
+                        ).item()
+                        oem_canonical[tind, dind] = angle_c / np.pi
                     except ValueError as e:
                         # Skip invalid rotation matrix pairs
                         # This can happen when GT or prediction has numerical precision issues
@@ -1548,6 +1412,7 @@ class Detect3Deval(COCOeval):
                         # Set to maximum error (180 degrees = 1.0 in normalized units)
                         oem[tind, dind] = 1.0
                         oem_sym[tind, dind] = 1.0
+                        oem_canonical[tind, dind] = 1.0
 
                     # Scale Error (same for both modes)
                     min_whl = np.minimum(
@@ -1597,6 +1462,7 @@ class Detect3Deval(COCOeval):
             "dtScaleError": sem,
             "dtOrientationError": oem,
             "dtOrientationErrorSym": oem_sym,
+            "dtOrientationErrorCanonical": oem_canonical,
         }
 
     def summarize(self):

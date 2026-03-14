@@ -90,12 +90,9 @@ class Omni3DEvaluator(Evaluator):
             "Objectron_test",
         ),
         per_class_eval: bool = True,
-        # APRel3D parameters
+        # APRel3D parameters (LabelAny3D-style)
         enable_aprel3d: bool = False,
-        scale_search_min: float | None = None,
-        scale_search_max: float | None = None,
-        scale_search_steps: int | None = None,
-        scale_optimize_method: str = "A",  # "A" = score-weighted, "B" = match-first
+        aprel_2d_iou_thresh: float = 0.75,
         # Mini dataset support
         use_mini_dataset: bool = False,
     ) -> None:
@@ -107,10 +104,7 @@ class Omni3DEvaluator(Evaluator):
             datasets: List of dataset names to evaluate.
             per_class_eval: Whether to evaluate per-class metrics.
             enable_aprel3d: Whether to enable APRel3D evaluation.
-            scale_search_min: Minimum scale for APRel3D search.
-            scale_search_max: Maximum scale for APRel3D search.
-            scale_search_steps: Number of scale steps for APRel3D search.
-            scale_optimize_method: Scale optimization method ("A" or "B").
+            aprel_2d_iou_thresh: 2D IoU threshold for matching (default 0.75).
             use_mini_dataset: If True, use annotations_mini100/ for GT.
         """
         super().__init__()
@@ -118,7 +112,7 @@ class Omni3DEvaluator(Evaluator):
         self.dataset_names = datasets
         self.per_class_eval = per_class_eval
         self.enable_aprel3d = enable_aprel3d
-        self.scale_optimize_method = scale_optimize_method
+        self.aprel_2d_iou_thresh = aprel_2d_iou_thresh
         self.use_mini_dataset = use_mini_dataset
 
         # Each dataset evaluator is stored here
@@ -157,10 +151,7 @@ class Omni3DEvaluator(Evaluator):
                     "Objectron" in dataset_name or "SUNRGBD" in dataset_name
                 ),
                 enable_aprel3d=enable_aprel3d,
-                scale_search_min=scale_search_min,
-                scale_search_max=scale_search_max,
-                scale_search_steps=scale_search_steps,
-                scale_optimize_method=scale_optimize_method,
+                aprel_2d_iou_thresh=aprel_2d_iou_thresh,
             )
 
             self.overall_imgIds.update(
@@ -301,15 +292,21 @@ class Omni3DEvaluator(Evaluator):
             all_ase = []
             all_aoe = []
             all_aoe_sym = []
+            all_aoe_canonical = []
             all_ods_sym = []
+            all_ods_canonical = []
 
             # Determine which keys to look for based on mode
             if self.enable_aprel3d:
                 ase_key, aoe_key, aoe_sym_key = "ASERel", "AOERel", "AOERelSym"
+                aoe_canonical_key = "AOERelCanonical"
                 ods_sym_key = "ODSRelSym"
+                ods_canonical_key = "ODSRelCanonical"
             else:
                 ase_key, aoe_key, aoe_sym_key = "ASE", "AOE", "AOE_Sym"
+                aoe_canonical_key = "AOE_Canonical"
                 ods_sym_key = "ODS_Sym"
+                ods_canonical_key = "ODS_Canonical"
 
             for dataset_name in self.dataset_names:
                 per_dataset_log_dict = per_dataset_results[dataset_name]
@@ -319,13 +316,19 @@ class Omni3DEvaluator(Evaluator):
                     all_aoe.append(per_dataset_log_dict[aoe_key])
                 if aoe_sym_key in per_dataset_log_dict and not np.isnan(per_dataset_log_dict[aoe_sym_key]):
                     all_aoe_sym.append(per_dataset_log_dict[aoe_sym_key])
+                if aoe_canonical_key in per_dataset_log_dict and not np.isnan(per_dataset_log_dict[aoe_canonical_key]):
+                    all_aoe_canonical.append(per_dataset_log_dict[aoe_canonical_key])
                 if ods_sym_key in per_dataset_log_dict and not np.isnan(per_dataset_log_dict[ods_sym_key]):
                     all_ods_sym.append(per_dataset_log_dict[ods_sym_key])
+                if ods_canonical_key in per_dataset_log_dict and not np.isnan(per_dataset_log_dict[ods_canonical_key]):
+                    all_ods_canonical.append(per_dataset_log_dict[ods_canonical_key])
 
             log_dict[ase_key] = np.mean(all_ase) if len(all_ase) > 0 else float("nan")
             log_dict[aoe_key] = np.mean(all_aoe) if len(all_aoe) > 0 else float("nan")
             log_dict[aoe_sym_key] = np.mean(all_aoe_sym) if len(all_aoe_sym) > 0 else float("nan")
+            log_dict[aoe_canonical_key] = np.mean(all_aoe_canonical) if len(all_aoe_canonical) > 0 else float("nan")
             log_dict[ods_sym_key] = np.mean(all_ods_sym) if len(all_ods_sym) > 0 else float("nan")
+            log_dict[ods_canonical_key] = np.mean(all_ods_canonical) if len(all_ods_canonical) > 0 else float("nan")
 
         if self.per_class_eval:
             precisions = evaluator.eval["precision"]

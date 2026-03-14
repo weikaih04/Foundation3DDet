@@ -169,6 +169,7 @@ def get_in_the_wild_evaluator_cfg(
     data_root: str = "data/in_the_wild",
     iou_type: str = "bbox",
     human_filtered: bool = True,
+    enable_aprel3d: bool = False,
 ) -> ConfigDict:
     """Get InTheWild evaluator config.
 
@@ -203,6 +204,7 @@ def get_in_the_wild_evaluator_cfg(
         annotation=annotation,
         freq_rare_thresh=5,
         freq_freq_thresh=20,
+        enable_aprel3d=enable_aprel3d,
     )
 
 
@@ -211,6 +213,7 @@ def get_in_the_wild_eval_callbacks(
     output_dir: FieldReference | str = "",
     eval_connector_mapping: dict | None = None,
     test_connector: ConfigDict | None = None,
+    enable_aprel3d: bool = False,
 ) -> list[ConfigDict]:
     """Get InTheWild evaluation callbacks: 2D AP, 3D AP (bbox), 3D AP (dist).
 
@@ -221,6 +224,7 @@ def get_in_the_wild_eval_callbacks(
             Ignored if test_connector is provided.
         test_connector: Pre-built connector config (SAM3_3D). If None,
             builds CallbackConnector from eval_connector_mapping.
+        enable_aprel3d: Whether to enable APRel3D (per-image scale alignment).
 
     Returns:
         List of EvaluatorCallback configs.
@@ -243,6 +247,7 @@ def get_in_the_wild_eval_callbacks(
             evaluator=get_in_the_wild_evaluator_cfg(
                 data_root=data_root,
                 iou_type="bbox",
+                enable_aprel3d=enable_aprel3d,
             ),
             metrics_to_eval=["2D", "3D"],
             save_predictions=True,
@@ -259,6 +264,117 @@ def get_in_the_wild_eval_callbacks(
             evaluator=get_in_the_wild_evaluator_cfg(
                 data_root=data_root,
                 iou_type="dist",
+                enable_aprel3d=enable_aprel3d,
+            ),
+            metrics_to_eval=["3D"],
+            save_predictions=True,
+            output_dir=output_dir,
+            save_prefix="detection_dist",
+            test_connector=test_connector,
+        )
+    )
+
+    return cbs
+
+
+def get_stereo4d_evaluator_cfg(
+    data_root: str = "data/in_the_wild",
+    iou_type: str = "bbox",
+    enable_aprel3d: bool = False,
+) -> ConfigDict:
+    """Get Stereo4D tinyval evaluator config.
+
+    Uses Detect3DEvaluator for the Stereo4D tinyval benchmark:
+    500 images with real stereo depth and human-reviewed 3D boxes.
+
+    APr/APc/APf thresholds: rare<5 images, common 5-10, frequent>=10.
+
+    Args:
+        data_root: Root directory for data.
+        iou_type: "bbox" for 3D IoU matching, "dist" for center distance.
+
+    Returns:
+        ConfigDict: Evaluator configuration.
+    """
+    from opendet3d.data.datasets.stereo4d import load_stereo4d_class_map
+
+    annotation = os.path.join(
+        data_root, "annotations/Stereo4D_tinyval.json"
+    )
+    class_map = load_stereo4d_class_map(annotation)
+    det_map = {name: i for i, name in enumerate(sorted(class_map.keys()))}
+
+    return class_config(
+        Detect3DEvaluator,
+        det_map=det_map,
+        cat_map=class_map,
+        eval_prox=False,
+        iou_type=iou_type,
+        num_columns=4,
+        annotation=annotation,
+        freq_rare_thresh=5,
+        freq_freq_thresh=10,
+        enable_aprel3d=enable_aprel3d,
+    )
+
+
+def get_stereo4d_eval_callbacks(
+    data_root: str = "data/in_the_wild",
+    output_dir: FieldReference | str = "",
+    eval_connector_mapping: dict | None = None,
+    test_connector: ConfigDict | None = None,
+    enable_aprel3d: bool = False,
+) -> list[ConfigDict]:
+    """Get Stereo4D tinyval evaluation callbacks: 2D AP, 3D AP (bbox), 3D AP (dist).
+
+    Args:
+        data_root: Root directory for data.
+        output_dir: Output directory for saving predictions.
+        eval_connector_mapping: Key mapping for CallbackConnector (GDino3D).
+            Ignored if test_connector is provided.
+        test_connector: Pre-built connector config (SAM3_3D). If None,
+            builds CallbackConnector from eval_connector_mapping.
+        enable_aprel3d: Whether to enable APRel3D (per-image scale alignment).
+
+    Returns:
+        List of EvaluatorCallback configs.
+    """
+    if test_connector is None:
+        from opendet3d.zoo.gdino3d.base.connector import CONN_COCO_DET3D_EVAL
+
+        if eval_connector_mapping is None:
+            eval_connector_mapping = CONN_COCO_DET3D_EVAL
+        test_connector = class_config(
+            CallbackConnector, key_mapping=eval_connector_mapping
+        )
+
+    cbs = []
+
+    # 2D + 3D AP (bbox mode: 3D IoU matching)
+    cbs.append(
+        class_config(
+            EvaluatorCallback,
+            evaluator=get_stereo4d_evaluator_cfg(
+                data_root=data_root,
+                iou_type="bbox",
+                enable_aprel3d=enable_aprel3d,
+            ),
+            metrics_to_eval=["2D", "3D"],
+            save_predictions=True,
+            output_dir=output_dir,
+            save_prefix="detection_bbox",
+            test_connector=test_connector,
+        )
+    )
+
+    # 3D AP (dist mode: center distance matching)
+    cbs.append(
+        class_config(
+            EvaluatorCallback,
+            evaluator=get_stereo4d_evaluator_cfg(
+                data_root=data_root,
+                iou_type="dist",
+                enable_aprel3d=enable_aprel3d,
             ),
             metrics_to_eval=["3D"],
             save_predictions=True,

@@ -61,7 +61,7 @@ def get_scannet_data_cfg(
         cached_file_path=test_cached_file_path,
     )
 
-    test_preprocess_cfg = get_test_transforms_cfg(shape=shape)
+    test_preprocess_cfg = get_test_transforms_cfg(shape=shape, with_depth=with_depth)
 
     return class_config(
         DataPipe, datasets=test_dataset_cfg, preprocess_fn=test_preprocess_cfg
@@ -99,7 +99,7 @@ def get_av2_data_cfg(
         cached_file_path=test_cached_file_path,
     )
 
-    test_preprocess_cfg = get_test_transforms_cfg(shape=shape)
+    test_preprocess_cfg = get_test_transforms_cfg(shape=shape, with_depth=with_depth)
 
     return class_config(
         DataPipe, datasets=test_dataset_cfg, preprocess_fn=test_preprocess_cfg
@@ -142,7 +142,7 @@ def get_labelany3d_coco_data_cfg(
         cached_file_path=test_cached_file_path,
     )
 
-    test_preprocess_cfg = get_test_transforms_cfg(shape=shape)
+    test_preprocess_cfg = get_test_transforms_cfg(shape=shape, with_depth=with_depth)
 
     return class_config(
         DataPipe, datasets=test_dataset_cfg, preprocess_fn=test_preprocess_cfg

@@ -211,7 +211,7 @@ def get_unidepth_v2_backend_cfg(
 
 def get_lingbot_depth_backend_cfg(
     params: ExperimentParameters,
-    pretrained_model: str = "robbyant/lingbot-depth-postrain-dc-vitl14",
+    pretrained_model: str = "pretrained/lingbot-depth/postrain-dc-vitl14/model.pt",
     num_tokens: int = 2400,
     target_latent_dim: int = 128,
     depth_loss_weight: float = 1.0,
@@ -531,7 +531,7 @@ def get_gdino3d_with_geometry_backend_cfg(
     unidepth_v2_encoder_pretrained: str | None = None,
     unidepth_v2_decoder_pretrained: str | None = None,
     # LingBot-Depth options
-    lingbot_pretrained_model: str = "robbyant/lingbot-depth-postrain-dc-vitl14",
+    lingbot_pretrained_model: str = "pretrained/lingbot-depth/postrain-dc-vitl14/model.pt",
     lingbot_num_tokens: int = 2400,
     lingbot_monocular_prob: float = 0.7,
     lingbot_masked_prob: float = 0.2,

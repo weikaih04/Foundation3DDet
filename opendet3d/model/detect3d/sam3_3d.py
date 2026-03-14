@@ -1258,21 +1258,25 @@ class SAM3_3D(nn.Module):
         device = pred_logits.device
         B_images = batch.images.shape[0]
 
-        # 2D confidence (foreground/background)
-        scores_all = pred_logits.sigmoid().squeeze(-1)  # (N_prompts, S)
+        # 2D confidence (foreground/background) - used for threshold & NMS
+        scores_2d = pred_logits.sigmoid().squeeze(-1)  # (N_prompts, S)
 
-        # Add 3D quality score if available
-        # final_score = 2d_score + weight * 3d_score
-        # 2D head handles "is there an object?", 3D head handles "is the 3D accurate?"
+        # 3D confidence (depth/geometry quality) - tracked separately
+        scores_3d_all = None
+        if pred_conf_3d is not None:
+            scores_3d_all = pred_conf_3d.sigmoid().squeeze(-1)  # (N_prompts, S)
+
+        # Combined score for ranking (NMS tie-breaking etc)
         # SAM3_3D_CONF_WEIGHT env var overrides config (e.g., "0.0" for 2D only)
         import os
         conf_weight = self.eval_3d_conf_weight
         conf_weight_override = os.environ.get("SAM3_3D_CONF_WEIGHT", None)
         if conf_weight_override is not None:
             conf_weight = float(conf_weight_override)
-        if pred_conf_3d is not None and conf_weight > 0:
-            conf_3d = pred_conf_3d.sigmoid().squeeze(-1)  # (N_prompts, S)
-            scores_all = scores_all + conf_weight * conf_3d
+        if scores_3d_all is not None and conf_weight > 0:
+            scores_all = scores_2d + conf_weight * scores_3d_all
+        else:
+            scores_all = scores_2d
 
         # Apply presence score if available (following SAM3 original postprocessors.py)
         # Presence score indicates whether a category has objects in the image
@@ -1284,6 +1288,7 @@ class SAM3_3D(nn.Module):
             if presence_score.dim() == 1:
                 presence_score = presence_score.unsqueeze(-1)
             scores_all = scores_all * presence_score  # (N_prompts, S) * (N_prompts, 1)
+            scores_2d = scores_2d * presence_score  # Also apply to 2D scores
 
         # Scale boxes to pixel coordinates
         # pred_boxes_2d is normalized xyxy [0, 1]
@@ -1295,6 +1300,8 @@ class SAM3_3D(nn.Module):
         boxes_list = []
         boxes3d_list = []
         scores_list = []
+        scores_2d_list = []
+        scores_3d_list = []
         class_ids_list = []
 
         # Get parameters from roi2det3d if available
@@ -1339,6 +1346,8 @@ class SAM3_3D(nn.Module):
                 boxes_list.append(torch.zeros(0, 4, device=device))
                 boxes3d_list.append(torch.zeros(0, 10, device=device))
                 scores_list.append(torch.zeros(0, device=device))
+                scores_2d_list.append(torch.zeros(0, device=device))
+                scores_3d_list.append(torch.zeros(0, device=device))
                 class_ids_list.append(torch.zeros(0, dtype=torch.long, device=device))
                 continue
 
@@ -1404,6 +1413,14 @@ class SAM3_3D(nn.Module):
                 img_boxes_flat = img_boxes[prompt_indices, best_indices]
                 img_class_ids_flat = img_class_ids
 
+                # Track 2D and 3D scores for oracle mode
+                img_scores_2d_flat = scores_2d[prompt_mask][prompt_indices, best_indices]
+                if scores_3d_all is not None:
+                    img_scores_3d = scores_3d_all[prompt_mask]
+                    img_scores_3d_flat = img_scores_3d[prompt_indices, best_indices]
+                else:
+                    img_scores_3d_flat = torch.zeros_like(img_scores_flat)
+
                 if pred_boxes_3d is not None:
                     img_boxes3d = pred_boxes_3d[prompt_mask]
                     img_boxes3d_flat = img_boxes3d[prompt_indices, best_indices]
@@ -1416,6 +1433,16 @@ class SAM3_3D(nn.Module):
                 img_scores_flat = img_scores.flatten()  # (n_prompts * S,)
                 img_boxes_flat = img_boxes.reshape(-1, 4)  # (n_prompts * S, 4)
 
+                # Track 2D scores separately for threshold filtering and output
+                img_scores_2d = scores_2d[prompt_mask].flatten()  # (n_prompts * S,)
+                img_scores_2d_flat = img_scores_2d  # alias for output
+
+                # Track 3D scores
+                if scores_3d_all is not None:
+                    img_scores_3d_flat = scores_3d_all[prompt_mask].flatten()
+                else:
+                    img_scores_3d_flat = torch.zeros_like(img_scores_flat)
+
                 # Expand class_ids to match flattened shape
                 img_class_ids_flat = img_class_ids.unsqueeze(1).expand(-1, S).flatten()  # (n_prompts * S,)
 
@@ -1426,10 +1453,13 @@ class SAM3_3D(nn.Module):
                 else:
                     img_boxes3d_flat = None
 
-                # Score threshold filter
+                # Score threshold filter (uses 2D score only)
                 if score_threshold > 0:
-                    keep = img_scores_flat > score_threshold
+                    keep = img_scores_2d > score_threshold
                     img_scores_flat = img_scores_flat[keep]
+                    img_scores_2d_flat = img_scores_2d_flat[keep]
+                    img_scores_2d = img_scores_2d[keep]
+                    img_scores_3d_flat = img_scores_3d_flat[keep]
                     img_boxes_flat = img_boxes_flat[keep]
                     img_class_ids_flat = img_class_ids_flat[keep]
                     if img_boxes3d_flat is not None:
@@ -1445,6 +1475,8 @@ class SAM3_3D(nn.Module):
                             img_boxes_flat, img_scores_flat, img_class_ids_flat, iou_threshold
                         )
                     img_scores_flat = img_scores_flat[keep]
+                    img_scores_2d_flat = img_scores_2d_flat[keep]
+                    img_scores_3d_flat = img_scores_3d_flat[keep]
                     img_boxes_flat = img_boxes_flat[keep]
                     img_class_ids_flat = img_class_ids_flat[keep]
                     if img_boxes3d_flat is not None:
@@ -1517,6 +1549,8 @@ class SAM3_3D(nn.Module):
             boxes_list.append(img_boxes_flat)
             boxes3d_list.append(decoded_boxes3d)
             scores_list.append(img_scores_flat)
+            scores_2d_list.append(img_scores_2d_flat)
+            scores_3d_list.append(img_scores_3d_flat)
             class_ids_list.append(img_class_ids_flat)
 
         # Get depth maps if available
@@ -1537,6 +1571,8 @@ class SAM3_3D(nn.Module):
             depth_maps=depth_maps,
             categories=None,
             predicted_intrinsics=predicted_intrinsics,
+            scores_3d=scores_3d_list,
+            scores_2d=scores_2d_list,
         )
 
     def _build_find_stage(

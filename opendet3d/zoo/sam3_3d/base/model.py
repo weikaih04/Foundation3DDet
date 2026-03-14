@@ -128,6 +128,7 @@ def get_sam3_3d_cfg(
     unpad_test: bool = True,
     eval_3d_conf_weight: float = 0.5,
     ambiguous_rotation: bool = False,
+    canonical_rotation: bool = False,
 ) -> tuple[ConfigDict, ConfigDict]:
     """Get SAM3_3D model configuration.
 
@@ -142,6 +143,8 @@ def get_sam3_3d_cfg(
             no NMS) for measuring 3D regression with GT box prompts.
         ambiguous_rotation: If True, normalize GT rotation to [0, 180) yaw
             range to eliminate 180-degree rotation ambiguity.
+        canonical_rotation: If True, normalize dims to W<=L and yaw
+            to [0, pi) for canonical rotation representation.
 
     Returns:
         Tuple of (model_cfg, box_coder_cfg).
@@ -150,6 +153,7 @@ def get_sam3_3d_cfg(
     box_coder = class_config(
         GroundingDINO3DCoder,
         ambiguous_rotation=ambiguous_rotation,
+        canonical_rotation=canonical_rotation,
     )
 
     # Note: bbox3d_head is NOT created here - let SAM3_3D create it automatically
@@ -177,7 +181,7 @@ def get_sam3_3d_cfg(
         )
         geometry_backend = class_config(
             LingbotDepthBackend,
-            pretrained_model="robbyant/lingbot-depth-postrain-dc-vitl14",
+            pretrained_model="pretrained/lingbot-depth/postrain-dc-vitl14/model.pt",
             num_tokens=2400,
             target_latent_dim=256,
             depth_loss_weight=1.0,
