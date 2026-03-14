@@ -27,6 +27,10 @@ def get_threeeed_dataset_cfg(
     cache_as_binary: bool = False,
     use_mini_dataset: bool = False,
     mini_dataset_size: int = 100,
+    truncation_thres: float = 0.33333333,
+    visibility_thres: float = 0.33333333,
+    min_height_thres: float = 0.0625,
+    max_height_thres: float = 1.50,
 ) -> list[ConfigDict]:
     """Get dataset configs for 3EED.
 
@@ -40,6 +44,10 @@ def get_threeeed_dataset_cfg(
         cache_as_binary: Whether to cache as binary.
         use_mini_dataset: If True, use mini dataset cache.
         mini_dataset_size: Size of mini dataset.
+        truncation_thres: Truncation threshold for is_ignore.
+        visibility_thres: Visibility threshold for is_ignore.
+        min_height_thres: Min box height ratio for is_ignore.
+        max_height_thres: Max box height ratio for is_ignore.
     """
     if use_mini_dataset:
         cached_dir = os.path.join(
@@ -71,6 +79,10 @@ def get_threeeed_dataset_cfg(
             cached_file_path=os.path.join(
                 cached_dir, f"{dataset}.pkl"
             ),
+            truncation_thres=truncation_thres,
+            visibility_thres=visibility_thres,
+            min_height_thres=min_height_thres,
+            max_height_thres=max_height_thres,
         )
 
         dataset_cfg_list.append(dataset_cfg)
@@ -86,6 +98,10 @@ def get_threeeed_train_cfg(
     cache_as_binary: bool = True,
     use_mini_dataset: bool = False,
     mini_dataset_size: int = 100,
+    truncation_thres: float = 0.50,
+    visibility_thres: float = 0.1,
+    min_height_thres: float = 0.0,
+    max_height_thres: float = 1.50,
 ) -> ConfigDict:
     """Get train config for 3EED.
 
@@ -97,6 +113,10 @@ def get_threeeed_train_cfg(
         cache_as_binary: Whether to cache as binary.
         use_mini_dataset: If True, use mini dataset cache.
         mini_dataset_size: Size of mini dataset.
+        truncation_thres: Truncation threshold (default 0.99, relaxed).
+        visibility_thres: Visibility threshold (default 0.0, relaxed).
+        min_height_thres: Min height ratio (default 0.0, relaxed).
+        max_height_thres: Max height ratio (default 1.50).
     """
     train_dataset_cfg = get_threeeed_dataset_cfg(
         data_root=data_root,
@@ -107,6 +127,10 @@ def get_threeeed_train_cfg(
         cache_as_binary=cache_as_binary,
         use_mini_dataset=use_mini_dataset,
         mini_dataset_size=mini_dataset_size,
+        truncation_thres=truncation_thres,
+        visibility_thres=visibility_thres,
+        min_height_thres=min_height_thres,
+        max_height_thres=max_height_thres,
     )
 
     train_preprocess_cfg = get_train_transforms_cfg(shape=shape)

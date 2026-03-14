@@ -30,6 +30,11 @@ def get_omni3d_dataset_cfg(
     cache_as_binary: bool = False,
     use_mini_dataset: bool = False,
     mini_dataset_size: int = 100,
+    # Filtering thresholds (relaxed for training, strict for eval)
+    truncation_thres: float = 0.33333333,
+    visibility_thres: float = 0.33333333,
+    min_height_thres: float = 0.0625,
+    max_height_thres: float = 1.50,
 ) -> list[ConfigDict]:
     """Get the dataset configs for Omni3D.
 
@@ -43,6 +48,10 @@ def get_omni3d_dataset_cfg(
         cache_as_binary: Whether to cache as binary
         use_mini_dataset: If True, use mini dataset (cache_omni3d50_miniN)
         mini_dataset_size: Size of mini dataset (default: 100)
+        truncation_thres: Truncation threshold for is_ignore (default 0.333)
+        visibility_thres: Visibility threshold for is_ignore (default 0.333)
+        min_height_thres: Min box height ratio for is_ignore (default 0.0625)
+        max_height_thres: Max box height ratio for is_ignore (default 1.50)
     """
     if use_mini_dataset:
         cached_dir = os.path.join(data_root, f"cache_omni3d50_mini{mini_dataset_size}")
@@ -81,6 +90,10 @@ def get_omni3d_dataset_cfg(
             data_prefix="data",
             cache_as_binary=cache_as_binary,
             cached_file_path=os.path.join(cached_dir, f"{dataset}.pkl"),
+            truncation_thres=truncation_thres,
+            visibility_thres=visibility_thres,
+            min_height_thres=min_height_thres,
+            max_height_thres=max_height_thres,
         )
 
         dataset_cfg_list.append(dataset_cfg)
@@ -110,6 +123,11 @@ def get_omni3d_train_cfg(
     cache_as_binary: bool = True,
     use_mini_dataset: bool = False,
     mini_dataset_size: int = 100,
+    # Relaxed filtering for training (denser GT)
+    truncation_thres: float = 0.50,
+    visibility_thres: float = 0.1,
+    min_height_thres: float = 0.0,
+    max_height_thres: float = 1.50,
 ) -> ConfigDict:
     """Get the train config for Omni3D.
 
@@ -122,6 +140,10 @@ def get_omni3d_train_cfg(
         cache_as_binary: Whether to cache as binary
         use_mini_dataset: If True, use mini dataset for fast testing
         mini_dataset_size: Size of mini dataset (default: 100)
+        truncation_thres: Truncation threshold (default 0.99, relaxed)
+        visibility_thres: Visibility threshold (default 0.0, relaxed)
+        min_height_thres: Min height ratio (default 0.0, relaxed)
+        max_height_thres: Max height ratio (default 1.50)
     """
     train_dataset_cfg = get_omni3d_dataset_cfg(
         data_root=data_root,
@@ -133,6 +155,10 @@ def get_omni3d_train_cfg(
         cache_as_binary=cache_as_binary,
         use_mini_dataset=use_mini_dataset,
         mini_dataset_size=mini_dataset_size,
+        truncation_thres=truncation_thres,
+        visibility_thres=visibility_thres,
+        min_height_thres=min_height_thres,
+        max_height_thres=max_height_thres,
     )
 
     train_preprocess_cfg = get_train_transforms_cfg(shape=shape)
