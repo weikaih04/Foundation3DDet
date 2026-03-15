@@ -45,6 +45,11 @@ class COCO3DDataset(CacheMappingMixin, Dataset):
         text_prompt_mapping: dict[str, dict[str, str]] | None = None,
         cache_as_binary: bool = False,
         cached_file_path: str | None = None,
+        # Omni3DAPI filtering thresholds (passed to COCO3D)
+        truncation_thres: float = 0.33333333,
+        visibility_thres: float = 0.33333333,
+        min_height_thres: float = 0.0625,
+        max_height_thres: float = 1.50,
         **kwargs: ArgsType,
     ) -> None:
         """Creates an instance of the class."""
@@ -62,6 +67,12 @@ class COCO3DDataset(CacheMappingMixin, Dataset):
 
         self.data_prefix = data_prefix
         self.text_prompt_mapping = text_prompt_mapping
+
+        # Omni3DAPI filtering thresholds
+        self.truncation_thres = truncation_thres
+        self.visibility_thres = visibility_thres
+        self.min_height_thres = min_height_thres
+        self.max_height_thres = max_height_thres
 
         # Metric Depth
         if with_depth and not K.depth_maps in keys_to_load:
@@ -132,6 +143,10 @@ class COCO3DDataset(CacheMappingMixin, Dataset):
                     self.data_root, "annotations", self.annotation_file
                 ),
                 self.categories,
+                truncation_thres=self.truncation_thres,
+                visibility_thres=self.visibility_thres,
+                min_height_thres=self.min_height_thres,
+                max_height_thres=self.max_height_thres,
             )
 
         cats_map = {v: k for k, v in self.class_map.items()}
@@ -408,6 +423,9 @@ class COCO3D(COCO):
                 type(dataset) == dict
             ), f"annotation file format {type(dataset)} not supported"
             print(f"Done (t={time.time() - tic:.2f}s)")
+
+            if "info" not in dataset:
+                dataset["info"] = {"description": name}
 
             if type(dataset["info"]) == list:
                 dataset["info"] = dataset["info"][0]

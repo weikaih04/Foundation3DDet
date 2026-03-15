@@ -33,11 +33,13 @@ class Det3DOut(NamedTuple):
 
     boxes (list[Tensor]): 2D bounding boxes of shape [N, 4] in xyxy format.
     boxes3d (list[Tensor]): 3D bounding boxes of shape [N, 10].
-    scores (list[Tensor]): confidence scores of shape [N,].
+    scores (list[Tensor]): 2D confidence scores of shape [N,].
     class_ids (list[Tensor]): class ids of shape [N,].
     depth_maps (list[Tensor] | None): depth maps for each image.
     categories (list[list[str]] | None): category names for each detection.
     predicted_intrinsics (Tensor | None): predicted camera intrinsics (B, 3, 3).
+    scores_3d (list[Tensor] | None): 3D confidence scores of shape [N,].
+    scores_2d (list[Tensor] | None): pure 2D confidence scores of shape [N,].
     """
 
     boxes: list[Tensor]
@@ -47,6 +49,8 @@ class Det3DOut(NamedTuple):
     depth_maps: list[Tensor] | None
     categories: list[list[str]] | None = None
     predicted_intrinsics: Tensor | None = None
+    scores_3d: list[Tensor] | None = None
+    scores_2d: list[Tensor] | None = None
 
 
 class GroundingDINO3DOut(NamedTuple):
