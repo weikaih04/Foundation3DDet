@@ -40,6 +40,8 @@ def get_sam3_3d_loss_cfg(
     loss_3d_conf_weight: float = 20.0,
     conf_depth_weight: float = 0.7,
     conf_iou_3d_weight: float = 0.3,
+    # Presence loss
+    presence_loss_weight: float = 20.0,
     # Ignore box negative loss suppression
     use_ignore_suppress: bool = False,
     ignore_iou_threshold: float = 0.5,
@@ -89,6 +91,8 @@ def get_sam3_3d_loss_cfg(
         loss_opt_ssi_weight=loss_opt_ssi_weight,
         # Auxiliary loss
         aux_loss_weight=aux_loss_weight,
+        # Presence loss
+        presence_loss_weight=presence_loss_weight,
         # 3D Confidence Head
         use_3d_conf=use_3d_conf,
         loss_3d_conf_weight=loss_3d_conf_weight,

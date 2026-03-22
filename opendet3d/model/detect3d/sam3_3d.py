@@ -356,6 +356,9 @@ class SAM3_3D(nn.Module):
         # ========== Depth Input at Test Time ==========
         use_depth_input_test: bool = False,
 
+        # ========== Predicted Intrinsics ==========
+        use_predicted_intrinsics: bool = False,
+
         # ========== Eval Score Control ==========
         eval_3d_conf_weight: float = 0.5,
     ) -> None:
@@ -378,6 +381,11 @@ class SAM3_3D(nn.Module):
             oracle_eval: If True, use oracle evaluation mode where each
                 prompt gets top-1 prediction (no NMS, no score filtering).
                 For measuring 3D regression quality with GT box prompts.
+            use_predicted_intrinsics: If True, use geometry backend's
+                predicted intrinsics (K_pred) for 3D box decoding at test
+                time instead of batch.intrinsics (dataset/default).
+                Useful for in-the-wild images without GT intrinsics.
+                Can be overridden by env var SAM3_USE_PRED_K=1/0.
             eval_3d_conf_weight: Weight for 3D confidence in eval score.
                 final_score = 2d_score + weight * 3d_score.
                 Set to 0.0 to use only 2D confidence for eval.
@@ -414,6 +422,7 @@ class SAM3_3D(nn.Module):
         self.hidden_dim = sam3_model.hidden_dim
         self.oracle_eval = oracle_eval
         self.use_depth_input_test = use_depth_input_test
+        self.use_predicted_intrinsics = use_predicted_intrinsics
         self.eval_3d_conf_weight = eval_3d_conf_weight
 
         # 3D-MOOD components
@@ -1329,9 +1338,15 @@ class SAM3_3D(nn.Module):
         if iou_thresh_override is not None:
             iou_threshold = float(iou_thresh_override)
 
-        # Debug: print NMS config once at start
+        # Debug: print config once at start
         if not hasattr(self, '_nms_config_printed'):
             print(f"[NMS CONFIG] use_nms={use_nms}, class_agnostic={class_agnostic_nms}, iou_thresh={iou_threshold}, score_thresh={score_threshold}")
+            # Log predicted intrinsics setting
+            _use_pred_k = self.use_predicted_intrinsics
+            _pred_k_override = os.environ.get("SAM3_USE_PRED_K", None)
+            if _pred_k_override is not None:
+                _use_pred_k = _pred_k_override == "1"
+            print(f"[INTRINSICS CONFIG] use_predicted_intrinsics={_use_pred_k}")
             self._nms_config_printed = True
 
         S = scores_all.shape[1]  # predictions per prompt
@@ -1360,6 +1375,8 @@ class SAM3_3D(nn.Module):
                 img_class_ids = batch.gt_category_ids[prompt_mask]  # (n_prompts,) or (n_prompts, max_gt)
                 if img_class_ids.dim() > 1:
                     img_class_ids = img_class_ids[:, 0]  # Take first if multiple
+            elif batch.text_ids is not None:
+                img_class_ids = batch.text_ids[prompt_mask]
             else:
                 img_class_ids = torch.zeros(n_prompts_this_img, dtype=torch.long, device=device)
 
@@ -1486,10 +1503,22 @@ class SAM3_3D(nn.Module):
                         print(f"[NMS DEBUG] img={img_idx}, before={n_before_nms}, after={n_after_nms}, suppressed={n_before_nms - n_after_nms}, iou_thresh={iou_threshold}")
 
             # Decode 3D boxes in padded space BEFORE rescaling (matching GDino3D)
-            # Use padded-space intrinsics (batch.intrinsics) since 2D boxes are
-            # still in padded pixel coordinates at this point.
+            # Use padded-space intrinsics since 2D boxes are still in padded
+            # pixel coordinates at this point.
+            # When use_predicted_intrinsics is enabled, use geometry backend's
+            # K_pred (also in padded space) instead of dataset intrinsics.
             if img_boxes3d_flat is not None and self.box_coder is not None and len(img_boxes_flat) > 0:
-                intrinsics_this_img = batch.intrinsics[img_idx]  # (3, 3) padded-space
+                # Determine whether to use predicted intrinsics
+                use_pred_k = self.use_predicted_intrinsics
+                pred_k_override = os.environ.get("SAM3_USE_PRED_K", None)
+                if pred_k_override is not None:
+                    use_pred_k = pred_k_override == "1"
+
+                if use_pred_k and geom_out is not None and "K_pred" in geom_out and geom_out["K_pred"] is not None:
+                    intrinsics_this_img = geom_out["K_pred"][img_idx]  # (3, 3) padded-space
+                else:
+                    intrinsics_this_img = batch.intrinsics[img_idx]  # (3, 3) padded-space
+
                 decoded_boxes3d = self.box_coder.decode(
                     img_boxes_flat,  # pixel xyxy in padded space
                     img_boxes3d_flat,

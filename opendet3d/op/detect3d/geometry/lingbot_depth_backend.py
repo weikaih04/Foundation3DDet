@@ -27,6 +27,7 @@ from torch import Tensor
 from .base import GeometryBackendBase, GeometryBackendOutput
 from opendet3d.op.geometric.ray import generate_rays
 from opendet3d.op.loss.silog_loss import SILogLoss
+from unidepth.utils.misc import ssi_helper
 
 import utils3d
 
@@ -117,6 +118,7 @@ class LingbotDepthBackend(GeometryBackendBase):
         target_latent_dim: int = 128,
         depth_loss_weight: float = 1.0,
         silog_loss_weight: float = 0.5,
+        ssi_loss_weight: float = 0.5,
         affine_global_weight: float = 10.0,
         affine_local_weight: float = 10.0,
         edge_loss_weight: float = 10.0,
@@ -138,6 +140,7 @@ class LingbotDepthBackend(GeometryBackendBase):
         self.target_latent_dim = target_latent_dim
         self.depth_loss_weight = depth_loss_weight
         self.silog_loss_weight = silog_loss_weight
+        self.ssi_loss_weight = ssi_loss_weight
         self.affine_global_weight = affine_global_weight
         self.affine_local_weight = affine_local_weight
         self.edge_loss_weight = edge_loss_weight
@@ -679,101 +682,107 @@ class LingbotDepthBackend(GeometryBackendBase):
                     * self.silog_loss_weight
                 )
 
-            # Back-project to 3D points for MoGe2 losses
-            # 50% chance per image: use K_pred or GT intrinsics
-            # This trains intrinsic head via MoGe2 loss while keeping
-            # depth supervised with GT intrinsics half the time.
-            use_pred_k = torch.rand(B, device=depth_pred.device) < 0.5
-            K_for_pred = torch.where(
-                use_pred_k[:, None, None], K_pred, intrinsics
+            # SSI loss (scale-shift invariant)
+            if self.ssi_loss_weight > 0 and valid_mask.any():
+                scale, shift = ssi_helper(
+                    depth_gt[valid_mask], depth_pred[valid_mask]
+                )
+                depth_aligned = depth_pred * scale + shift
+                ssi_val = F.l1_loss(
+                    depth_aligned[valid_mask], depth_gt[valid_mask]
+                )
+                losses["opt_ssi"] = (
+                    ssi_val.clamp(max=10.0) * self.ssi_loss_weight
+                )
+
+            # Skip MoGe2 losses if all weights are 0
+            _skip_moge = (
+                self.affine_global_weight == 0
+                and self.affine_local_weight == 0
+                and self.edge_loss_weight == 0
             )
-            pred_points = backproject_depth_to_points(
-                depth_pred, K_for_pred, H, W
-            )  # [B, H, W, 3]
-            gt_points = backproject_depth_to_points(
-                depth_gt, intrinsics, H, W
-            )  # [B, H, W, 3]
-            # MoGe2 convention: invalid GT -> inf
-            gt_points[~valid_mask] = float("inf")
 
-            # Per-image MoGe2 losses (alignment is per-image)
-            zero = depth_pred.new_tensor(0.0)
-            aff_global_sum = zero
-            aff_local4_sum = zero
-            aff_local16_sum = zero
-            edge_sum = zero
+            # MoGe2 affine-invariant losses (skip if all weights are 0)
+            if not _skip_moge:
+                # Back-project to 3D points for MoGe2 losses
+                # 50% chance per image: use K_pred or GT intrinsics
+                use_pred_k = torch.rand(B, device=depth_pred.device) < 0.5
+                K_for_pred = torch.where(
+                    use_pred_k[:, None, None], K_pred, intrinsics
+                )
+                pred_points = backproject_depth_to_points(
+                    depth_pred, K_for_pred, H, W
+                )  # [B, H, W, 3]
+                gt_points = backproject_depth_to_points(
+                    depth_gt, intrinsics, H, W
+                )  # [B, H, W, 3]
+                gt_points[~valid_mask] = float("inf")
 
-            for i in range(B):
-                has_valid = valid_mask[i].any()
-                if has_valid:
-                    loss_g, _, scale_i = (
-                        affine_invariant_global_loss(
-                            pred_points[i],
-                            gt_points[i],
-                            align_resolution=48,
+                zero = depth_pred.new_tensor(0.0)
+                aff_global_sum = zero
+                aff_local4_sum = zero
+                aff_local16_sum = zero
+                edge_sum = zero
+
+                for i in range(B):
+                    has_valid = valid_mask[i].any()
+                    if has_valid:
+                        loss_g, _, scale_i = (
+                            affine_invariant_global_loss(
+                                pred_points[i],
+                                gt_points[i],
+                                align_resolution=48,
+                            )
                         )
-                    )
-                else:
-                    loss_g = zero
-                    scale_i = zero
-                aff_global_sum = aff_global_sum + loss_g
+                    else:
+                        loss_g = zero
+                        scale_i = zero
+                    aff_global_sum = aff_global_sum + loss_g
 
-                # MoGe2 local loss expects normalized focal
-                # (fx/W, fy/H ~0.5-1.0), not pixel focal
-                fx_norm = K_pred[i, 0, 0] / W
-                fy_norm = K_pred[i, 1, 1] / H
-                focal_i = 1.0 / (
-                    1.0 / fx_norm**2 + 1.0 / fy_norm**2
-                ) ** 0.5
+                    fx_norm = K_pred[i, 0, 0] / W
+                    fy_norm = K_pred[i, 1, 1] / H
+                    focal_i = 1.0 / (
+                        1.0 / fx_norm**2 + 1.0 / fy_norm**2
+                    ) ** 0.5
 
-                if has_valid:
-                    loss_l4, _ = affine_invariant_local_loss(
-                        pred_points[i],
-                        gt_points[i],
-                        focal_i,
-                        scale_i,
-                        level=4,
-                        align_resolution=24,
-                        num_patches=16,
-                        importance_sampling=False,
-                    )
-                    loss_l16, _ = affine_invariant_local_loss(
-                        pred_points[i],
-                        gt_points[i],
-                        focal_i,
-                        scale_i,
-                        level=16,
-                        align_resolution=12,
-                        num_patches=256,
-                        importance_sampling=False,
-                    )
-                    loss_e, _ = edge_loss(
-                        pred_points[i], gt_points[i]
-                    )
-                else:
-                    loss_l4 = zero
-                    loss_l16 = zero
-                    loss_e = zero
-                aff_local4_sum = aff_local4_sum + loss_l4
-                aff_local16_sum = aff_local16_sum + loss_l16
-                edge_sum = edge_sum + loss_e
+                    if has_valid:
+                        loss_l4, _ = affine_invariant_local_loss(
+                            pred_points[i], gt_points[i], focal_i, scale_i,
+                            level=4, align_resolution=24, num_patches=16,
+                            importance_sampling=False,
+                        )
+                        loss_l16, _ = affine_invariant_local_loss(
+                            pred_points[i], gt_points[i], focal_i, scale_i,
+                            level=16, align_resolution=12, num_patches=256,
+                            importance_sampling=False,
+                        )
+                        loss_e, _ = edge_loss(
+                            pred_points[i], gt_points[i]
+                        )
+                    else:
+                        loss_l4 = zero
+                        loss_l16 = zero
+                        loss_e = zero
+                    aff_local4_sum = aff_local4_sum + loss_l4
+                    aff_local16_sum = aff_local16_sum + loss_l16
+                    edge_sum = edge_sum + loss_e
 
-            losses["affine_global"] = (
-                (aff_global_sum / B).clamp(max=10.0)
-                * self.affine_global_weight
-            )
-            losses["affine_local_4"] = (
-                (aff_local4_sum / B).clamp(max=10.0)
-                * self.affine_local_weight
-            )
-            losses["affine_local_16"] = (
-                (aff_local16_sum / B).clamp(max=10.0)
-                * self.affine_local_weight
-            )
-            losses["edge"] = (
-                (edge_sum / B).clamp(max=10.0)
-                * self.edge_loss_weight
-            )
+                losses["affine_global"] = (
+                    (aff_global_sum / B).clamp(max=10.0)
+                    * self.affine_global_weight
+                )
+                losses["affine_local_4"] = (
+                    (aff_local4_sum / B).clamp(max=10.0)
+                    * self.affine_local_weight
+                )
+                losses["affine_local_16"] = (
+                    (aff_local16_sum / B).clamp(max=10.0)
+                    * self.affine_local_weight
+                )
+                losses["edge"] = (
+                    (edge_sum / B).clamp(max=10.0)
+                    * self.edge_loss_weight
+                )
 
             # Mask BCE loss (confidence map)
             # MoGe2 uses 3-state masks (fin / inf / unknown).

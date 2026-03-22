@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from collections import defaultdict
 
 import numpy as np
 import cv2
+from pycocotools import mask as maskUtils
 
+from vis4d.common.logging import rank_zero_info
 from vis4d.common.typing import ArgsType, DictStrAny
 from vis4d.data.const import CommonKeys as K
 
@@ -24,6 +28,7 @@ _DEPTH_DIRS = {
     "coco/train": f"{_V4_DEPTH_ROOT}/coco/train/depth",
     "obj365/val": f"{_V4_DEPTH_ROOT}/obj365/val/depth",
     "obj365/train": f"{_V4_DEPTH_ROOT}/obj365/train/depth",
+    "v3det/train": f"{_V4_DEPTH_ROOT}/v3det/train/depth",
 }
 
 # Confidence map directories (uint8 PNG, same resolution as depth)
@@ -32,6 +37,7 @@ _CONF_DIRS = {
     "coco/train": f"{_V4_DEPTH_ROOT}/coco/train/confidence",
     "obj365/val": f"{_V4_DEPTH_ROOT}/obj365/val/confidence",
     "obj365/train": f"{_V4_DEPTH_ROOT}/obj365/train/confidence",
+    "v3det/train": f"{_V4_DEPTH_ROOT}/v3det/train/confidence",
 }
 
 # Depth values in the .npy files are in mm; convert to meters
@@ -44,8 +50,11 @@ def _get_source_key_from_file_path(file_path: str) -> str:
     Handles both absolute paths (legacy) and HDF5 relative paths:
       /weka/.../coco/train2017/X.jpg       -> "coco/train"
       images/coco_train/X.jpg              -> "coco/train"
+      images/v3det_train/Q.../X.jpg        -> "v3det/train"
     """
-    if "coco/val2017" in file_path or "/coco_val/" in file_path:
+    if "/v3det_train/" in file_path:
+        return "v3det/train"
+    elif "coco/val2017" in file_path or "/coco_val/" in file_path:
         return "coco/val"
     elif "coco/train2017" in file_path or "/coco_train/" in file_path:
         return "coco/train"
@@ -113,6 +122,7 @@ class InTheWild3DDataset(COCO3DDataset):
         max_depth: float = 100.0,
         per_image_categories: bool = False,
         depth_confidence_threshold: int = 0,
+        mask_annotation_files: dict[str, str] | None = None,
         **kwargs: ArgsType,
     ) -> None:
         """Creates an instance of the class.
@@ -130,6 +140,11 @@ class InTheWild3DDataset(COCO3DDataset):
                 this threshold are set to 0 (invalid). Set to 0 to
                 disable confidence masking. Only applies when confidence
                 map exists for the image.
+            mask_annotation_files: Optional dict mapping source key
+                (e.g. "coco/train", "obj365/val") to the annotation
+                JSON path that contains segmentation masks. When
+                provided, masks are matched to each sample's boxes and
+                returned as "masks2d_rle" in __getitem__.
         """
         super().__init__(
             class_map=class_map,
@@ -139,6 +154,156 @@ class InTheWild3DDataset(COCO3DDataset):
         )
         self.per_image_categories = per_image_categories
         self.depth_confidence_threshold = depth_confidence_threshold
+
+        # Separate dict for mask RLEs (DatasetFromList serializes
+        # samples, so in-place mutation does not persist).
+        self._mask_rle_index: dict[int, list] = {}
+        if mask_annotation_files:
+            self._build_mask_index(mask_annotation_files)
+
+    def _build_mask_index(
+        self, mask_annotation_files: dict[str, str]
+    ) -> None:
+        """Load mask annotations and build per-sample mask index.
+
+        For each mask annotation file, builds an index by image filename,
+        then matches masks to ITW sample boxes by (x1, y1) coordinate
+        proximity.  Results are stored in self._mask_rle_index keyed
+        by sample index.
+
+        Args:
+            mask_annotation_files: {source_key: annotation_json_path}.
+        """
+        # Group samples by (source_key, basename) for matching
+        source_bn_to_indices = defaultdict(list)
+        for i in range(len(self.samples)):
+            sample = self.samples[i]
+            fp = sample["img"]["file_path"]
+            sk = _get_source_key_from_file_path(fp)
+            bn = fp.split("/")[-1]
+            source_bn_to_indices[(sk, bn)].append(i)
+
+        for source_key, ann_path in mask_annotation_files.items():
+            # Basenames we need from this source
+            needed_bns = {
+                bn
+                for (sk, bn) in source_bn_to_indices
+                if sk == source_key
+            }
+            if not needed_bns:
+                rank_zero_info(
+                    f"[masks] No ITW images for {source_key}, "
+                    "skipping."
+                )
+                continue
+
+            rank_zero_info(
+                f"[masks] Loading {source_key} from {ann_path} ..."
+            )
+            t0 = time.time()
+            with open(ann_path) as f:
+                data = json.load(f)
+            rank_zero_info(
+                f"[masks]   Loaded in {time.time() - t0:.1f}s "
+                f"({len(data.get('images', []))} images, "
+                f"{len(data.get('annotations', []))} annotations)"
+            )
+
+            # filename -> (mask_img_id, height, width)
+            fn_to_info = {}
+            for img in data["images"]:
+                fn = img.get("file_name", "").split("/")[-1]
+                if fn in needed_bns:
+                    fn_to_info[fn] = (
+                        img["id"],
+                        img["height"],
+                        img["width"],
+                    )
+
+            # Reverse lookup: mask_img_id -> (height, width)
+            mid_to_hw = {
+                v[0]: (v[1], v[2]) for v in fn_to_info.values()
+            }
+
+            rank_zero_info(
+                f"[masks]   Matched {len(fn_to_info)} images "
+                "by filename"
+            )
+
+            # mask_img_id -> [(x1, y1, rle_dict), ...]
+            needed_ids = set(mid_to_hw.keys())
+            mask_by_id = defaultdict(list)
+            for ann in data["annotations"]:
+                mid = ann["image_id"]
+                if mid not in needed_ids:
+                    continue
+                seg = ann.get("segmentation")
+                if seg is None:
+                    continue
+                bbox = ann["bbox"]  # xywh
+                # Convert polygon / uncompressed RLE to compressed
+                # RLE for uniform handling
+                hw = mid_to_hw.get(mid)
+                if hw is None:
+                    continue
+                if isinstance(seg, list):
+                    # Polygon format
+                    rles = maskUtils.frPyObjects(seg, hw[0], hw[1])
+                    seg = maskUtils.merge(rles)
+                elif isinstance(seg.get("counts"), list):
+                    # Uncompressed RLE (iscrowd) -> compress
+                    seg = maskUtils.frPyObjects(
+                        seg, hw[0], hw[1]
+                    )
+                mask_by_id[mid].append(
+                    (bbox[0], bbox[1], seg)
+                )
+
+            del data  # free raw JSON
+
+            # Match masks to ITW sample boxes
+            n_matched = 0
+            n_total = 0
+            for (sk, bn), indices in source_bn_to_indices.items():
+                if sk != source_key:
+                    continue
+                info = fn_to_info.get(bn)
+                if info is None:
+                    continue
+                mid = info[0]
+                masks_for_img = mask_by_id.get(mid, [])
+                if not masks_for_img:
+                    continue
+                for si in indices:
+                    sample = self.samples[si]
+                    boxes2d = sample["boxes2d"]  # (N, 4) xyxy
+                    masks_rle = []
+                    for box in boxes2d:
+                        x1 = float(box[0])
+                        y1 = float(box[1])
+                        matched = None
+                        for mx1, my1, rle in masks_for_img:
+                            if (
+                                abs(mx1 - x1) < 1.0
+                                and abs(my1 - y1) < 1.0
+                            ):
+                                matched = rle
+                                break
+                        masks_rle.append(matched)
+                        n_total += 1
+                        if matched is not None:
+                            n_matched += 1
+                    self._mask_rle_index[si] = masks_rle
+
+            rank_zero_info(
+                f"[masks]   Matched {n_matched}/{n_total} boxes "
+                f"for {source_key}"
+            )
+
+        rank_zero_info(
+            f"[masks] Total: {len(self._mask_rle_index)}"
+            f"/{len(self.samples)} samples have masks"
+        )
 
     def __getitem__(self, idx: int):
         """Get single sample, optionally with per-image category filtering."""
@@ -152,14 +317,27 @@ class InTheWild3DDataset(COCO3DDataset):
                 ]
             else:
                 data_dict[K.boxes2d_names] = []
+
+        # Forward pre-matched mask RLEs if available
+        masks_rle = self._mask_rle_index.get(idx)
+        if masks_rle is not None:
+            data_dict["masks2d_rle"] = masks_rle
+
         return data_dict
 
     def get_depth_filenames(self, img: DictStrAny) -> str | None:
         """Return path to the .npy depth file for this image."""
         file_path = img["file_path"]
         source_key = _get_source_key_from_file_path(file_path)
+        if source_key not in _DEPTH_DIRS:
+            return None
         depth_dir = _DEPTH_DIRS[source_key]
-        formatted_id = _get_formatted_id_from_file_path(file_path)
+        # V3Det uses formatted_id stored in the image entry because
+        # its filenames (e.g. 7_506_xxx.jpg) don't encode the ID.
+        if "formatted_id" in img:
+            formatted_id = img["formatted_id"]
+        else:
+            formatted_id = _get_formatted_id_from_file_path(file_path)
         depth_path = f"{depth_dir}/{formatted_id}_sr_1024_long.npy"
         return depth_path if os.path.exists(depth_path) else None
 
@@ -174,13 +352,17 @@ class InTheWild3DDataset(COCO3DDataset):
 
         # Apply MoGe2 confidence masking before resize
         if self.depth_confidence_threshold > 0:
-            file_path = sample["img"]["file_path"]
+            img_entry = sample["img"]
+            file_path = img_entry["file_path"]
             source_key = _get_source_key_from_file_path(file_path)
             conf_dir = _CONF_DIRS.get(source_key)
             if conf_dir is not None:
-                formatted_id = _get_formatted_id_from_file_path(
-                    file_path
-                )
+                if "formatted_id" in img_entry:
+                    formatted_id = img_entry["formatted_id"]
+                else:
+                    formatted_id = _get_formatted_id_from_file_path(
+                        file_path
+                    )
                 conf_path = f"{conf_dir}/{formatted_id}.png"
                 if os.path.exists(conf_path):
                     conf = cv2.imread(

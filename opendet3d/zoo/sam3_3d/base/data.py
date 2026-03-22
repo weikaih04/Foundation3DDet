@@ -35,6 +35,7 @@ _test_collator = None
 _oracle_collator = None
 _oracle_text_category_collator = None
 _5mode_collator = None
+_5mode_mask_pt_collator = None
 
 
 def sam3_3d_collate_fn(batch: List[dict], **kwargs):
@@ -164,8 +165,88 @@ def sam3_3d_5mode_collate_fn(batch: List[dict], **kwargs):
                 (0.4, 0.1),   # 40% mild jitter (~10% box size)
                 (0.1, 0.2),   # 10% moderate jitter (~20% box size)
             ],
+            include_negatives=True,
+            max_negatives_per_image=5,
         )
     return _5mode_collator(batch)
+
+
+_5mode_neg_pt_collator = None
+
+
+def sam3_3d_5mode_neg_pt_collate_fn(batch: List[dict], **kwargs):
+    """5-mode + negative sampling + point prompts collate function.
+
+    Same as sam3_3d_5mode_collate_fn but with:
+    - Negative sampling (10 per image) for presence loss training
+    - SAM3-style point prompts (budget 1-3, box_chance=0.5)
+
+    Args:
+        batch: List of data samples
+        **kwargs: Additional arguments from vis4d
+
+    Returns:
+        Collated batch data
+    """
+    global _5mode_neg_pt_collator
+    if _5mode_neg_pt_collator is None:
+        _5mode_neg_pt_collator = SAM3_3DCollator(
+            max_prompts_per_image=10,
+            use_text_prompts=True,
+            use_geometry_prompts=True,
+            text_only_prob=0.5,
+            use_label_prob=1/3,
+            box_noise_tiers=[
+                (0.5, 0.0),   # 50% no noise (exact GT box)
+                (0.4, 0.1),   # 40% mild jitter (~10% box size)
+                (0.1, 0.2),   # 10% moderate jitter (~20% box size)
+            ],
+            include_negatives=True,
+            max_negatives_per_image=5,
+            use_point_prompts=True,
+            num_positive_points=(1, 3),
+            box_chance=0.5,
+        )
+    return _5mode_neg_pt_collator(batch)
+
+
+def sam3_3d_5mode_mask_pt_collate_fn(batch: List[dict], **kwargs):
+    """5-mode + exclusive point/box + mask-based point sampling.
+
+    Branch 2 (GEOMETRY) uses exclusive mode:
+    - 70% box-only (no points)
+    - 30% point-only (no box), only when mask available
+    Points use SAM3 random_box mode: uniform from box region,
+    mask determines positive/negative labels.
+
+    Args:
+        batch: List of data samples
+        **kwargs: Additional arguments from vis4d
+
+    Returns:
+        Collated batch data
+    """
+    global _5mode_mask_pt_collator
+    if _5mode_mask_pt_collator is None:
+        _5mode_mask_pt_collator = SAM3_3DCollator(
+            max_prompts_per_image=10,
+            use_text_prompts=True,
+            use_geometry_prompts=True,
+            text_only_prob=0.5,
+            use_label_prob=1 / 3,
+            box_noise_tiers=[
+                (0.5, 0.0),  # 50% no noise (exact GT box)
+                (0.4, 0.1),  # 40% mild jitter (~10% box size)
+                (0.1, 0.2),  # 10% moderate jitter (~20% box size)
+            ],
+            include_negatives=True,
+            max_negatives_per_image=5,
+            use_point_prompts=True,
+            point_mode_prob=0.3,
+            num_positive_points=(1, 3),
+            point_sample_mode="random_box",
+        )
+    return _5mode_mask_pt_collator(batch)
 
 
 def create_sam3_3d_collate_fn(

@@ -188,7 +188,7 @@ def get_in_the_wild_evaluator_cfg(
     from opendet3d.data.datasets.in_the_wild import load_in_the_wild_class_map
 
     ann_name = (
-        "InTheWild_val_human_filtered" if human_filtered else "InTheWild_val"
+        "InTheWild_val_final" if human_filtered else "InTheWild_val"
     )
     annotation = os.path.join(data_root, f"annotations/{ann_name}.json")
     class_map = load_in_the_wild_class_map(annotation)

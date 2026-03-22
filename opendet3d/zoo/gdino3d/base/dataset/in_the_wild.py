@@ -30,6 +30,7 @@ def get_in_the_wild_dataset_cfg(
     visibility_thres: float = 0.33333333,
     min_height_thres: float = 0.0625,
     max_height_thres: float = 1.50,
+    mask_annotation_files: dict[str, str] | None = None,
 ) -> ConfigDict:
     """Get dataset config for a single InTheWild split.
 
@@ -55,21 +56,19 @@ def get_in_the_wild_dataset_cfg(
     )
     class_map = load_in_the_wild_class_map(annotation_path)
 
-    split = dataset_name.split("_")[-1]  # "train" or "val"
     depth_suffix = "_depth" if with_depth else ""
     if use_mini_dataset:
         cached_file_path = os.path.join(
             data_root,
             f"cache_mini{mini_dataset_size}",
-            f"{split}{depth_suffix}.pkl",
+            f"{dataset_name}{depth_suffix}.pkl",
         )
     else:
         cached_file_path = os.path.join(
-            data_root, f"{split}{depth_suffix}.pkl"
+            data_root, f"{dataset_name}{depth_suffix}.pkl"
         )
 
-    return class_config(
-        InTheWild3DDataset,
+    cfg_kwargs = dict(
         data_root=data_root,
         dataset_name=dataset_name,
         class_map=class_map,
@@ -85,11 +84,15 @@ def get_in_the_wild_dataset_cfg(
         min_height_thres=min_height_thres,
         max_height_thres=max_height_thres,
     )
+    if mask_annotation_files is not None:
+        cfg_kwargs["mask_annotation_files"] = mask_annotation_files
+
+    return class_config(InTheWild3DDataset, **cfg_kwargs)
 
 
 def get_in_the_wild_train_cfg(
     data_root: str = "data/in_the_wild",
-    train_dataset: str = "InTheWild_train",
+    train_dataset: str = "InTheWild_train_final",
     data_backend: None | ConfigDict = None,
     shape: tuple[int, int] = (800, 1333),
     cache_as_binary: bool = True,
@@ -100,6 +103,7 @@ def get_in_the_wild_train_cfg(
     visibility_thres: float = 0.1,
     min_height_thres: float = 0.0,
     max_height_thres: float = 1.50,
+    mask_annotation_files: dict[str, str] | None = None,
 ) -> ConfigDict:
     """Get the train config for InTheWild.
 
@@ -131,6 +135,7 @@ def get_in_the_wild_train_cfg(
         visibility_thres=visibility_thres,
         min_height_thres=min_height_thres,
         max_height_thres=max_height_thres,
+        mask_annotation_files=mask_annotation_files,
     )
 
     train_preprocess_cfg = get_train_transforms_cfg(shape=shape)
@@ -144,7 +149,7 @@ def get_in_the_wild_train_cfg(
 
 def get_in_the_wild_test_cfg(
     data_root: str = "data/in_the_wild",
-    test_dataset: str = "InTheWild_val_human_filtered",
+    test_dataset: str = "InTheWild_val_final",
     data_backend: None | ConfigDict = None,
     with_depth: bool = False,
     shape: tuple[int, int] = (800, 1333),

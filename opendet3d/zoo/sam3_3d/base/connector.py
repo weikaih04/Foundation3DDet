@@ -326,6 +326,24 @@ class SAM3_3DCollator:
         # Oracle evaluation mode (GT box as geometry prompt)
         oracle_eval: bool = False,  # If True, each GT box = one geometry prompt
         oracle_text_category: bool = False,  # If True, oracle + category text
+        # Point prompt: SAM3-style box/point budget (only when use_point_prompts=True)
+        # num_points is the total geometric prompt budget.
+        # box_chance controls probability of including a box (which takes 1 slot).
+        # E.g. num_points=(1,3), box_chance=0.5:
+        #   num=1, box=True → pure box | num=1, box=False → 1 point
+        #   num=2, box=True → box+1pt  | num=2, box=False → 2 points
+        #   num=3, box=True → box+2pt  | num=3, box=False → 3 points
+        box_chance: float = 0.5,
+        # Exclusive point mode probability. When use_point_prompts=True,
+        # Branch 2 randomly picks EITHER box-only OR point-only (never
+        # both). Point-only is chosen with probability point_mode_prob,
+        # but only when the selected box has a mask (masks2d_rle).
+        # Otherwise box-only. Points use SAM3 random_box mode: uniform
+        # from box region, mask determines pos/neg labels.
+        point_mode_prob: float = 0.3,
+        # Negative sampling (SAM3 style)
+        include_negatives: bool = False,  # Add negative queries (absent categories)
+        max_negatives_per_image: int = 5,  # Max negative queries per image
         # Training vs inference filtering
         filter_empty_boxes: bool = True,  # Set False at test time to keep 0-GT-box images
     ):
@@ -402,6 +420,14 @@ class SAM3_3DCollator:
         self.oracle_eval = oracle_eval
         self.oracle_text_category = oracle_text_category
 
+        # Point prompt: box/point budget
+        self.box_chance = box_chance
+        self.point_mode_prob = point_mode_prob
+
+        # Negative sampling (SAM3 style presence loss training)
+        self.include_negatives = include_negatives
+        self.max_negatives_per_image = max_negatives_per_image
+
         # Training vs inference filtering
         self.filter_empty_boxes = filter_empty_boxes
 
@@ -455,6 +481,53 @@ class SAM3_3DCollator:
             points = sample_points_without_mask(box_xyxy, n_pos, n_neg, H, W)
 
         return points
+
+    def _sample_geo_budget(self) -> tuple[int, bool]:
+        """Sample geometric prompt budget (SAM3 style).
+
+        Returns:
+            (n_points, use_box): number of point prompts and whether to
+            include a box. Box takes 1 slot from the total budget.
+        """
+        n_total = self._sample_num_points(self.num_positive_points)
+        if self.box_chance > 0:
+            use_box = random.random() < self.box_chance
+            n_points = max(n_total - int(use_box), 0)
+        else:
+            use_box = False
+            n_points = n_total
+        return n_points, use_box
+
+    def _sample_points_normalized(
+        self,
+        box_xyxy_pixel: np.ndarray,
+        n_points: int,
+        H: int,
+        W: int,
+        mask: Optional[np.ndarray] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample n_points from box region, return normalized coords + labels.
+
+        Returns:
+            pts_xy: (n_points, 2) normalized [0,1]
+            pts_labels: (n_points,) long, 1=positive 0=negative
+        """
+        if n_points <= 0:
+            return None, None
+        if mask is not None:
+            points = sample_points_from_mask(
+                mask, n_points, self.point_sample_mode, box_xyxy_pixel
+            )
+        else:
+            points = sample_points_without_mask(
+                box_xyxy_pixel, n_points, 0, H, W
+            )
+        pts_xy = torch.tensor(
+            points[:, :2] / np.array([W, H]),
+            dtype=torch.float32,
+        )
+        pts_labels = torch.tensor(points[:, 2], dtype=torch.long)
+        return pts_xy, pts_labels
 
     def __call__(self, batch: List[dict]) -> SAM3_3DBatchedInputs:
         """Collate batch of per-image samples to SAM3_3DBatchedInputs.
@@ -649,7 +722,8 @@ class SAM3_3DCollator:
         img_ids_list = []
         text_ids_list = []
         geo_boxes_list = []  # normalized cxcywh (for visual/geometry queries)
-        geo_points_list = []  # normalized xy with labels
+        geo_points_list = []  # normalized xy (N, 2) or None
+        geo_point_labels_list = []  # labels (N,) or None
         is_visual_query_list = []  # Track which queries have visual prompts
         # Query types (collator-level label only, does NOT control SAM3 internal matching):
         # 0=TEXT, 1=VISUAL, 2=GEOMETRY, 3=VISUAL+LABEL, 4=GEOMETRY+LABEL
@@ -767,6 +841,8 @@ class SAM3_3DCollator:
                     box_padded = transform_box_to_padded(boxes2d[box_idx])
                     box_norm_xyxy = normalize_box_xyxy(box_padded)
                     geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
+                    geo_points_list.append(None)
+                    geo_point_labels_list.append(None)
 
                     # Target = this single box (one-to-one)
                     gt_boxes2d_per_query.append(
@@ -859,6 +935,8 @@ class SAM3_3DCollator:
                     box_padded = transform_box_to_padded(boxes2d[box_idx])
                     box_norm_xyxy = normalize_box_xyxy(box_padded)
                     geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
+                    geo_points_list.append(None)
+                    geo_point_labels_list.append(None)
 
                     # Target = this single box (one-to-one)
                     gt_boxes2d_per_query.append(
@@ -977,11 +1055,13 @@ class SAM3_3DCollator:
 
                         is_text_only = random.random() < self.text_only_prob
                         if is_text_only:
-                            # TEXT: text="car", no box, all targets
+                            # TEXT: text="car", no box, no points, all targets
                             query_types_list.append(0)  # TEXT
                             is_visual_query_list.append(False)
                             text_ids_list.append(_get_text_id(cat_name))
                             geo_boxes_list.append(None)
+                            geo_points_list.append(None)
+                            geo_point_labels_list.append(None)
                         else:
                             # Box-based o2m query
                             has_label = random.random() < self.use_label_prob
@@ -997,6 +1077,9 @@ class SAM3_3DCollator:
                             is_visual_query_list.append(True)
                             _, geo_cxcywh = _make_geo_box(box_indices)
                             geo_boxes_list.append(geo_cxcywh)
+                            # Branch 1 visual: no point prompts (box only)
+                            geo_points_list.append(None)
+                            geo_point_labels_list.append(None)
 
                         # Targets: ALL boxes of this category (multi-target)
                         query_gt_boxes2d = []
@@ -1018,18 +1101,95 @@ class SAM3_3DCollator:
 
                         has_label_b2 = random.random() < self.use_label_prob
                         if has_label_b2:
-                            # GEOMETRY+LABEL: text="geometric: car", box, 1 target
+                            # GEOMETRY+LABEL: text="geometric: car", 1 target
                             query_types_list.append(4)  # GEOMETRY+LABEL
                             gl_text = f"{self.geometric_query_str}: {cat_name}"
                             text_ids_list.append(_get_text_id(gl_text))
                         else:
-                            # GEOMETRY: text="geometric", box, 1 target
+                            # GEOMETRY: text="geometric", 1 target
                             query_types_list.append(2)  # GEOMETRY
                             text_ids_list.append(_get_text_id(self.geometric_query_str))
                         is_visual_query_list.append(True)
 
                         selected_idx, geo_cxcywh = _make_geo_box(box_indices)
-                        geo_boxes_list.append(geo_cxcywh)
+
+                        # Decide geometric prompt mode for Branch 2
+                        if self.use_point_prompts:
+                            # Exclusive mode: box OR point, never both
+                            masks_rle = sample.get(
+                                "masks2d_rle", None
+                            )
+                            has_mask = (
+                                masks_rle is not None
+                                and selected_idx < len(masks_rle)
+                                and masks_rle[selected_idx]
+                                is not None
+                            )
+                            use_pt = (
+                                has_mask
+                                and random.random()
+                                < self.point_mode_prob
+                            )
+                            if use_pt:
+                                # Point-only (no box)
+                                from pycocotools import (
+                                    mask as maskUtils,
+                                )
+
+                                sel_mask = maskUtils.decode(
+                                    masks_rle[selected_idx]
+                                )
+                                sel_box = boxes2d[selected_idx]
+                                sel_box_np = (
+                                    sel_box.cpu().numpy()
+                                    if isinstance(
+                                        sel_box, torch.Tensor
+                                    )
+                                    else np.array(sel_box)
+                                )
+                                n_pts = self._sample_num_points(
+                                    self.num_positive_points
+                                )
+                                if n_pts == 1:
+                                    # Single point: always positive
+                                    # from mask interior
+                                    points = sample_points_from_mask(
+                                        sel_mask,
+                                        1,
+                                        "random_mask",
+                                    )
+                                else:
+                                    # Multi-point: random_box mode,
+                                    # mask determines pos/neg labels
+                                    points = sample_points_from_mask(
+                                        sel_mask,
+                                        n_pts,
+                                        "random_box",
+                                        sel_box_np,
+                                    )
+                                pts_xy = torch.tensor(
+                                    points[:, :2]
+                                    / np.array([W, H]),
+                                    dtype=torch.float32,
+                                )
+                                pts_labels = torch.tensor(
+                                    points[:, 2],
+                                    dtype=torch.long,
+                                )
+                                geo_boxes_list.append(None)
+                                geo_points_list.append(pts_xy)
+                                geo_point_labels_list.append(
+                                    pts_labels
+                                )
+                            else:
+                                # Box-only (no points)
+                                geo_boxes_list.append(geo_cxcywh)
+                                geo_points_list.append(None)
+                                geo_point_labels_list.append(None)
+                        else:
+                            geo_boxes_list.append(geo_cxcywh)
+                            geo_points_list.append(None)
+                            geo_point_labels_list.append(None)
 
                         # Target: ONLY the selected box (single-target)
                         query_gt_boxes2d = [normalize_box_xyxy(boxes2d[selected_idx])]
@@ -1091,6 +1251,9 @@ class SAM3_3DCollator:
                             geo_boxes_list.append(xyxy_to_cxcywh(box_norm_xyxy))
                         else:
                             geo_boxes_list.append(None)
+                        # Legacy mode: no point prompts
+                        geo_points_list.append(None)
+                        geo_point_labels_list.append(None)
 
                         # Multi-instance targets: ALL boxes of this category
                         query_gt_boxes2d = []
@@ -1105,6 +1268,41 @@ class SAM3_3DCollator:
                         ign_indices = cat_to_ignore_indices.get(cat_id, [])
                         query_ign = [normalize_box_xyxy(ignore_boxes2d_raw[i]) for i in ign_indices] if ign_indices and ignore_boxes2d_raw is not None else []
                         ignore_boxes2d_per_query.append(query_ign)
+
+                # ========== Negative sampling (SAM3 style) ==========
+                # Add TEXT queries for absent categories (num_gts=0).
+                # These train the presence head to predict "not present".
+                # SAM3 does this via COCO_FROM_JSON include_negatives=True.
+                if (
+                    self.include_negatives
+                    and class_names is not None
+                    and 0 < len(class_names) <= 100
+                ):
+                    present_cats = set(cat_to_box_indices.keys())
+                    all_cats = set(range(len(class_names)))
+                    absent_cats = list(all_cats - present_cats)
+
+                    if len(absent_cats) > self.max_negatives_per_image:
+                        absent_cats = random.sample(
+                            absent_cats, self.max_negatives_per_image
+                        )
+
+                    for neg_cat_id in absent_cats:
+                        neg_cat_name = class_names[neg_cat_id]
+                        img_ids_list.append(img_idx)
+                        gt_category_ids_list.append(neg_cat_id)
+                        query_types_list.append(0)  # TEXT (exhaustive)
+                        is_visual_query_list.append(False)
+                        if neg_cat_name not in text_to_id:
+                            text_to_id[neg_cat_name] = len(unique_texts)
+                            unique_texts.append(neg_cat_name)
+                        text_ids_list.append(text_to_id[neg_cat_name])
+                        geo_boxes_list.append(None)
+                        geo_points_list.append(None)
+                        geo_point_labels_list.append(None)
+                        gt_boxes2d_per_query.append([])
+                        gt_boxes3d_per_query.append(None)
+                        ignore_boxes2d_per_query.append([])
 
         profile_stop("  collator_category_group")
 
@@ -1166,9 +1364,57 @@ class SAM3_3DCollator:
                 dtype=torch.long, device=device
             )  # (N, 1)
 
+        # ========== Point prompts: pad to (N_prompts, max_P, 2) ==========
+        geo_points = None
+        geo_points_mask = None
+        geo_point_labels = None
+        has_points = any(p is not None for p in geo_points_list)
+        if has_points:
+            max_P = max(
+                len(p) for p in geo_points_list if p is not None
+            )
+            if max_P > 0:
+                pts_padded = []
+                pts_mask_list = []
+                pts_labels_padded = []
+                for pts, lbls in zip(
+                    geo_points_list, geo_point_labels_list
+                ):
+                    if pts is None or len(pts) == 0:
+                        pts_padded.append(
+                            torch.zeros(max_P, 2, device=device)
+                        )
+                        pts_mask_list.append(
+                            torch.ones(max_P, dtype=torch.bool, device=device)
+                        )
+                        pts_labels_padded.append(
+                            torch.zeros(max_P, dtype=torch.long, device=device)
+                        )
+                    else:
+                        n = len(pts)
+                        pad_n = max_P - n
+                        pts_padded.append(torch.cat([
+                            pts.to(device),
+                            torch.zeros(pad_n, 2, device=device),
+                        ]))
+                        pts_mask_list.append(torch.cat([
+                            torch.zeros(n, dtype=torch.bool, device=device),
+                            torch.ones(pad_n, dtype=torch.bool, device=device),
+                        ]))
+                        pts_labels_padded.append(torch.cat([
+                            lbls.to(device),
+                            torch.zeros(pad_n, dtype=torch.long, device=device),
+                        ]))
+                geo_points = torch.stack(pts_padded)          # (N, max_P, 2)
+                geo_points_mask = torch.stack(pts_mask_list)   # (N, max_P)
+                geo_point_labels = torch.stack(pts_labels_padded)  # (N, max_P)
+
         # ========== Multi-instance GT boxes: pad to (N_prompts, max_gt, 4) ==========
-        # Find max number of targets per query
-        max_gt = max(len(q) for q in gt_boxes2d_per_query) if gt_boxes2d_per_query else 1
+        # Find max number of targets per query (at least 1 for tensor shape)
+        max_gt = max(
+            (len(q) for q in gt_boxes2d_per_query), default=1
+        )
+        max_gt = max(max_gt, 1)  # Ensure at least 1 for padded tensor shape
         num_gts_list = []
 
         gt_boxes2d_padded = []
@@ -1176,7 +1422,10 @@ class SAM3_3DCollator:
             n_gt = len(query_boxes)
             num_gts_list.append(n_gt)
 
-            if n_gt < max_gt:
+            if n_gt == 0:
+                # Negative query: all-zero padding, num_gts=0
+                padded = [torch.zeros(4, device=device)] * max_gt
+            elif n_gt < max_gt:
                 # Pad with zeros
                 padded = query_boxes + [torch.zeros(4, device=device)] * (max_gt - n_gt)
             else:
@@ -1252,9 +1501,9 @@ class SAM3_3DCollator:
             geo_boxes=geo_boxes,
             geo_boxes_mask=geo_boxes_mask,
             geo_box_labels=geo_box_labels,
-            geo_points=None,  # Point prompts not implemented in per-category design yet
-            geo_points_mask=None,
-            geo_point_labels=None,
+            geo_points=geo_points,
+            geo_points_mask=geo_points_mask,
+            geo_point_labels=geo_point_labels,
             gt_boxes2d=gt_boxes2d,
             gt_boxes3d=gt_boxes3d,
             num_gts=num_gts,

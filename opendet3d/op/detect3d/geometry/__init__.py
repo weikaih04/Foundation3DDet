@@ -25,11 +25,24 @@ All backends support:
 """
 
 from .base import GeometryBackendBase, GeometryBackendOutput
-from .unidepth_head_backend import UniDepthHeadBackend
-from .detany3d_backend import DetAny3DGeometryBackend
-from .unidepth_v2_backend import UniDepthV2GeometryBackend
-from .unidepth_decoder_dino_only import UnidepthDecoderDinoOnly
 from .lingbot_depth_backend import LingbotDepthBackend
+
+# Lazy imports: these pull in heavy deps (xformers, DetAny3D, UniDepth)
+# that may not be available in all environments
+def __getattr__(name):
+    if name == "UniDepthHeadBackend":
+        from .unidepth_head_backend import UniDepthHeadBackend
+        return UniDepthHeadBackend
+    if name == "DetAny3DGeometryBackend":
+        from .detany3d_backend import DetAny3DGeometryBackend
+        return DetAny3DGeometryBackend
+    if name == "UniDepthV2GeometryBackend":
+        from .unidepth_v2_backend import UniDepthV2GeometryBackend
+        return UniDepthV2GeometryBackend
+    if name == "UnidepthDecoderDinoOnly":
+        from .unidepth_decoder_dino_only import UnidepthDecoderDinoOnly
+        return UnidepthDecoderDinoOnly
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "GeometryBackendBase",
