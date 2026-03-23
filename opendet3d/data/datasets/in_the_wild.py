@@ -191,10 +191,6 @@ class InTheWild3DDataset(COCO3DDataset):
                 if sk == source_key
             }
             if not needed_bns:
-                rank_zero_info(
-                    f"[masks] No ITW images for {source_key}, "
-                    "skipping."
-                )
                 continue
 
             rank_zero_info(
@@ -212,7 +208,12 @@ class InTheWild3DDataset(COCO3DDataset):
             # filename -> (mask_img_id, height, width)
             fn_to_info = {}
             for img in data["images"]:
-                fn = img.get("file_name", "").split("/")[-1]
+                fn = img.get("file_name")
+                if fn is None:
+                    # LVIS format: file_name is None, use id
+                    fn = f"{img['id']:012d}.jpg"
+                else:
+                    fn = fn.split("/")[-1]
                 if fn in needed_bns:
                     fn_to_info[fn] = (
                         img["id"],
@@ -256,7 +257,7 @@ class InTheWild3DDataset(COCO3DDataset):
                         seg, hw[0], hw[1]
                     )
                 mask_by_id[mid].append(
-                    (bbox[0], bbox[1], seg)
+                    (bbox[0], bbox[1], bbox[2], bbox[3], seg)
                 )
 
             del data  # free raw JSON
@@ -281,11 +282,16 @@ class InTheWild3DDataset(COCO3DDataset):
                     for box in boxes2d:
                         x1 = float(box[0])
                         y1 = float(box[1])
+                        # box is xyxy, mask bbox is xywh
+                        bw = float(box[2]) - x1
+                        bh = float(box[3]) - y1
                         matched = None
-                        for mx1, my1, rle in masks_for_img:
+                        for mx1, my1, mw, mh, rle in masks_for_img:
                             if (
                                 abs(mx1 - x1) < 1.0
                                 and abs(my1 - y1) < 1.0
+                                and abs(mw - bw) < 2.0
+                                and abs(mh - bh) < 2.0
                             ):
                                 matched = rle
                                 break
@@ -318,10 +324,31 @@ class InTheWild3DDataset(COCO3DDataset):
             else:
                 data_dict[K.boxes2d_names] = []
 
-        # Forward pre-matched mask RLEs if available
+        # Decode masks and add as (N, H, W) uint8 array for transforms.
+        # masks_rle is aligned with sample["boxes2d"] (pre-filter).
+        # data_dict boxes2d comes from COCO3D which may filter some
+        # boxes (ignore, bad rotation, etc.), but the ordering of
+        # valid boxes is preserved, so masks_rle indices still match.
         masks_rle = self._mask_rle_index.get(idx)
-        if masks_rle is not None:
-            data_dict["masks2d_rle"] = masks_rle
+        if masks_rle is not None and len(masks_rle) > 0:
+            n_boxes = len(data_dict[K.boxes2d])
+            if n_boxes == 0:
+                pass  # No boxes after filtering, skip masks
+            else:
+                sample = self.samples[idx]
+                h = sample["img"]["height"]
+                w = sample["img"]["width"]
+                decoded = []
+                for rle in masks_rle[:n_boxes]:
+                    if rle is not None:
+                        decoded.append(maskUtils.decode(rle))
+                    else:
+                        decoded.append(
+                            np.zeros((h, w), dtype=np.uint8)
+                        )
+                data_dict["masks2d"] = np.stack(
+                    decoded, axis=0
+                )
 
         return data_dict
 

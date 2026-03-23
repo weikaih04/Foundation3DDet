@@ -1116,14 +1116,13 @@ class SAM3_3DCollator:
                         # Decide geometric prompt mode for Branch 2
                         if self.use_point_prompts:
                             # Exclusive mode: box OR point, never both
-                            masks_rle = sample.get(
-                                "masks2d_rle", None
+                            masks2d = sample.get(
+                                "masks2d", None
                             )
                             has_mask = (
-                                masks_rle is not None
-                                and selected_idx < len(masks_rle)
-                                and masks_rle[selected_idx]
-                                is not None
+                                masks2d is not None
+                                and selected_idx < len(masks2d)
+                                and masks2d[selected_idx].sum() > 0
                             )
                             use_pt = (
                                 has_mask
@@ -1132,13 +1131,13 @@ class SAM3_3DCollator:
                             )
                             if use_pt:
                                 # Point-only (no box)
-                                from pycocotools import (
-                                    mask as maskUtils,
-                                )
-
-                                sel_mask = maskUtils.decode(
-                                    masks_rle[selected_idx]
-                                )
+                                sel_mask = masks2d[selected_idx]
+                                if isinstance(
+                                    sel_mask, torch.Tensor
+                                ):
+                                    sel_mask = (
+                                        sel_mask.cpu().numpy()
+                                    )
                                 sel_box = boxes2d[selected_idx]
                                 sel_box_np = (
                                     sel_box.cpu().numpy()
@@ -1152,11 +1151,12 @@ class SAM3_3DCollator:
                                 )
                                 if n_pts == 1:
                                     # Single point: always positive
-                                    # from mask interior
+                                    # from mask center (farthest
+                                    # from edges)
                                     points = sample_points_from_mask(
                                         sel_mask,
                                         1,
-                                        "random_mask",
+                                        "centered",
                                     )
                                 else:
                                     # Multi-point: random_box mode,

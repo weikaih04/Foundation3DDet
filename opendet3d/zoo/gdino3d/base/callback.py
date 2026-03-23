@@ -170,6 +170,7 @@ def get_in_the_wild_evaluator_cfg(
     iou_type: str = "bbox",
     human_filtered: bool = True,
     enable_aprel3d: bool = False,
+    annotation_name: str | None = None,
 ) -> ConfigDict:
     """Get InTheWild evaluator config.
 
@@ -181,15 +182,20 @@ def get_in_the_wild_evaluator_cfg(
         iou_type: "bbox" for 3D IoU matching, "dist" for center distance.
         human_filtered: If True, use human-filtered annotations
             (valid3D + 2-pass human review). If False, use original.
+        annotation_name: Override annotation file name (without .json).
+            If None, uses human_filtered flag to pick.
 
     Returns:
         ConfigDict: Evaluator configuration.
     """
     from opendet3d.data.datasets.in_the_wild import load_in_the_wild_class_map
 
-    ann_name = (
-        "InTheWild_val_final" if human_filtered else "InTheWild_val"
-    )
+    if annotation_name is not None:
+        ann_name = annotation_name
+    else:
+        ann_name = (
+            "InTheWild_val_final" if human_filtered else "InTheWild_val"
+        )
     annotation = os.path.join(data_root, f"annotations/{ann_name}.json")
     class_map = load_in_the_wild_class_map(annotation)
     det_map = {name: i for i, name in enumerate(sorted(class_map.keys()))}
@@ -214,6 +220,7 @@ def get_in_the_wild_eval_callbacks(
     eval_connector_mapping: dict | None = None,
     test_connector: ConfigDict | None = None,
     enable_aprel3d: bool = False,
+    annotation_name: str | None = None,
 ) -> list[ConfigDict]:
     """Get InTheWild evaluation callbacks: 2D AP, 3D AP (bbox), 3D AP (dist).
 
@@ -225,6 +232,7 @@ def get_in_the_wild_eval_callbacks(
         test_connector: Pre-built connector config (SAM3_3D). If None,
             builds CallbackConnector from eval_connector_mapping.
         enable_aprel3d: Whether to enable APRel3D (per-image scale alignment).
+        annotation_name: Override annotation file name (without .json).
 
     Returns:
         List of EvaluatorCallback configs.
@@ -248,6 +256,7 @@ def get_in_the_wild_eval_callbacks(
                 data_root=data_root,
                 iou_type="bbox",
                 enable_aprel3d=enable_aprel3d,
+                annotation_name=annotation_name,
             ),
             metrics_to_eval=["2D", "3D"],
             save_predictions=True,
@@ -265,6 +274,7 @@ def get_in_the_wild_eval_callbacks(
                 data_root=data_root,
                 iou_type="dist",
                 enable_aprel3d=enable_aprel3d,
+                annotation_name=annotation_name,
             ),
             metrics_to_eval=["3D"],
             save_predictions=True,

@@ -28,6 +28,12 @@ from vis4d.data.transforms.resize import (
 )
 
 from opendet3d.data.transforms.crop import CropBoxes3D
+from opendet3d.data.transforms.masks import (
+    CenterPadMasks2D,
+    CropMasks2D,
+    FlipMasks2D,
+    ResizeMasks2D,
+)
 from opendet3d.data.transforms.pad import (
     CenterPadBoxes2D,
     CenterPadDepthMaps,
@@ -47,6 +53,7 @@ def get_train_transforms_cfg(
         class_config(ResizeBoxes2D),
         class_config(ResizeIntrinsics),
         class_config(ResizeDepthMaps),
+        class_config(ResizeMasks2D),
     ]
 
     # Center Crop
@@ -57,6 +64,7 @@ def get_train_transforms_cfg(
         class_config(CropBoxes3D),
         class_config(CropIntrinsics),
         class_config(CropDepthMaps),
+        class_config(CropMasks2D),
     ]
 
     flip_transforms = [
@@ -65,6 +73,7 @@ def get_train_transforms_cfg(
         class_config(FlipBoxes2D),
         class_config(FlipBoxes3D),
         class_config(FlipDepthMaps),
+        class_config(FlipMasks2D),
     ]
 
     preprocess_transforms.append(
@@ -84,6 +93,7 @@ def get_train_transforms_cfg(
         class_config(CenterPadBoxes2D),
         class_config(CenterPadIntrinsics),
         class_config(CenterPadDepthMaps),
+        class_config(CenterPadMasks2D),
     ]
 
     train_preprocess_cfg = class_config(
