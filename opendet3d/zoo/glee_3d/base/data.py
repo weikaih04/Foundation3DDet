@@ -24,7 +24,12 @@ from opendet3d.zoo.glee_3d.base.connector import (
 
 # Module-level collator singletons
 _default_collator = GLEE_3DCollator(filter_empty_boxes=True)
-_test_collator = GLEE_3DCollator(filter_empty_boxes=False)
+_test_collator = GLEE_3DCollator(
+    filter_empty_boxes=False, visual_prompt_prob=0.0
+)
+_oracle_collator = GLEE_3DCollator(
+    filter_empty_boxes=False, visual_prompt_prob=0.0, oracle_eval=True
+)
 
 
 def glee_3d_collate_fn(batch, **kwargs):
@@ -33,8 +38,13 @@ def glee_3d_collate_fn(batch, **kwargs):
 
 
 def glee_3d_test_collate_fn(batch, **kwargs):
-    """Collate function for GLEE_3D evaluation."""
+    """Text eval: pure text prompts, no visual prompts."""
     return _test_collator(batch)
+
+
+def glee_3d_oracle_collate_fn(batch, **kwargs):
+    """Oracle eval: GT boxes as box prompts."""
+    return _oracle_collator(batch)
 
 
 def get_glee_3d_data_cfg(

@@ -84,11 +84,14 @@ def get_glee_3d_hyperparams_cfg(
     return params
 
 
-def build_glee_model_from_cfg() -> "GLEE_Model":  # noqa: F821
+def build_glee_model_from_cfg(
+    glee_checkpoint: str = "pretrained/glee/GLEE_Plus_scaleup.pth",
+) -> "GLEE_Model":  # noqa: F821
     """Build GLEE_Model using detectron2 config system.
 
     This is called at model instantiation time (not config time).
     Returns a GLEE_Model instance with backbone, pixel_decoder, predictor.
+    Loads pretrained GLEE checkpoint if provided.
     """
     from detectron2.config import get_cfg
     from glee.config import add_glee_config
@@ -130,6 +133,30 @@ def build_glee_model_from_cfg() -> "GLEE_Model":  # noqa: F821
         video_info={"bz": 1, "len": 1},
         contras_mean=False,
     )
+
+    # Load pretrained GLEE checkpoint
+    if glee_checkpoint:
+        import torch
+        print(f"[GLEE_3D] Loading GLEE checkpoint: {glee_checkpoint}")
+        ckpt = torch.load(glee_checkpoint, map_location="cpu")
+        # Handle different checkpoint formats
+        state_dict = ckpt.get("model", ckpt)
+        # Strip 'glee.' prefix if present (from wrapped models)
+        cleaned = {}
+        for k, v in state_dict.items():
+            if k.startswith("glee."):
+                cleaned[k[5:]] = v
+            else:
+                cleaned[k] = v
+        missing, unexpected = model.load_state_dict(cleaned, strict=False)
+        print(f"[GLEE_3D] Loaded checkpoint: {len(cleaned)} keys")
+        if missing:
+            print(f"[GLEE_3D] Missing keys: {len(missing)} "
+                  f"(first 5: {missing[:5]})")
+        if unexpected:
+            print(f"[GLEE_3D] Unexpected keys: {len(unexpected)} "
+                  f"(first 5: {unexpected[:5]})")
+
     return model
 
 
@@ -183,7 +210,10 @@ def get_glee_3d_cfg(
         )
 
     # GLEE model (built from detectron2 cfg at instantiation time)
-    glee_model = class_config(build_glee_model_from_cfg)
+    glee_model = class_config(
+        build_glee_model_from_cfg,
+        glee_checkpoint=glee_checkpoint,
+    )
 
     # 3D Head: 10 layers (GLEE two-stage: 1 initial + 9 decoder)
     num_3d_layers = params.num_decoder_layers + 1

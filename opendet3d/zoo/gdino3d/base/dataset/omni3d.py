@@ -123,6 +123,7 @@ def get_omni3d_train_cfg(
     cache_as_binary: bool = True,
     use_mini_dataset: bool = False,
     mini_dataset_size: int = 100,
+    with_depth: bool = True,
     # Relaxed filtering for training (denser GT)
     truncation_thres: float = 0.50,
     visibility_thres: float = 0.1,
@@ -151,7 +152,7 @@ def get_omni3d_train_cfg(
         data_backend=data_backend,
         omni3d50=omni3d50,
         remove_empty=True,
-        with_depth=True,
+        with_depth=with_depth,
         cache_as_binary=cache_as_binary,
         use_mini_dataset=use_mini_dataset,
         mini_dataset_size=mini_dataset_size,
@@ -161,7 +162,9 @@ def get_omni3d_train_cfg(
         max_height_thres=max_height_thres,
     )
 
-    train_preprocess_cfg = get_train_transforms_cfg(shape=shape)
+    train_preprocess_cfg = get_train_transforms_cfg(
+        shape=shape, with_depth=with_depth
+    )
 
     return class_config(
         DataPipe,
@@ -212,7 +215,9 @@ def get_omni3d_test_cfg(
         mini_dataset_size=mini_dataset_size,
     )
 
-    test_preprocess_cfg = get_test_transforms_cfg(shape=shape)
+    test_preprocess_cfg = get_test_transforms_cfg(
+        shape=shape, with_depth=with_depth
+    )
 
     return class_config(
         DataPipe, datasets=test_dataset_cfg, preprocess_fn=test_preprocess_cfg

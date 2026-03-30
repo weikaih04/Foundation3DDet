@@ -1,0 +1,94 @@
+version: v2
+description: "GLEE_3D (Swin-L + LingbotDepth) Omni3D canonical, 2 nodes 16 GPUs, batch=2/GPU, GLEE defaults"
+budget: ai2/oe-mm
+tasks:
+- name: glee-3d-lingbot-f21-omni3d-canonical-2n
+  replicas: 2
+  image:
+    docker: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+  envVars:
+    - name: WEIKAI_UW_WANDB_KEY
+      secret: WEIKAI_UW_WANDB_KEY
+    - name: NCCL_SOCKET_IFNAME
+      value: ib
+    - name: NCCL_IB_HCA
+      value: "^=mlx5_bond_0"
+    - name: NCCL_DEBUG
+      value: INFO
+  command: ['bash', '-c']
+  arguments:
+  - |
+    EXP_NAME="glee_3d_lingbot_f21_omni3d_canonical_12e_2node"
+
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=America/Los_Angeles
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export MIXED_PRECISION=bf16
+    export PYTHONWARNINGS="ignore::UserWarning"
+
+    apt-get update && \
+    apt-get install -y libstdc++6 libgl1-mesa-glx libglib2.0-0 g++ git wget \
+        libibverbs1 libibverbs-dev librdmacm1 ibverbs-providers \
+        kmod dpatch debhelper swig automake udev chrpath flex libpci3 \
+        libmnl0 pciutils libnl-route-3-dev libnl-route-3-200 graphviz \
+        lsof autoconf libnuma1 m4 libnl-3-200 bison libltdl-dev \
+        libfuse2 libnl-3-dev ethtool autotools-dev libusb-1.0-0 python3 && \
+
+    MOFED_VER=5.8-1.1.2.1 && \
+    OS_VER=ubuntu20.04 && \
+    PLATFORM=x86_64 && \
+    wget --quiet https://content.mellanox.com/ofed/MLNX_OFED-${MOFED_VER}/MLNX_OFED_LINUX-${MOFED_VER}-${OS_VER}-${PLATFORM}.tgz && \
+    tar -xf MLNX_OFED_LINUX-${MOFED_VER}-${OS_VER}-${PLATFORM}.tgz && \
+    MLNX_OFED_LINUX-${MOFED_VER}-${OS_VER}-${PLATFORM}/mlnxofedinstall --basic --user-space-only --without-fw-update --without-mlnx-iproute2 -q && \
+    rm -rf MLNX_OFED_LINUX-${MOFED_VER}-${OS_VER}-${PLATFORM} MLNX_OFED_LINUX-${MOFED_VER}-${OS_VER}-${PLATFORM}.tgz && \
+
+    source /weka/oe-training-default/jieyuz2/improve_segments/miniconda3/bin/activate && \
+    conda activate glee3d && \
+    cd /weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet && \
+
+    export PYTHONPATH=/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet:/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet/GLEE/projects/GLEE:/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet/UniDepth:/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet/lingbot-depth:/weka/oe-training-default/weikaih/3d_boundingbox_detection/Foundation3DDet/sam3_da3/Foundation3DDet/MoGe2:$PYTHONPATH && \
+
+    export WANDB_API_KEY=$WEIKAI_UW_WANDB_KEY && \
+    export WANDB_PROJECT="GLEE_3D-Training" && \
+    export WANDB_NAME=$EXP_NAME && \
+    export WANDB_TAGS="glee_3d,swin_l,lingbot_depth,freeze21,omni3d,canonical_rotation,2node" && \
+
+    torchrun \
+        --nnodes=2 \
+        --node-rank=$BEAKER_REPLICA_RANK \
+        --nproc-per-node=8 \
+        --rdzv_backend=static \
+        --rdzv_id=glee_3d_omni3d_canonical_2n \
+        --rdzv_conf="read_timeout=600" \
+        --rdzv_endpoint=$BEAKER_LEADER_REPLICA_HOSTNAME:29401 \
+        -m vis4d.engine.run fit \
+        --config opendet3d/zoo/glee_3d/glee_3d_lingbot_depth_freeze21_omni3d.py \
+        --gpus 8 \
+        --nodes 2 \
+        --config.experiment_name=$EXP_NAME \
+        --config.work_dir=vis4d-workspace \
+        --config.version=v1 \
+        --config.pl_trainer.val_check_interval=1.0 \
+        --config.pl_trainer.strategy=ddp_find_unused_parameters_true \
+        --wandb \
+        --resume
+
+  result:
+    path: /exp_outputs
+  datasets:
+    - mountPath: /weka/oe-training-default
+      source:
+        weka: oe-training-default
+  resources:
+    gpuCount: 8
+    sharedMemory: 1000GiB
+  context:
+    priority: high
+    preemptible: true
+  constraints:
+    cluster: [ai2/jupiter]
+  hostNetworking: true
+  leaderSelection: true
+  propagateFailure: true
+  propagatePreemption: true
+workspace: ai2/video-olmo-data

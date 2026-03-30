@@ -12,11 +12,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from vis4d.op.loss.common import l1_loss
 from vis4d.op.loss.reducer import SumWeightedLoss
+
+
+def _reduce_mean(tensor: Tensor) -> Tensor:
+    """All-reduce mean across GPUs (matching GDino3D's reduce_mean)."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return tensor
+    tensor = tensor.clone()
+    dist.all_reduce(tensor.div_(dist.get_world_size()), op=dist.ReduceOp.SUM)
+    return tensor
 
 from opendet3d.op.detect3d.grounding_dino_3d.coder import GroundingDINO3DCoder
 
@@ -167,6 +177,7 @@ class GLEE_3DLoss(nn.Module):
         intrinsics: Tensor,  # (B, 3, 3)
         image_size: tuple[int, int],  # (H, W)
         ignore_boxes_2d: list[Tensor] | None = None,  # per-image ignore boxes xyxy pixel
+        visual_P: bool = False,  # whether visual prompts are active
     ) -> dict[str, Tensor]:
         """Compute all losses.
 
@@ -182,6 +193,7 @@ class GLEE_3DLoss(nn.Module):
             "pred_scores": pred_scores,
             "pred_boxes": pred_boxes_2d,
             "pred_masks": None,
+            "visual_P": visual_P,
         }
 
         # Ignore suppress: compute mask for predictions overlapping ignore boxes

@@ -21,10 +21,30 @@ from glee.models.vos_utils import masks_to_boxes
 
 # opendet3d 3D components (same as SAM3_3D)
 from opendet3d.op.detect3d.geometry import GeometryBackendBase
+from torchvision.ops import batched_nms, nms
+
 from opendet3d.op.detect3d.grounding_dino_3d import (
     GroundingDINO3DCoder,
     GroundingDINO3DHead,
 )
+class Det3DOut(NamedTuple):
+    """Standard detection output for evaluator compatibility."""
+
+    boxes: list[Tensor]
+    boxes3d: list[Tensor]
+    scores: list[Tensor]
+    class_ids: list[Tensor]
+    depth_maps: list[Tensor] | None = None
+    categories: list[list[str]] | None = None
+    predicted_intrinsics: Tensor | None = None
+    scores_3d: list[Tensor] | None = None
+    scores_2d: list[Tensor] | None = None
+
+
+def _cxcywh_to_xyxy(boxes: Tensor) -> Tensor:
+    """Convert cxcywh to xyxy format."""
+    cx, cy, w, h = boxes.unbind(-1)
+    return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +123,14 @@ class GLEE_3DBatchedInputs:
     def device(self) -> torch.device:
         return self.images.device
 
+    def __contains__(self, key: str) -> bool:
+        """Support 'key in batch' for vis4d connector compatibility."""
+        return hasattr(self, key)
+
+    def __getitem__(self, key: str):
+        """Support batch[key] for vis4d connector compatibility."""
+        return getattr(self, key)
+
 
 # ---------------------------------------------------------------------------
 # GLEE_3D Model
@@ -131,6 +159,8 @@ class GLEE_3D(nn.Module):
         freeze_text_encoder: bool = True,
         # Task config
         task: str = "glee3d",
+        # Eval options
+        use_depth_input_test: bool = False,
     ) -> None:
         super().__init__()
 
@@ -143,6 +173,7 @@ class GLEE_3D(nn.Module):
         self.geometry_backend = geometry_backend
         self.early_depth_fusion = early_depth_fusion
         self.task = task
+        self.use_depth_input_test = use_depth_input_test
 
         # Determine camera prompt usage from geometry backend
         use_camera_prompt = True
@@ -176,7 +207,16 @@ class GLEE_3D(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, batch: GLEE_3DBatchedInputs) -> GLEE_3DOut:
+    def forward(
+        self, batch: GLEE_3DBatchedInputs
+    ):
+        if not self.training:
+            return self.forward_test(batch)
+        return self.forward_train(batch)
+
+    def forward_train(
+        self, batch: GLEE_3DBatchedInputs
+    ) -> GLEE_3DOut:
         images = batch.images  # (B, 3, H, W) ImageNet normalized
         B, _, H, W = images.shape
         device = batch.device
@@ -191,10 +231,16 @@ class GLEE_3D(nn.Module):
         # ============================================================
         # Step 2: GLEE backbone
         # ============================================================
-        # GLEE backbone expects normalized images (ImageNet).
-        # Our vis4d pipeline already applies ImageNet normalization
-        # which is mathematically identical to GLEE's pixel_mean/std.
-        features = self.glee.backbone(images)
+        # Convert vis4d ImageNet norm → GLEE's expected BGR mean-subtracted format
+        # vis4d: (RGB_255 - mean_rgb_255) / (std_rgb * 255), range ~[-2, 3]
+        # GLEE: BGR_255 - mean_bgr_255, range ~[-124, 152]
+        # Since means are identical (just RGB/BGR order), undo std and flip channels
+        _std_255 = torch.tensor(
+            [58.395, 57.12, 57.375], device=device
+        ).view(1, 3, 1, 1)
+        images_glee = images * _std_255          # undo std → mean-subtracted RGB_255
+        images_glee = images_glee[:, [2, 1, 0]]  # RGB → BGR
+        features = self.glee.backbone(images_glee)
 
         # ============================================================
         # Step 2.5: Visual prompts (box/point) processing
@@ -216,7 +262,9 @@ class GLEE_3D(nn.Module):
 
         if self.geometry_backend is not None:
             intrinsics = batch.intrinsics
-            depth_gt = batch.depth_gt if self.training else None
+            depth_gt = None
+            if self.training or self.use_depth_input_test:
+                depth_gt = batch.depth_gt
             depth_mask = batch.depth_mask if self.training else None
 
             if self.training:
@@ -389,6 +437,157 @@ class GLEE_3D(nn.Module):
         )
 
     # ------------------------------------------------------------------
+    # Test-time forward (produces Det3DOut for evaluator)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward_test(self, batch: GLEE_3DBatchedInputs):
+        """Test-time forward: runs model + postprocessing → Det3DOut.
+
+        Follows GDino3D's RoI2Det3D pattern:
+        1. logits sigmoid → per-class scores
+        2. top-K + score threshold
+        3. cxcywh norm → pixel xyxy
+        4. NMS (optional)
+        5. box_coder.decode → 3D boxes
+        6. remove padding, rescale to original image
+        """
+        # Move spatial_masks to device if present (oracle eval)
+        if batch.spatial_masks is not None:
+            batch.spatial_masks = [
+                m.to(batch.images.device) for m in batch.spatial_masks
+            ]
+        out = self.forward_train(batch)
+
+        B, _, H, W = batch.images.shape
+        device = batch.device
+
+        # Config
+        score_threshold = getattr(self, "score_threshold", 0.0)
+        max_per_img = getattr(self, "max_per_img", 300)
+        use_nms = getattr(self, "use_nms", False)
+        iou_threshold = getattr(self, "iou_threshold", 0.5)
+        eval_3d_conf_weight = getattr(self, "eval_3d_conf_weight", 0.0)
+
+        boxes_list = []
+        boxes3d_list = []
+        scores_list = []
+        class_ids_list = []
+
+        for b in range(B):
+            cls_score = out.pred_logits[b].sigmoid()  # (Q, C)
+            bbox_pred = out.pred_boxes_2d[b]  # (Q, 4) cxcywh norm
+            bbox_3d_pred = (
+                out.pred_boxes_3d[b]
+                if out.pred_boxes_3d is not None
+                else None
+            )
+
+            # Step 1: Convert ALL boxes cxcywh norm → pixel xyxy
+            # (same order as GDino3D RoI2Det3D: convert first, then top-K)
+            det_bboxes_all = _cxcywh_to_xyxy(bbox_pred)  # (Q, 4)
+            det_bboxes_all[:, 0::2] *= W
+            det_bboxes_all[:, 1::2] *= H
+            det_bboxes_all[:, 0::2].clamp_(min=0, max=W)
+            det_bboxes_all[:, 1::2].clamp_(min=0, max=H)
+
+            # Step 2: Top-K across all queries x classes
+            k = min(max_per_img, cls_score.numel())
+            if k == 0:
+                boxes_list.append(torch.zeros(0, 4, device=device))
+                boxes3d_list.append(torch.zeros(0, 10, device=device))
+                scores_list.append(torch.zeros(0, device=device))
+                class_ids_list.append(
+                    torch.zeros(0, dtype=torch.long, device=device)
+                )
+                continue
+
+            scores_flat, indexes = cls_score.view(-1).topk(k)
+            num_classes = cls_score.shape[-1]
+            det_labels = indexes % num_classes
+            query_idx = indexes // num_classes
+
+            det_bboxes = det_bboxes_all[query_idx]
+            det_3d = (
+                bbox_3d_pred[query_idx]
+                if bbox_3d_pred is not None
+                else None
+            )
+
+            # Step 3: 3D confidence weighting (optional)
+            if eval_3d_conf_weight > 0 and out.pred_conf_3d is not None:
+                conf_3d = (
+                    out.pred_conf_3d[b, query_idx].sigmoid().squeeze(-1)
+                )
+                scores_flat = scores_flat + eval_3d_conf_weight * conf_3d
+
+            # Step 4: Score threshold
+            if score_threshold > 0:
+                mask = scores_flat > score_threshold
+                det_bboxes = det_bboxes[mask]
+                det_labels = det_labels[mask]
+                scores_flat = scores_flat[mask]
+                if det_3d is not None:
+                    det_3d = det_3d[mask]
+
+            # Step 5: NMS (optional, same as GDino3D)
+            if use_nms and len(det_bboxes) > 0:
+                keep = batched_nms(
+                    det_bboxes, scores_flat, det_labels, iou_threshold
+                )
+                det_bboxes = det_bboxes[keep]
+                det_labels = det_labels[keep]
+                scores_flat = scores_flat[keep]
+                if det_3d is not None:
+                    det_3d = det_3d[keep]
+
+            # Step 6: Decode 3D boxes (BEFORE rescale, same as GDino3D)
+            if det_3d is not None and det_3d.numel() > 0:
+                intrinsics_b = batch.intrinsics[b]
+                det_bboxes3d = self.box_coder.decode(
+                    det_bboxes, det_3d, intrinsics_b
+                )
+            else:
+                det_bboxes3d = torch.zeros(
+                    len(det_bboxes), 10, device=device
+                )
+
+            # Step 7: Remove padding + rescale to original image space
+            # (exact same logic as GDino3D RoI2Det3D lines 411-427)
+            if batch.padding is not None:
+                pad = batch.padding[b]
+                det_bboxes[:, 0] -= pad[0]  # left
+                det_bboxes[:, 1] -= pad[2]  # top
+                det_bboxes[:, 2] -= pad[0]
+                det_bboxes[:, 3] -= pad[2]
+
+                ori_h, ori_w = batch.original_hw[b]
+                scales = det_bboxes.new_tensor([
+                    (W - pad[0] - pad[1]) / ori_w,
+                    (H - pad[2] - pad[3]) / ori_h,
+                ])
+            elif batch.original_hw is not None:
+                ori_h, ori_w = batch.original_hw[b]
+                scales = det_bboxes.new_tensor([W / ori_w, H / ori_h])
+            else:
+                scales = det_bboxes.new_tensor([1.0, 1.0])
+
+            det_bboxes /= scales.repeat(2).unsqueeze(0)
+
+            boxes_list.append(det_bboxes)
+            boxes3d_list.append(det_bboxes3d)
+            scores_list.append(scores_flat)
+            class_ids_list.append(det_labels)
+
+        return Det3DOut(
+            boxes=boxes_list,
+            boxes3d=boxes3d_list,
+            scores=scores_list,
+            class_ids=class_ids_list,
+            depth_maps=None,
+        )
+
+    # ------------------------------------------------------------------
     # Text encoding helper (extracted from GLEE_Model.forward)
     # ------------------------------------------------------------------
 
@@ -523,12 +722,15 @@ class GLEE_3D(nn.Module):
                 point_h, point_w = h // 40, w // 40
                 new_promptmasks = []
                 for pmask in key_promptmasks:
-                    pts = rand_sample((pmask[0].nonzero()[:, 1:]).t(), 1).t()
+                    nonzero_pts = pmask[0].nonzero()[:, 1:]  # (N, 2)
                     zeromask = torch.zeros_like(pmask)
-                    py, px = pts[0, 0].long(), pts[0, 1].long()
-                    zeromask[:, :,
-                             max(0, py - point_h):py + point_h,
-                             max(0, px - point_w):px + point_w] = True
+                    if nonzero_pts.shape[0] > 0:
+                        pts = rand_sample(nonzero_pts.t(), 1).t()
+                        py, px = pts[0, 0].long(), pts[0, 1].long()
+                        zeromask[:, :,
+                                 max(0, py - point_h):py + point_h,
+                                 max(0, px - point_w):px + point_w] = True
+                    # Empty mask: keep zeromask (no point prompt for this image)
                     new_promptmasks.append(zeromask)
                 key_promptmasks = new_promptmasks
 

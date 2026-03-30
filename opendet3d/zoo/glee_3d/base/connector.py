@@ -41,6 +41,7 @@ class GLEE_3DCollator:
         visual_prompt_prob: float = 0.3,
         box_noise_std: float = 0.1,
         object_text_prob: float = 0.5,
+        oracle_eval: bool = False,
     ):
         self.filter_empty_boxes = filter_empty_boxes
         self.visual_prompt_prob = visual_prompt_prob
@@ -48,6 +49,8 @@ class GLEE_3DCollator:
         # When visual prompt is active, probability of replacing class names
         # with ["object"] (class-agnostic mode, like GLEE's SA1B training)
         self.object_text_prob = object_text_prob
+        # Oracle eval: each GT box → box prompt (no noise, no text replacement)
+        self.oracle_eval = oracle_eval
 
     def __call__(self, batch: list[dict]) -> GLEE_3DBatchedInputs:
         images_list = []
@@ -78,9 +81,13 @@ class GLEE_3DCollator:
         for sample in batch:
             # Image: (3, H, W)
             img = sample[K.images]
-            if isinstance(img, torch.Tensor):
-                if img.dim() == 4 and img.shape[0] == 1:
-                    img = img.squeeze(0)
+            if not isinstance(img, torch.Tensor):
+                img = torch.as_tensor(img, dtype=torch.float32)
+            if img.dim() == 4 and img.shape[0] == 1:
+                img = img.squeeze(0)
+            # Handle HWC → CHW (test data may be NHWC after squeeze)
+            if img.dim() == 3 and img.shape[-1] in (1, 3):
+                img = img.permute(2, 0, 1)
             images_list.append(img)
 
             # Intrinsics: (3, 3)
@@ -118,6 +125,7 @@ class GLEE_3DCollator:
                 w = (x2 - x1).clamp(min=1e-6)
                 h = (y2 - y1).clamp(min=1e-6)
                 boxes_cxcywh = torch.stack([cx, cy, w, h], dim=-1)
+                boxes_cxcywh = torch.clamp(boxes_cxcywh, 0, 1)
 
                 # Map per-box class IDs → batch-global label indices
                 per_box_names = [global_names[int(cid)] for cid in box_class_ids]
@@ -199,11 +207,21 @@ class GLEE_3DCollator:
             depth_gt = torch.stack(depth_gt_list, dim=0)
             depth_mask = torch.stack(depth_mask_list, dim=0)
 
-        # Generate visual prompts (box/point) for training
-        # May also replace class_names with ["object"] for class-agnostic mode
-        spatial_masks, visual_prompt_type, class_names = self._generate_visual_prompts(
-            batch, images, gt_boxes_2d_pixel_list, class_names
-        )
+        # Generate visual prompts
+        if self.oracle_eval:
+            # Oracle: each GT box → exact box prompt (no noise)
+            spatial_masks, visual_prompt_type, class_names = (
+                self._generate_oracle_prompts(
+                    images, gt_boxes_2d_pixel_list
+                )
+            )
+        else:
+            # Training: random visual prompts (box/point) with noise
+            spatial_masks, visual_prompt_type, class_names = (
+                self._generate_visual_prompts(
+                    batch, images, gt_boxes_2d_pixel_list, class_names
+                )
+            )
 
         # If class_names changed to ["object"], remap all target labels to 0
         if len(class_names) == 1 and class_names[0] == "object":
@@ -228,6 +246,31 @@ class GLEE_3DCollator:
             padding=padding_list,
         )
 
+
+    def _generate_oracle_prompts(
+        self,
+        images: Tensor,
+        gt_boxes_2d_pixel_list: list[Tensor],
+    ) -> tuple[list[Tensor], str, list[str]]:
+        """Oracle eval: each GT box → exact box prompt mask (no noise).
+
+        Creates one spatial mask per image with ALL GT boxes filled in.
+        Uses "object" as class name (class-agnostic oracle).
+        """
+        B, _, H, W = images.shape
+        spatial_masks = []
+        for b in range(B):
+            mask = torch.zeros(1, H, W)
+            gt_boxes = gt_boxes_2d_pixel_list[b]  # (N, 4) xyxy pixel
+            for box in gt_boxes:
+                x1, y1, x2, y2 = box.long()
+                x1 = max(0, x1.item())
+                y1 = max(0, y1.item())
+                x2 = min(W, x2.item())
+                y2 = min(H, y2.item())
+                mask[:, y1:y2, x1:x2] = 1.0
+            spatial_masks.append(mask)
+        return spatial_masks, "box", ["object"]
 
     def _generate_visual_prompts(
         self,
@@ -373,4 +416,5 @@ class GLEE_3DLossConnector:
             "intrinsics": batch.intrinsics,
             "ignore_boxes_2d": getattr(batch, "ignore_boxes_2d", None),
             "image_size": (H, W),
+            "visual_P": batch.spatial_masks is not None,
         }

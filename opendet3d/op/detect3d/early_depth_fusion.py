@@ -183,6 +183,8 @@ class EarlyDepthFusionLingbot(nn.Module):
         assert N == H_d * W_d, f"depth_latents N={N} != H_d*W_d={H_d * W_d}"
 
         # Normalize depth_latents to unit scale
+        # Cast to match LayerNorm dtype (AMP bf16 compatibility)
+        depth_latents = depth_latents.to(self.depth_norm.weight.dtype)
         depth_latents = self.depth_norm(depth_latents)
 
         # Reshape: [B, N, C_depth] -> [B, C_depth, H_d, W_d]

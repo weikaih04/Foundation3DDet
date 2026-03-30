@@ -1,13 +1,6 @@
-"""GLEE_3D + LingbotDepth (freeze21) on Omni3D.
+"""GLEE_3D + LingbotDepth (freeze21) on Omni3D - 6 epoch ablation.
 
-Training config matching GLEE's defaults:
-- GLEE Swin-L (Plus) Stage3 Scaleup pretrained
-- LingbotDepth geometry backend (encoder freeze 21/24 blocks)
-- 1024x1024 fixed square input
-- Omni3D dataset, canonical rotation
-- batch=2/GPU (GLEE default), lr=1e-4, weight_decay=0.05
-- AMP bf16, gradient_clip=0.01 (GLEE default)
-- Ignore suppress, 3D confidence head
+Same as 12e config but with 6 epochs for faster ablation.
 """
 
 from __future__ import annotations
@@ -37,32 +30,24 @@ from opendet3d.zoo.glee_3d.base.loss import get_glee_3d_loss_cfg
 
 
 def get_config() -> ExperimentConfig:
-    """GLEE_3D + LingbotDepth freeze21 on Omni3D (canonical rotation)."""
-    # ================================================================
-    # General config
-    # ================================================================
+    """GLEE_3D + LingbotDepth freeze21 on Omni3D - 6 epoch ablation."""
     config = get_default_cfg(
-        exp_name="glee_3d_lingbot_f21_omni3d_canonical"
+        exp_name="glee_3d_lingbot_f21_omni3d_canonical_6e"
     )
     config.use_checkpoint = True
 
-    # ================================================================
-    # Hyperparameters (matching GLEE Swin-L defaults)
-    # ================================================================
     params = get_glee_3d_hyperparams_cfg(
-        num_epochs=12,
-        samples_per_gpu=2,     # GLEE default: DATASET_BS=2
+        num_epochs=6,
+        samples_per_gpu=2,
         workers_per_gpu=4,
-        base_lr=1e-4,          # GLEE default
-        weight_decay=0.05,     # GLEE default
+        base_lr=1e-4,
+        weight_decay=0.05,
     )
     config.params = params
 
     glee_image_shape = (1024, 1024)
 
-    # ================================================================
     # Datasets
-    # ================================================================
     data_backend = class_config(HDF5Backend)
 
     omni3d_train_data_cfg = get_omni3d_train_cfg(
@@ -74,7 +59,6 @@ def get_config() -> ExperimentConfig:
     omni3d_test_data_cfg = get_omni3d_test_cfg(
         data_backend=data_backend,
         shape=glee_image_shape,
-        with_depth=True,
     )
 
     config.data = get_glee_3d_data_cfg(
@@ -85,9 +69,7 @@ def get_config() -> ExperimentConfig:
         image_shape=glee_image_shape,
     )
 
-    # ================================================================
     # Model
-    # ================================================================
     config.model, box_coder = get_glee_3d_cfg(
         params=params,
         glee_checkpoint="pretrained/glee/GLEE_Plus_scaleup.pth",
@@ -98,9 +80,7 @@ def get_config() -> ExperimentConfig:
         canonical_rotation=True,
     )
 
-    # ================================================================
-    # Loss (with ignore suppress + 3D confidence)
-    # ================================================================
+    # Loss
     config.loss = get_glee_3d_loss_cfg(
         params=params,
         box_coder_cfg=box_coder,
@@ -108,25 +88,19 @@ def get_config() -> ExperimentConfig:
         loss_geom_scale=5.0,
     )
 
-    # ================================================================
-    # Data Connectors
-    # ================================================================
+    # Connectors
     config.train_data_connector, config.test_data_connector = (
         get_glee_3d_data_connector_cfg()
     )
 
-    # ================================================================
-    # Optimizer (GLEE defaults: backbone 0.1x lr, text encoder frozen)
-    # ================================================================
+    # Optimizer
     config.optimizers = get_glee_3d_optim_cfg(
         params,
         freeze_backbone=params.freeze_backbone,
         freeze_all_pretrained=params.freeze_all_pretrained,
     )
 
-    # ================================================================
     # Callbacks
-    # ================================================================
     omni3d_evaluator_cfg = get_omni3d_evaluator_cfg(
         data_root="data/omni3d",
         omni3d50=True,
@@ -141,12 +115,7 @@ def get_config() -> ExperimentConfig:
         omni3d_evaluator=omni3d_evaluator_cfg,
     )
 
-    # ================================================================
-    # PyTorch Lightning (with GLEE-matching settings)
-    # ================================================================
+    # PL Trainer
     config.pl_trainer = get_pl_cfg(config, params)
-    # AMP bf16 via MIXED_PRECISION env var in YAML (not here)
-    # NOTE: Override pl_trainer values via YAML because value_mode()
-    # resets direct assignments on FieldConfigDict.
 
-    return config.value_mode()
+    return config
